@@ -1,0 +1,6 @@
+{
+  "summary": "Architectural plan to enhance PriceEnvelopeChart with directional trade fill markers, active OCO stop-loss/take-profit bracket projections, and an interactive inspection popover displaying agent performance, entry regime, and live unrealized PnL.",
+  "updatedAt": "2026-10-19T16:55:16.525874883Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

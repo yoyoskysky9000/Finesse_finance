@@ -1,0 +1,6 @@
+{
+  "name": "QuantPulse: Public.com & Prediction Market Agent Orchestrator",
+  "description": "Autonomous quantitative trading and prediction market agent orchestrator with deterministic time-series evaluation, multi-horizon data feed planning, and automated ATR/drawdown circuit breakers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
