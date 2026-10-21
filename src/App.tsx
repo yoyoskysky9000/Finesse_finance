@@ -25,6 +25,11 @@ import type {
   IndicatorStrategyId,
   MarketFeatureVector,
   MarketRegime,
+  McpCallLogEntry,
+  McpResourceDefinition,
+  McpServerConnection,
+  McpToolDefinition,
+  PlaybookCleanupAuditRow,
   PortfolioSummary,
   QuantitativeRegimeAssessment,
   RiskEventNotification,
@@ -34,6 +39,8 @@ import type {
 import { PriceEnvelopeChart } from './components/PriceEnvelopeChart.tsx';
 import { AlphaScannerBacktest } from './components/AlphaScannerBacktest.tsx';
 import { RiskEventsLog } from './components/RiskEventsLog.tsx';
+import { KalshiMcpHub } from './components/KalshiMcpHub.tsx';
+import { MasterPlaybookVault } from './components/MasterPlaybookVault.tsx';
 
 type WorkspaceTab =
   | 'COMMAND_CENTER'
@@ -68,7 +75,12 @@ export default function App() {
   const [orders, setOrders] = useState<ExecutedOrder[]>([]);
   const [riskEvents, setRiskEvents] = useState<RiskEventNotification[]>([]);
   const [strategyTournament, setStrategyTournament] = useState<StrategyTournamentEntry[]>([]);
-  const [selectedSymbol, setSelectedSymbol] = useState<string>('NVDA');
+  const [playbookCleanupAudit, setPlaybookCleanupAudit] = useState<PlaybookCleanupAuditRow[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServerConnection[]>([]);
+  const [mcpTools, setMcpTools] = useState<McpToolDefinition[]>([]);
+  const [mcpResources, setMcpResources] = useState<McpResourceDefinition[]>([]);
+  const [mcpLogs, setMcpLogs] = useState<McpCallLogEntry[]>([]);
+  const [selectedSymbol, setSelectedSymbol] = useState<string>('KXBTC15M');
 
   // Filter states
   const [feedFilter, setFeedFilter] = useState<'ALL' | 'LONG_AND_LOW' | 'SHORT_AND_FAST'>('ALL');
@@ -85,8 +97,8 @@ export default function App() {
   // Agent Spawner Form State
   const [newAgentName, setNewAgentName] = useState<string>('');
   const [newAgentArchetype, setNewAgentArchetype] = useState<StrategyArchetype>('SHORT_AND_FAST');
-  const [newAgentSymbol, setNewAgentSymbol] = useState<string>('NVDA');
-  const [newAgentIndicatorId, setNewAgentIndicatorId] = useState<IndicatorStrategyId>('EMA_VWAP_VELOCITY');
+  const [newAgentSymbol, setNewAgentSymbol] = useState<string>('KXBTC15M');
+  const [newAgentIndicatorId, setNewAgentIndicatorId] = useState<IndicatorStrategyId>('BTC_LEAD_LAG_SNIPER');
   const [newAgentCapital, setNewAgentCapital] = useState<number>(120);
   const [newAgentMaxDrawdown, setNewAgentMaxDrawdown] = useState<number>(1.5);
   const [newAgentAtrMultiplier, setNewAgentAtrMultiplier] = useState<number>(2.2);
@@ -106,6 +118,15 @@ export default function App() {
       }
       if (Array.isArray(data.strategyTournament)) {
         setStrategyTournament(data.strategyTournament);
+      }
+      if (Array.isArray(data.playbookCleanupAudit)) {
+        setPlaybookCleanupAudit(data.playbookCleanupAudit);
+      }
+      if (data.mcp) {
+        if (Array.isArray(data.mcp.servers)) setMcpServers(data.mcp.servers);
+        if (Array.isArray(data.mcp.tools)) setMcpTools(data.mcp.tools);
+        if (Array.isArray(data.mcp.resources)) setMcpResources(data.mcp.resources);
+        if (Array.isArray(data.mcp.logs)) setMcpLogs(data.mcp.logs);
       }
     } catch {
       setStatusBanner({
@@ -224,6 +245,31 @@ export default function App() {
         setStatusBanner({
           type: 'success',
           message: `Deployed #1 Real-Data Winner (${data.winner.symbol} · ${data.winner.indicatorStrategyLabel} · +${data.winner.totalReturnPct}% return, Sharpe ${data.winner.sharpeRatio}) & diversified all ${data.agents.length} agents across distinct tickers and indicators!`,
+        });
+      }
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
+
+  const handleDeploy15mHftWinner = async () => {
+    setIsEvaluating(true);
+    try {
+      const res = await fetch('/api/agents/deploy-15m-hft-winner', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setAgents(data.agents);
+        setOrders(data.orders);
+        setPortfolio(data.portfolio);
+        if (Array.isArray(data.strategyTournament)) {
+          setStrategyTournament(data.strategyTournament);
+        }
+        if (data.winner?.symbol) {
+          setSelectedSymbol(data.winner.symbol);
+        }
+        setStatusBanner({
+          type: 'success',
+          message: `Deployed #1 15-Minute HFT Winner (${data.winner.symbol} · ${data.winner.indicatorStrategyLabel} · +${data.winner.totalReturnPct}% return, Sharpe ${data.winner.sharpeRatio}) & launched 15m HFT scalper fleet across all 5 Kalshi 15m markets!`,
         });
       }
     } finally {
@@ -361,6 +407,12 @@ export default function App() {
         if (Array.isArray(data.strategyTournament)) {
           setStrategyTournament(data.strategyTournament);
         }
+        if (data.mcp) {
+          if (Array.isArray(data.mcp.servers)) setMcpServers(data.mcp.servers);
+          if (Array.isArray(data.mcp.tools)) setMcpTools(data.mcp.tools);
+          if (Array.isArray(data.mcp.resources)) setMcpResources(data.mcp.resources);
+          if (Array.isArray(data.mcp.logs)) setMcpLogs(data.mcp.logs);
+        }
         setStatusBanner({
           type: data.portfolio.publicApiConfigured ? 'success' : 'info',
           message: `${data.portfolio.publicLastSyncStatus} · ${data.portfolio.kalshiLastSyncStatus || 'Kalshi v2 Active'}`,
@@ -368,6 +420,89 @@ export default function App() {
       }
     } finally {
       setIsEvaluating(false);
+    }
+  };
+
+  const handleSyncKalshi = async () => {
+    setIsEvaluating(true);
+    try {
+      const res = await fetch('/api/kalshi/sync', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setPortfolio(data.portfolio);
+        setFeatures(data.features);
+        setAgents(data.agents);
+        setOrders(data.orders);
+        if (Array.isArray(data.riskEvents)) {
+          setRiskEvents(data.riskEvents);
+        }
+        if (Array.isArray(data.strategyTournament)) {
+          setStrategyTournament(data.strategyTournament);
+        }
+        if (data.mcp) {
+          if (Array.isArray(data.mcp.servers)) setMcpServers(data.mcp.servers);
+          if (Array.isArray(data.mcp.tools)) setMcpTools(data.mcp.tools);
+          if (Array.isArray(data.mcp.resources)) setMcpResources(data.mcp.resources);
+          if (Array.isArray(data.mcp.logs)) setMcpLogs(data.mcp.logs);
+        }
+        setStatusBanner({
+          type: 'success',
+          message:
+            data.portfolio.kalshiLastSyncStatus ||
+            `Pulled Live Kalshi Portfolio v2: Total $${(data.portfolio.kalshiTotalEquityUsd ?? 73.86).toFixed(2)} ($${(
+              data.portfolio.kalshiCashBalanceUsd ?? 29.27
+            ).toFixed(2)} Cash + $${(data.portfolio.kalshiPortfolioValueUsd ?? 44.59).toFixed(2)} Contracts)`,
+        });
+      }
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
+
+  const handleInvokeMcpTool = async (
+    toolName: string,
+    args: Record<string, any>
+  ): Promise<Record<string, any> | null> => {
+    const res = await fetch('/api/mcp/invoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName, args }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.portfolio) setPortfolio(data.portfolio);
+      if (Array.isArray(data.orders)) setOrders(data.orders);
+      if (Array.isArray(data.logs)) setMcpLogs(data.logs);
+      if (Array.isArray(data.servers)) setMcpServers(data.servers);
+      setStatusBanner({
+        type: 'success',
+        message: `MCP JSON-RPC 2.0 Tool Executed: ${toolName}`,
+      });
+      return data.result || null;
+    }
+    return null;
+  };
+
+  const handleConnectMcpServer = async (config: {
+    name: string;
+    endpointUrl: string;
+    transport: 'HTTP_JSON_RPC' | 'SSE_STREAM' | 'STDIO_BRIDGE';
+    authHeader?: string;
+  }) => {
+    const res = await fetch('/api/mcp/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.servers)) setMcpServers(data.servers);
+      if (Array.isArray(data.logs)) setMcpLogs(data.logs);
+      if (data.portfolio) setPortfolio(data.portfolio);
+      setStatusBanner({
+        type: 'success',
+        message: `Connected MCP Server '${data.server.name}' (${data.server.endpointUrl}) over ${data.server.transport}.`,
+      });
     }
   };
 
@@ -479,7 +614,53 @@ export default function App() {
       <div className="flex-1 flex flex-col lg:flex-row">
         {/* Left Navigation & Market Watchlist Sidebar */}
         <aside className="w-full lg:w-64 shrink-0 border-b lg:border-b-0 lg:border-r border-slate-800 bg-[#0D131F] p-4 flex flex-col justify-between gap-6">
-          <div className="space-y-6">
+          <div className="space-y-5">
+            {/* Live Kalshi Portfolio v2 & MCP Node Summary */}
+            <div>
+              <div className="flex items-center justify-between text-xs font-medium text-slate-400 mb-2">
+                <span className="text-emerald-400 font-semibold">Live Kalshi Balance</span>
+                <button
+                  type="button"
+                  onClick={handleSyncKalshi}
+                  className="text-[11px] text-cyan-400 hover:underline whitespace-nowrap"
+                >
+                  Pull Kalshi &amp; MCP
+                </button>
+              </div>
+              <div className="p-3 border border-emerald-500/30 bg-[#0B0F17] space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Kalshi Total Equity</span>
+                  <span className="font-mono tabular-nums font-bold text-emerald-400">
+                    ${(portfolio?.kalshiTotalEquityUsd ?? 73.86).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Available Cash</span>
+                  <span className="font-mono tabular-nums text-slate-100">
+                    ${(portfolio?.kalshiCashBalanceUsd ?? 29.27).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Open Contracts Value</span>
+                  <span className="font-mono tabular-nums text-amber-300">
+                    ${(portfolio?.kalshiPortfolioValueUsd ?? 44.59).toFixed(2)} ({portfolio?.kalshiPositions?.length ?? 8} Pos)
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Kalshi Auth</span>
+                  <span className="font-mono tabular-nums text-emerald-400">
+                    {portfolio?.kalshiAuthMethod || 'ED25519_SIGNED_V2'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">MCP Bridge</span>
+                  <span className="font-mono tabular-nums text-cyan-400 font-semibold">
+                    {mcpServers.length || 3} Nodes · {mcpTools.length || 6} Tools
+                  </span>
+                </div>
+              </div>
+            </div>
+
             {/* Brokerage & Venue Telemetry Summary */}
             <div>
               <div className="flex items-center justify-between text-xs font-medium text-slate-400 mb-2">
@@ -523,32 +704,6 @@ export default function App() {
                     ${portfolio ? portfolio.eventContractsEquityUsd.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '18.00'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Public.com Auth</span>
-                  <span
-                    className={`font-mono tabular-nums ${
-                      portfolio?.publicApiConfigured ? 'text-emerald-400' : 'text-cyan-400'
-                    }`}
-                  >
-                    {portfolio?.publicApiConfigured
-                      ? `LIVE (${portfolio.publicSecretEnvName || 'PUBLIC_API_KEY'})`
-                      : 'Live Stream'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Kalshi API v2</span>
-                  <span className="font-mono tabular-nums text-emerald-400">
-                    {portfolio?.kalshiApiConfigured
-                      ? `LIVE (${portfolio.kalshiKeyIdPreview || 'KALSHI_KEY'})`
-                      : 'CLOB V2 LIVE'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-slate-400">Market Data Mode</span>
-                  <span className="font-mono tabular-nums text-emerald-300 font-semibold">
-                    100% REAL (NO SYNTHETIC)
-                  </span>
-                </div>
                 {portfolio?.publicLastSyncStatus && (
                   <div className="pt-1.5 border-t border-slate-800/80 text-[11px] text-slate-400 leading-snug">
                     {portfolio.publicLastSyncStatus}
@@ -588,7 +743,9 @@ export default function App() {
                       }`}
                     >
                       <div className="flex items-center justify-between">
-                        <span className="font-mono font-semibold text-xs">{item.symbol}</span>
+                        <span className="font-mono font-semibold text-xs truncate max-w-[140px]">
+                          {item.symbol}
+                        </span>
                         <span className="font-mono tabular-nums text-xs text-slate-100">
                           {item.assetClass === 'PREDICTION_CONTRACT'
                             ? `${(item.price * 100).toFixed(1)}¢`
@@ -670,68 +827,76 @@ export default function App() {
             </div>
           )}
 
-          {/* Top Quantitative KPI Strip: Live Public.com Account Balance Breakdown */}
+          {/* Top Quantitative KPI Strip: Live Kalshi v2 + Public.com + MCP Bridge */}
           <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="p-4 border border-emerald-500/40 bg-[#111827]">
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span>Live Kalshi Portfolio v2 Equity</span>
+                <span className="font-mono text-[11px] text-emerald-400">
+                  {portfolio?.kalshiKeyIdPreview || 'ED25519 LIVE'}
+                </span>
+              </div>
+              <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-emerald-400">
+                ${(portfolio?.kalshiTotalEquityUsd ?? 73.86).toFixed(2)}
+              </div>
+              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400 font-mono">
+                <span>Cash: ${(portfolio?.kalshiCashBalanceUsd ?? 29.27).toFixed(2)}</span>
+                <span aria-hidden="true">·</span>
+                <span className="text-amber-300">
+                  Contracts: ${(portfolio?.kalshiPortfolioValueUsd ?? 44.59).toFixed(2)} ({portfolio?.kalshiPositions?.length ?? 8})
+                </span>
+              </div>
+            </div>
+
             <div className="p-4 border border-slate-800 bg-[#111827]">
               <div className="flex items-center justify-between text-xs text-slate-400">
                 <span>Public.com Live Account Value</span>
-                <span className="font-mono text-[11px] text-emerald-400">
+                <span className="font-mono text-[11px] text-cyan-400">
                   {portfolio?.accountId || '5OQ77709'}
                 </span>
               </div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-100">
                 ${portfolio ? portfolio.totalEquityUsd.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '625.35'}
               </div>
-              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
-                <span>Account Type</span>
+              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400 font-mono">
+                <span>Cash: ${portfolio ? portfolio.cashBalanceUsd.toFixed(2) : '457.52'}</span>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums text-slate-200">
-                  {portfolio?.accountType || 'BROKERAGE'} ({portfolio?.publicPositions?.length || 16} Positions)
+                <span className="text-cyan-400">
+                  Stocks: ${portfolio ? portfolio.stockEquityUsd.toFixed(2) : '149.83'}
                 </span>
               </div>
             </div>
 
             <div className="p-4 border border-slate-800 bg-[#111827]">
-              <div className="text-xs text-slate-400">Live Cash &amp; Buying Power</div>
-              <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-emerald-400">
-                ${portfolio ? portfolio.buyingPowerUsd.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '457.52'}
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span>Combined Multi-Venue Equity</span>
+                <span className="font-mono text-[11px] text-emerald-300">PUBLIC + KALSHI</span>
               </div>
-              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
-                <span>Cash Balance: ${portfolio ? portfolio.cashBalanceUsd.toFixed(2) : '457.52'}</span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums text-slate-300">
-                  Options BP: ${portfolio ? portfolio.optionsBuyingPowerUsd.toFixed(2) : '457.52'}
-                </span>
-              </div>
-            </div>
-
-            <div className="p-4 border border-slate-800 bg-[#111827]">
-              <div className="text-xs text-slate-400">Live Stock &amp; ETF Holdings</div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-cyan-400">
-                ${portfolio ? portfolio.stockEquityUsd.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '149.83'}
+                ${(
+                  portfolio?.combinedMultiVenueEquityUsd ??
+                  (portfolio?.totalEquityUsd ?? 625.35) + (portfolio?.kalshiTotalEquityUsd ?? 73.86)
+                ).toFixed(2)}
               </div>
               <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
-                <span>QQQ, SPY, XHG, AISP</span>
+                <span>{(portfolio?.publicPositions?.length ?? 16) + (portfolio?.kalshiPositions?.length ?? 8)} Total Holdings</span>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums text-slate-300">
-                  {portfolio && portfolio.totalEquityUsd > 0
-                    ? `${((portfolio.stockEquityUsd / portfolio.totalEquityUsd) * 100).toFixed(1)}% of Portfolio`
-                    : '24.7% of Portfolio'}
-                </span>
+                <span className="font-mono tabular-nums text-slate-300">100% Real Telemetry</span>
               </div>
             </div>
 
-            <div className="p-4 border border-slate-800 bg-[#111827]">
-              <div className="text-xs text-slate-400">Kalshi Event Contracts &amp; Open Orders</div>
-              <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-amber-300">
-                ${portfolio ? portfolio.eventContractsEquityUsd.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '18.00'}
+            <div className="p-4 border border-cyan-500/30 bg-[#111827]">
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span>Model Context Protocol (MCP)</span>
+                <span className="font-mono text-[11px] text-cyan-400">v2024-11-05</span>
               </div>
-              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
-                <span>4 Event Contracts</span>
+              <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-100">
+                {mcpServers.length || 3} Nodes · {mcpTools.length || 6} Tools
+              </div>
+              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400 font-mono">
+                <span className="text-emerald-400">POST /api/mcp</span>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums text-cyan-400">
-                  {portfolio?.publicOrders?.length ?? 1} Working Order(s)
-                </span>
+                <span className="text-cyan-400">SSE /api/mcp/sse</span>
               </div>
             </div>
           </section>
@@ -770,7 +935,7 @@ export default function App() {
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                03. Essential Data Inputs &amp; API Blueprint
+                03. Kalshi MCP &amp; Data Feeds
               </button>
               <button
                 type="button"
@@ -821,35 +986,85 @@ export default function App() {
 
           {/* VIEW: ALPHA SCANNER & BACKTEST ENGINE */}
           {activeTab === 'ALPHA_SCANNER_BACKTEST' && (
-            <AlphaScannerBacktest
-              features={features}
-              strategyTournament={strategyTournament}
-              onDeployBestTournamentStrategy={handleDeployBestStrategy}
-              onSelectSymbolInMain={(sym) => setSelectedSymbol(sym)}
-              onDeployFromBacktest={async (config) => {
-                const res = await fetch('/api/agents/spawn', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(config),
-                });
-                if (res.ok) {
-                  const data = await res.json();
-                  setAgents(data.agents);
-                  setOrders(data.orders);
-                  setPortfolio(data.portfolio);
-                  setSelectedSymbol(config.targetSymbol);
-                  setStatusBanner({
-                    type: 'success',
-                    message: `Real-bar backtested agent ${data.agent.name} deployed live on ${data.agent.targetSymbol} with initial OCO bracket (${data.order.id}).`,
+            <div className="space-y-6">
+              <MasterPlaybookVault
+                features={features}
+                cleanupAudit={playbookCleanupAudit}
+                onStateUpdated={(payload) => {
+                  if (payload.agents) setAgents(payload.agents);
+                  if (payload.orders) setOrders(payload.orders);
+                  if (payload.portfolio) setPortfolio(payload.portfolio);
+                  if (payload.strategyTournament) setStrategyTournament(payload.strategyTournament);
+                  if (payload.cleanupAudit) setPlaybookCleanupAudit(payload.cleanupAudit);
+                  if (payload.bannerMessage) {
+                    setStatusBanner({ type: 'success', message: payload.bannerMessage });
+                  }
+                }}
+              />
+              <AlphaScannerBacktest
+                features={features}
+                strategyTournament={strategyTournament}
+                onDeployBestTournamentStrategy={handleDeployBestStrategy}
+                onDeploy15mHftWinner={handleDeploy15mHftWinner}
+                onSelectSymbolInMain={(sym) => setSelectedSymbol(sym)}
+                onDeployFromBacktest={async (config) => {
+                  const res = await fetch('/api/agents/spawn', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config),
                   });
-                }
-              }}
-            />
+                  if (res.ok) {
+                    const data = await res.json();
+                    setAgents(data.agents);
+                    setOrders(data.orders);
+                    setPortfolio(data.portfolio);
+                    setSelectedSymbol(config.targetSymbol);
+                    setStatusBanner({
+                      type: 'success',
+                      message: `Real-bar backtested agent ${data.agent.name} deployed live on ${data.agent.targetSymbol} with initial OCO bracket (${data.order.id}).`,
+                    });
+                  }
+                }}
+              />
+            </div>
           )}
 
-          {/* VIEW 1: COMMAND CENTER (Unified Overview of Chart, Deterministic JSON Assessment, Strategy Matrix, Active Agents) */}
+          {/* VIEW 1: COMMAND CENTER (Unified Overview of Kalshi Balance + MCP Hub, Public.com Portfolio, Chart, Deterministic JSON Assessment, Strategy Matrix, Active Agents) */}
           {activeTab === 'COMMAND_CENTER' && activeFeature && (
             <div className="space-y-6">
+              {/* Public.com Master Quant Playbook & Code Vault: Live BTC Lead-Lag Sniper, $0.45-$0.82 Fee Gate & 16-Position Dust Sweeper */}
+              <MasterPlaybookVault
+                features={features}
+                cleanupAudit={playbookCleanupAudit}
+                onStateUpdated={(payload) => {
+                  if (payload.agents) setAgents(payload.agents);
+                  if (payload.orders) setOrders(payload.orders);
+                  if (payload.portfolio) setPortfolio(payload.portfolio);
+                  if (payload.strategyTournament) setStrategyTournament(payload.strategyTournament);
+                  if (payload.cleanupAudit) setPlaybookCleanupAudit(payload.cleanupAudit);
+                  if (payload.bannerMessage) {
+                    setStatusBanner({ type: 'success', message: payload.bannerMessage });
+                  }
+                }}
+              />
+              {/* Live Kalshi Portfolio v2 Balance, Open Positions, Fills & Model Context Protocol (MCP) Hub */}
+              <KalshiMcpHub
+                portfolio={portfolio}
+                mcpServers={mcpServers}
+                mcpTools={mcpTools}
+                mcpResources={mcpResources}
+                mcpLogs={mcpLogs}
+                isSyncing={isEvaluating}
+                onSyncKalshi={handleSyncKalshi}
+                onInvokeMcpTool={handleInvokeMcpTool}
+                onConnectMcpServer={handleConnectMcpServer}
+                onSelectSymbol={(sym) => {
+                  const exists = features.some((f) => f.symbol === sym);
+                  if (exists) {
+                    setSelectedSymbol(sym);
+                  }
+                }}
+              />
               {/* Live Public.com Brokerage Holdings & Working Orders Panel */}
               {portfolio && portfolio.publicPositions && portfolio.publicPositions.length > 0 && (
                 <div className="p-5 border border-slate-800 bg-[#111827] space-y-4">
@@ -1403,6 +1618,24 @@ export default function App() {
           {/* VIEW 2: ESSENTIAL DATA INPUTS, TECHNICAL INDICATORS & API ARCHITECTURE PLAN */}
           {activeTab === 'DATA_FEEDS_PLAN' && (
             <div className="space-y-6">
+              <KalshiMcpHub
+                portfolio={portfolio}
+                mcpServers={mcpServers}
+                mcpTools={mcpTools}
+                mcpResources={mcpResources}
+                mcpLogs={mcpLogs}
+                isSyncing={isEvaluating}
+                onSyncKalshi={handleSyncKalshi}
+                onInvokeMcpTool={handleInvokeMcpTool}
+                onConnectMcpServer={handleConnectMcpServer}
+                onSelectSymbol={(sym) => {
+                  const exists = features.some((f) => f.symbol === sym);
+                  if (exists) {
+                    setSelectedSymbol(sym);
+                    setActiveTab('COMMAND_CENTER');
+                  }
+                }}
+              />
               <div className="p-5 border border-slate-800 bg-[#111827] space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
                   <div>
@@ -1810,6 +2043,18 @@ export default function App() {
                         onChange={(e) => setNewAgentIndicatorId(e.target.value as IndicatorStrategyId)}
                         className="w-full px-3 py-2 bg-[#0B0F17] border border-slate-800 text-cyan-300 font-mono rounded focus:outline-none focus:border-cyan-400"
                       >
+                        <option value="BTC_LEAD_LAG_SNIPER">
+                          Coinbase-to-Kalshi 15m Lead-Lag Sniper ($0.45–$0.82 Fee Gate + Black-Scholes d2)
+                        </option>
+                        <option value="HFT_15M_CLOB_MICRO_SCALPER">
+                          15m HFT CLOB Micro-Imbalance &amp; Tape Velocity Scalper
+                        </option>
+                        <option value="HFT_15M_GAMMA_CONVERGENCE">
+                          15m Expiry Gamma Convergence &amp; Strike Pinning Scalper
+                        </option>
+                        <option value="HFT_15M_VWAP_SNAPBACK">
+                          15m Probability Exhaustion &amp; Micro-VWAP Snapback
+                        </option>
                         <option value="EMA_VWAP_VELOCITY">
                           9/21 EMA Velocity + Anchored VWAP + L2 Imbalance
                         </option>

@@ -1,0 +1,263 @@
+# Public.com Quant System: Master Recovery & Upgrade Vault
+**Saved for:** Skyler (`lakeskyler904@gmail.com`)  
+**Snapshot Date:** October 20, 2026  
+**Account Telemetry:** Cash & Buying Power: `$435.08` | Active Public.com Agents: 4
+
+---
+
+## PART 1: Your 4 Live Public.com Agents (Recovered from Gmail Telemetry)
+
+Your Gmail logs (`hello@team.public.com` and `replies@mail.public.com`) show four active cloud agents running on your Public.com account:
+
+1. **`BTC Lead-Lag Sniper Agent`** (Your missing Coinbase-to-Prediction-Market strategy)
+   * **What it's doing:** Trading 15-minute Bitcoin binary contracts (`BTC Up or Down - 15 minutes?`).
+   * **What's leaking money:** On Oct 19 at 10:14 EDT, it bought **111 contracts at `$0.27`** (`$19.98` total) and paid **`$2.25` in flat fees** (`$1.09` exchange fee + `$1.16` commission)—an immediate **11.2% fee drag** on entry. It is also polling 15-minute `RSI(14)` instead of real-time spot ticks.
+2. **`Portfolio Telemetry And Risk Trim`**
+   * **What it's doing:** Sending hourly position snapshots and holding 16 positions—including 8 tiny fractional "dust" stocks (`1e-05` shares worth `$0.00`) and 3 decaying long-dated Kalshi event contracts.
+3. **`Alpha Research Scanner`**
+   * **What it's doing:** Scanning 140 watchlist stocks every 15 minutes and firing alerts on micro-cap penny stocks (`RCT` at `$0.08`, `XHG` at `$2.16`, `BGIN` at `$1.85`).
+   * **What's wrong:** Cumulative Win Rate is `0` and Profit Factor is `0`.
+4. **`ETH Momentum Buy With Exits`**
+   * **What it's doing:** Trading spot ETH using 15m `RSI(14)` and Volume Ratio with a trailing stop (stopped out at `$2,342.50` on Oct 18).
+
+---
+
+## PART 2: Copy-Paste Prompt Upgrades for Your Public.com App
+
+If you manage these agents directly inside the Public.com app or web portal, copy and paste these upgraded rules into each agent's instructions immediately:
+
+### 1. Paste into `BTC Lead-Lag Sniper Agent`
+> **UPGRADED EXECUTION & FEE-GATE RULES:**
+> 1. **Contract Price Band (`$0.45` to `$0.82` ONLY):** NEVER buy any 15-minute BTC event contract priced below `$0.45` or above `$0.82`. Because Public.com charges a flat `$0.02` per-contract fee (`$0.01` exchange + `$0.01` commission), buying cheap contracts (`$0.19–$0.38`) destroys expectancy via fee drag.
+> 2. **Net-of-Fee Edge Calculation:** Before placing any order, calculate fair binary probability from BTC spot distance to the target strike. Subtract `$0.02` per contract from the expected payout. Only execute if Net Expected Value > `+$0.04` per contract.
+> 3. **Position Cap:** Maximum `25` contracts or `$18.00` total risk per 15-minute window.
+> 4. **No Flip-Flopping:** Never buy both `Yes` and `No` on the same target strike within the same 15-minute window unless locking in a guaranteed risk-free arbitrage spread where `Yes + No + $0.04 fees < $1.00`.
+
+### 2. Paste into `Portfolio Telemetry And Risk Trim`
+> **UPGRADED CLEANUP & RISK RULES:**
+> 1. **Sweep Equity Dust:** During regular market hours (9:30 AM – 4:00 PM EDT), liquidate any equity position whose total dollar value is under `$1.00` (`BGIN`, `GLND`, `XRPN`, `BZAI`, `SHMD`, `KOD`, `EGG`, `AIB`). Use `HIGHEST_COST` tax-lot matching to harvest capital losses.
+> 2. **Trim Stale Event Contracts:** Close non-core event contracts (`KALSHI.KXALIENS-27-29.Y`, `KALSHI.KXBTCMAX100-26-NOV.Y`, `KALSHI.KXBTCPRICE-130000-27JUL08.Y`) if unrealized loss exceeds `-12%` and expiry is more than 14 days away.
+> 3. **Core Protection:** Do NOT auto-liquidate core holdings (`QQQ`, `SPY`, `ACN`, `AISP`) or profitable intraday BTC contracts (`KALSHI.KXBTCD`).
+
+### 3. Paste into `Alpha Research Scanner`
+> **UPGRADED LIQUIDITY & QUALITY FILTER:**
+> 1. **Ban Penny Stocks:** Immediately exclude any equity priced under `$10.00` per share (`RCT`, `XHG`, `BGIN`, `RADX`, `MMLP`) or with average daily volume under `1,000,000` shares.
+> 2. **Focus on Optionable Liquid Leaders:** Restrict momentum and volume-surge alerts strictly to liquid S&P 500 / Nasdaq-100 equities and ETFs where bid-ask spreads are tight (`< 0.05%`).
+
+---
+
+## PART 3: Your Portfolio Dust & Stale Position Audit Table
+
+| Symbol | Asset Type | Current Qty | Value | Unrealized P&L | Action to Take |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`BGIN`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`GLND`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`XRPN`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`BZAI`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`SHMD`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`KOD`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`EGG`** | Equity | `0.00001` | `$0.00` | `$0.00` | **SELL DUST** (`$0` commission, `HIGHEST_COST` lot) |
+| **`AIB`** | Equity | `0.00835` | `$0.01` | `-$0.01` (`-50.1%`) | **SELL DUST** (`$0` commission, harvest loss) |
+| **`KALSHI.KXALIENS-27-29.Y`** | Event | `21` | `$4.20` | `-$0.63` (`-13.0%`) | **TRIM STALE** (Frees `$3.78` net of `$0.42` fees) |
+| **`KALSHI.KXBTCMAX100-26-NOV.Y`** | Event | `10` | `$1.40` | `-$0.70` (`-33.3%`) | **TRIM STALE** (Frees `$1.20` net of `$0.20` fees) |
+| **`KALSHI.KXBTCPRICE-130000-27JUL08.Y`** | Event | `5` | `$1.20` | `-$0.35` (`-22.6%`) | **TRIM STALE** (Frees `$1.10` net of `$0.10` fees) |
+| **`KALSHI.KXBTCD-26OCT2317-T81499.99.Y`** | Event | `20` | `$11.20` | `+$0.40` (`+3.7%`) | **KEEP** (Active BTC position in profit) |
+| **`QQQ` / `SPY` / `ACN` / `AISP`** | Equities | Core | `$170.95` | Core Holdings | **KEEP** (Protected core equity holdings) |
+
+---
+
+## PART 4: Complete Python Engine (`btc_lead_lag_and_cleaner.py`)
+
+When you are on a computer with Python (`pip install duckdb websockets httpx pydantic google-genai`), save and run this single script. It includes:
+1. Secure local API key storage (never exposed in chat).
+2. Local `quant_ledger.duckdb` database creation.
+3. The Portfolio Dust & Stale Kalshi Sweeper.
+4. The Coinbase WebSocket-to-Public.com BTC Lead-Lag Sniper Engine.
+
+```python
+import asyncio
+import datetime
+import getpass
+import json
+import math
+import os
+from typing import Literal, Optional
+
+import duckdb
+import httpx
+import websockets
+from pydantic import BaseModel, Field
+
+# Optional Google GenAI SDK import
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
+
+DB_PATH = "quant_ledger.duckdb"
+ENV_PATH = ".env"
+
+
+# =====================================================================
+# 1. SECURE LOCAL KEY VAULT (Never paste keys in chat!)
+# =====================================================================
+def ensure_local_keys():
+    """Prompts for keys locally in terminal if not already set in .env."""
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH, "r") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    os.environ[k] = v
+
+    if not os.environ.get("PUBLIC_COM_SECRET"):
+        print("\n=== LOCAL KEY SETUP (Stored strictly on your device) ===")
+        pub_key = getpass.getpass("Paste your PUBLIC_COM_SECRET (hidden, press Enter to skip for dry-run): ").strip()
+        gem_key = getpass.getpass("Paste your GEMINI_API_KEY (hidden, press Enter to skip for dry-run): ").strip()
+        with open(ENV_PATH, "w") as f:
+            f.write(f"PUBLIC_COM_SECRET={pub_key}\n")
+            f.write(f"GEMINI_API_KEY={gem_key}\n")
+            f.write("ENABLE_TRADING=false\n")
+        os.environ["PUBLIC_COM_SECRET"] = pub_key
+        os.environ["GEMINI_API_KEY"] = gem_key
+        os.environ["ENABLE_TRADING"] = "false"
+
+
+# =====================================================================
+# 2. DUCKDB TELEMETRY LEDGER (Replaces Gmail Inbox Logging)
+# =====================================================================
+def init_db() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS cleanup_audit (
+            ts TIMESTAMP,
+            symbol VARCHAR,
+            asset_type VARCHAR,
+            qty DOUBLE,
+            current_value DOUBLE,
+            action VARCHAR,
+            est_fee DOUBLE,
+            net_cash_freed DOUBLE,
+            mode VARCHAR
+        );
+        CREATE TABLE IF NOT EXISTS lead_lag_signals (
+            ts TIMESTAMP,
+            coinbase_spot DOUBLE,
+            strike DOUBLE,
+            minutes_left DOUBLE,
+            yes_ask DOUBLE,
+            no_ask DOUBLE,
+            fair_yes_prob DOUBLE,
+            net_edge_per_contract DOUBLE,
+            action VARCHAR,
+            contracts INTEGER,
+            rationale VARCHAR
+        );
+    """)
+    return con
+
+
+# =====================================================================
+# 3. PORTFOLIO DUST & STALE EVENT CONTRACT SWEEPER
+# =====================================================================
+PORTFOLIO_SNAPSHOT = [
+    {"symbol": "BGIN", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "GLND", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "AIB", "type": "EQUITY", "qty": 0.00835, "val": 0.01, "pnl_pct": -50.11},
+    {"symbol": "XRPN", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "BZAI", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "SHMD", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "KOD", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "EGG", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
+    {"symbol": "KALSHI.KXALIENS-27-29.Y", "type": "EVENT", "qty": 21, "val": 4.20, "pnl_pct": -13.04},
+    {"symbol": "KALSHI.KXBTCMAX100-26-NOV.Y", "type": "EVENT", "qty": 10, "val": 1.40, "pnl_pct": -33.33},
+    {"symbol": "KALSHI.KXBTCPRICE-130000-27JUL08.Y", "type": "EVENT", "qty": 5, "val": 1.20, "pnl_pct": -22.58},
+    {"symbol": "KALSHI.KXBTCD-26OCT2317-T81499.99.Y", "type": "EVENT", "qty": 20, "val": 11.20, "pnl_pct": 3.70},
+    {"symbol": "QQQ", "type": "EQUITY", "qty": 0.0702, "val": 50.72, "pnl_pct": 1.43},
+    {"symbol": "SPY", "type": "EQUITY", "qty": 0.06493, "val": 49.92, "pnl_pct": -0.17},
+    {"symbol": "ACN", "type": "EQUITY", "qty": 0.219, "val": 50.83, "pnl_pct": -0.34},
+    {"symbol": "AISP", "type": "EQUITY", "qty": 9.41176, "val": 19.53, "pnl_pct": -12.62},
+]
+
+
+def run_portfolio_cleaner(con: duckdb.DuckDBPyConnection):
+    mode = "LIVE" if os.environ.get("ENABLE_TRADING", "false").lower() == "true" else "DRY_RUN"
+    print(f"\n=== RUNNING PORTFOLIO CLEANER [{mode}] ===")
+    for pos in PORTFOLIO_SNAPSHOT:
+        sym, ptype, qty, val, pnl = pos["symbol"], pos["type"], pos["qty"], pos["val"], pos["pnl_pct"]
+        if ptype == "EQUITY" and val < 1.00:
+            action = "SWEEP_EQUITY_DUST (HIGHEST_COST LOT)"
+            fee = 0.00
+            net_freed = val
+        elif ptype == "EVENT" and pnl < -12.0:
+            action = "TRIM_STALE_EVENT_CONTRACT"
+            fee = round(qty * 0.02, 2)
+            net_freed = round(max(0.0, val - fee), 2)
+        else:
+            action = "KEEP_PROTECTED"
+            fee = 0.00
+            net_freed = 0.00
+
+        con.execute(
+            "INSERT INTO cleanup_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [datetime.datetime.now(datetime.timezone.utc), sym, ptype, qty, val, action, fee, net_freed, mode],
+        )
+
+    df = con.execute(
+        "SELECT symbol, asset_type, qty, current_value, action, est_fee, net_cash_freed FROM cleanup_audit"
+    ).fetchdf()
+    print(df.to_string(index=False))
+
+
+# =====================================================================
+# 4. BTC LEAD-LAG SNIPER MATH & RISK GATE
+# =====================================================================
+def evaluate_btc_lead_lag(
+    coinbase_spot: float,
+    strike: float,
+    minutes_left: float,
+    yes_ask: float,
+    no_ask: float,
+    annual_vol: float = 0.55,
+    fee_per_contract: float = 0.02,
+):
+    """Calculates exact Black-Scholes binary probability & enforces the $0.45-$0.82 fee gate."""
+    t_years = max(minutes_left, 0.1) / (365.25 * 24 * 60)
+    sigma_t = annual_vol * math.sqrt(t_years)
+    d2 = (math.log(coinbase_spot / strike) - 0.5 * (annual_vol ** 2) * t_years) / sigma_t
+    fair_yes = 0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0)))
+    fair_no = 1.0 - fair_yes
+
+    yes_edge = fair_yes - (yes_ask + fee_per_contract)
+    no_edge = fair_no - (no_ask + fee_per_contract)
+
+    best_side = "BUY_YES" if yes_edge >= no_edge else "BUY_NO"
+    best_ask = yes_ask if best_side == "BUY_YES" else no_ask
+    best_edge = max(yes_edge, no_edge)
+
+    # Hard Deterministic Risk Gate
+    if best_ask < 0.45 or best_ask > 0.82:
+        return "HOLD", 0, fair_yes, best_edge, f"Blocked by Fee Gate: Ask ${best_ask:.2f} outside [$0.45, $0.82]"
+    if best_edge < 0.04:
+        return "HOLD", 0, fair_yes, best_edge, f"Insufficient Net Edge (${best_edge:.3f} < $0.04 min)"
+
+    contracts = min(25, int(18.00 // (best_ask + fee_per_contract)))
+    return best_side, contracts, fair_yes, best_edge, f"Approved {best_side}: Net Edge +${best_edge:.3f}/contract"
+
+
+if __name__ == "__main__":
+    ensure_local_keys()
+    db_con = init_db()
+    run_portfolio_cleaner(db_con)
+
+    print("\n=== TESTING BTC LEAD-LAG SNIPER GATE ===")
+    # Test 1: Your Oct 19 10:14 AM trade ($0.27 ask -> should be BLOCKED by fee gate)
+    act1, qty1, prob1, edge1, reason1 = evaluate_btc_lead_lag(82010.0, 82021.39, 12.0, 0.27, 0.75)
+    print(f"Test 1 ($0.27 Ask): Action={act1} | Qty={qty1} | FairYes={prob1:.1%} | {reason1}")
+
+    # Test 2: High-conviction Coinbase surge above strike ($0.62 ask -> APPROVED)
+    act2, qty2, prob2, edge2, reason2 = evaluate_btc_lead_lag(82620.0, 82510.73, 10.0, 0.62, 0.40)
+    print(f"Test 2 ($0.62 Ask): Action={act2} | Qty={qty2} | FairYes={prob2:.1%} | {reason2}")
+```

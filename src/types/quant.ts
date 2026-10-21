@@ -21,12 +21,55 @@ export type StrategyArchetype = 'LONG_AND_LOW' | 'SHORT_AND_FAST';
 export type ExecutionVenue = 'PUBLIC_BROKERAGE' | 'PREDICTION_MARKET';
 export type AgentStatus = 'ACTIVE' | 'PAUSED' | 'HALTED_BY_KILL_SWITCH';
 export type IndicatorStrategyId =
+  | 'BTC_LEAD_LAG_SNIPER'
+  | 'HFT_15M_CLOB_MICRO_SCALPER'
+  | 'HFT_15M_GAMMA_CONVERGENCE'
+  | 'HFT_15M_VWAP_SNAPBACK'
   | 'EMA_VWAP_VELOCITY'
   | 'MACD_RVOL_MOMENTUM'
   | 'BB_SQUEEZE_BREAKOUT'
   | 'RSI_ATR_MEAN_REVERSION'
   | 'STOCH_RSI_OBV_SCALPER'
   | 'KALSHI_CLOB_IMBALANCE';
+
+export interface LeadLagSignalEvaluation {
+  ts: string;
+  coinbaseSpot: number;
+  strike: number;
+  minutesLeft: number;
+  yesAsk: number;
+  noAsk: number;
+  annualVol: number;
+  feePerContract: number;
+  d2: number;
+  fairYesProb: number;
+  fairNoProb: number;
+  yesNetEdge: number;
+  noNetEdge: number;
+  bestSide: 'BUY_YES' | 'BUY_NO';
+  bestAsk: number;
+  netEdgePerContract: number;
+  action: 'BUY_YES' | 'BUY_NO' | 'HOLD';
+  contracts: number;
+  totalRiskUsd: number;
+  feeGatePassed: boolean;
+  edgeGatePassed: boolean;
+  rationale: string;
+}
+
+export interface PlaybookCleanupAuditRow {
+  ts: string;
+  symbol: string;
+  assetType: 'EQUITY' | 'EVENT';
+  qty: number;
+  currentValue: number;
+  pnlPct: number;
+  action: 'SWEEP_EQUITY_DUST (HIGHEST_COST LOT)' | 'TRIM_STALE_EVENT_CONTRACT' | 'KEEP_PROTECTED';
+  estFee: number;
+  netCashFreed: number;
+  mode: 'LIVE' | 'DRY_RUN' | 'EXECUTED';
+  swept?: boolean;
+}
 
 export interface OHLCVBar {
   timestamp: string;
@@ -69,7 +112,16 @@ export interface MarketFeatureVector {
   bbBandwidthPct?: number; // Bollinger Band width %
   macdHistogram?: number; // MACD(12,26,9) histogram
   stochRsi?: number; // Stochastic RSI (0-100)
-  dataSource?: string; // e.g. 'LIVE_PUBLIC_AND_EXCHANGE_BARS' | 'LIVE_KALSHI_CLOB_V2'
+  dataSource?: string; // e.g. 'LIVE_PUBLIC_AND_EXCHANGE_BARS' | 'LIVE_KALSHI_CLOB_V2' | 'LIVE_KALSHI_15M_HFT_CLOB'
+  is15MinPrediction?: boolean;
+  seriesTicker?: string;
+  activeContractTicker?: string;
+  targetStrikeLabel?: string;
+  closeTimeIso?: string;
+  secondsToExpiry?: number;
+  recentSettlements?: Array<'YES' | 'NO'>;
+  tradesPerMinute?: number;
+  leadLagSignal?: LeadLagSignalEvaluation;
   bars: OHLCVBar[];
   lastAssessment?: QuantitativeRegimeAssessment;
 }
@@ -173,6 +225,90 @@ export interface PublicApiOrder {
   createdAt: string;
 }
 
+export interface KalshiBalanceBreakdown {
+  exchangeIndex: number;
+  balanceUsd: number;
+}
+
+export interface KalshiPosition {
+  ticker: string;
+  title: string;
+  side: 'YES' | 'NO';
+  contracts: number;
+  rawPositionFp: number;
+  marketExposureUsd: number;
+  currentPrice: number;
+  yesPrice: number;
+  currentValueUsd: number;
+  unrealizedPnlUsd: number;
+  realizedPnlUsd: number;
+  feesPaidUsd: number;
+  totalTradedUsd: number;
+  lastUpdatedTs: string;
+}
+
+export interface KalshiFill {
+  fillId: string;
+  orderId: string;
+  ticker: string;
+  action: 'buy' | 'sell';
+  side: 'yes' | 'no';
+  count: number;
+  yesPrice: number;
+  noPrice: number;
+  feeCostUsd: number;
+  isTaker: boolean;
+  createdTime: string;
+}
+
+export interface McpToolDefinition {
+  name: string;
+  description: string;
+  category:
+    | 'KALSHI_PORTFOLIO'
+    | 'PUBLIC_BROKERAGE'
+    | 'QUANT_REGIME'
+    | 'ALPHA_BACKTEST'
+    | 'ORDER_EXECUTION'
+    | 'RISK_GOVERNANCE';
+  inputSchema: Record<string, any>;
+}
+
+export interface McpResourceDefinition {
+  uri: string;
+  name: string;
+  description: string;
+  mimeType: string;
+}
+
+export interface McpServerConnection {
+  id: string;
+  name: string;
+  transport: 'HTTP_JSON_RPC' | 'SSE_STREAM' | 'STDIO_BRIDGE';
+  endpointUrl: string;
+  protocolVersion: string;
+  status: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED';
+  latencyMs: number;
+  authType: string;
+  toolsCount: number;
+  resourcesCount: number;
+  lastPingAt: string;
+  capabilities: string[];
+}
+
+export interface McpCallLogEntry {
+  id: string;
+  timestamp: string;
+  serverId: string;
+  method: string;
+  toolOrResourceName: string;
+  args: Record<string, any>;
+  durationMs: number;
+  status: 'SUCCESS' | 'ERROR';
+  responsePreview: string;
+  rawJsonRpcResponse?: Record<string, any>;
+}
+
 export interface PortfolioSummary {
   accountId: string;
   accountType: string;
@@ -186,8 +322,19 @@ export interface PortfolioSummary {
   predictionApiConfigured: boolean;
   kalshiApiConfigured?: boolean;
   kalshiApiConnected?: boolean;
+  kalshiAuthMethod?: string;
   kalshiKeyIdPreview?: string;
   kalshiLastSyncStatus?: string;
+  kalshiCashBalanceUsd?: number;
+  kalshiPortfolioValueUsd?: number;
+  kalshiTotalEquityUsd?: number;
+  kalshiBalanceBreakdown?: KalshiBalanceBreakdown[];
+  kalshiPositions?: KalshiPosition[];
+  kalshiRecentFills?: KalshiFill[];
+  combinedMultiVenueEquityUsd?: number;
+  mcpConnected?: boolean;
+  mcpServerCount?: number;
+  mcpToolCount?: number;
   totalEquityUsd: number;
   buyingPowerUsd: number;
   cashOnlyBuyingPowerUsd: number;
@@ -283,6 +430,50 @@ export interface BacktestResult {
   trades: BacktestTrade[];
 }
 
+export interface ComparativeEquityPoint {
+  timestamp: string;
+  barIndex: number;
+  strategyAEquity: number;
+  strategyBEquity: number;
+  benchmarkEquity: number;
+  strategyADrawdownPct: number;
+  strategyBDrawdownPct: number;
+  equitySpreadUsd: number;
+  underlyingPrice: number;
+}
+
+export interface ComparativeBacktestResult {
+  symbol: string;
+  detectedRegime: MarketRegime;
+  barsTested: number;
+  initialCapitalUsd: number;
+  dataSource: string;
+  dataQualityWarning: boolean;
+  strategyA: BacktestResult;
+  strategyB: BacktestResult;
+  winnerStrategyId: IndicatorStrategyId;
+  winnerStrategyLabel: string;
+  winnerSlot: 'STRATEGY_A' | 'STRATEGY_B';
+  deltas: {
+    totalReturnSpreadPct: number;
+    netAlphaSpreadPct: number;
+    sharpeSpread: number;
+    sortinoSpread: number;
+    maxDrawdownSpreadPct: number;
+    winRateSpreadPct: number;
+    profitFactorSpread: number;
+  };
+  riskFirstVerdict: {
+    downsideWinnerId: IndicatorStrategyId;
+    riskAdjustedWinnerId: IndicatorStrategyId;
+    invalidationThresholdAtr: number;
+    maxAllowedDrawdownPct: number;
+    rationale: string;
+  };
+  equityCurve: ComparativeEquityPoint[];
+}
+
+
 export interface StrategyTournamentEntry {
   rank: number;
   symbol: string;
@@ -305,6 +496,9 @@ export interface StrategyTournamentEntry {
   recommendedStopAtr: number;
   recommendedTakeProfitAtr: number;
   compositeScore: number;
+  is15MinPrediction?: boolean;
+  activeContractTicker?: string;
+  targetStrikeLabel?: string;
 }
 
 export type RiskEventType =
