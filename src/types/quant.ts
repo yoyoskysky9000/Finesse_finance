@@ -526,5 +526,65 @@ export interface RiskEventNotification {
   acknowledged: boolean;
 }
 
+export interface AppSourceFileEntry {
+  path: string;
+  sizeBytes: number;
+  sha256: string;
+  category: 'BACKEND' | 'FRONTEND' | 'CONFIG' | 'PLAYBOOK_VAULT';
+  content: string;
+}
 
+export interface AppBundleExportPayload {
+  bundleId: string;
+  exportedAt: string;
+  appName: string;
+  version: string;
+  dataQualityWarning: boolean;
+  riskFirstEvaluation: {
+    portfolioDrawdownPct: number;
+    maxAllowedDrawdownPct: number;
+    globalKillSwitchActive: boolean;
+    activeCircuitBreakerAlerts: number;
+    invalidationThresholdAtr: number;
+    rationale: string;
+  };
+  summaryMetrics: {
+    totalSourceFiles: number;
+    totalBundleBytes: number;
+    trackedInstrumentsCount: number;
+    activeAgentsCount: number;
+    workingOrdersCount: number;
+    combinedMultiVenueEquityUsd: number;
+  };
+  liveState: {
+    portfolio: PortfolioSummary;
+    feeds: DataFeedSpec[];
+    features: MarketFeatureVector[];
+    agents: AutonomousAgent[];
+    orders: ExecutedOrder[];
+    riskEvents: RiskEventNotification[];
+    strategyTournament: StrategyTournamentEntry[];
+    playbookCleanupAudit: PlaybookCleanupAuditRow[];
+  };
+  sourceFiles: AppSourceFileEntry[];
+  playbookMarkdownReport: string;
+}
 
+export interface DriveCopiedArtifact {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  webViewLink: string;
+  createdTime: string;
+}
+
+export interface DriveAppCopyFolder {
+  id: string;
+  name: string;
+  createdTime: string;
+  modifiedTime?: string;
+  webViewLink: string;
+  description?: string;
+  files?: DriveCopiedArtifact[];
+}

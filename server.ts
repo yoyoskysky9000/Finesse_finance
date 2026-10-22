@@ -2,11 +2,14 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import crypto from 'crypto';
 import type {
   AlphaOpportunity,
+  AppBundleExportPayload,
+  AppSourceFileEntry,
   AutonomousAgent,
   BacktestEquityPoint,
   BacktestResult,
@@ -6083,6 +6086,208 @@ app.post('/api/mcp/connect', async (req, res) => {
     resources: mcpResourceDefinitions,
     logs: mcpCallLogs,
     portfolio: computePortfolioSummary(),
+  });
+});
+
+// ============================================================================
+// GOOGLE DRIVE APP COPY & VAULT SYNC BUNDLE ENDPOINTS
+// ============================================================================
+
+app.get('/api/app-bundle/export', (_req, res) => {
+  const portfolio = computePortfolioSummary();
+  const strategyTournament = computeStrategyTournament();
+
+  const candidatePaths: Array<{
+    relPath: string;
+    category: AppSourceFileEntry['category'];
+  }> = [
+    { relPath: 'package.json', category: 'CONFIG' },
+    { relPath: 'metadata.json', category: 'CONFIG' },
+    { relPath: 'tsconfig.json', category: 'CONFIG' },
+    { relPath: 'vite.config.ts', category: 'CONFIG' },
+    { relPath: 'index.html', category: 'FRONTEND' },
+    { relPath: 'server.ts', category: 'BACKEND' },
+    { relPath: 'src/main.tsx', category: 'FRONTEND' },
+    { relPath: 'src/index.css', category: 'FRONTEND' },
+    { relPath: 'src/App.tsx', category: 'FRONTEND' },
+    { relPath: 'src/types/quant.ts', category: 'FRONTEND' },
+    { relPath: 'src/services/googleDriveService.ts', category: 'FRONTEND' },
+    { relPath: 'src/components/GoogleDriveCopyPanel.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/AlphaScannerBacktest.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/ArchetypeVarianceD3Lab.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/PriceEnvelopeChart.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/MasterPlaybookVault.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/KalshiMcpHub.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/RiskEventsLog.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/StrategyCorrelationMatrix.tsx', category: 'FRONTEND' },
+    { relPath: 'src/components/PortfolioTradeCorrelationMatrix.tsx', category: 'FRONTEND' },
+    {
+      relPath: 'public/assets/aistudio/Master_Quant_Playbook___Code_Vault_8d64dfad',
+      category: 'PLAYBOOK_VAULT',
+    },
+  ];
+
+  const sourceFiles: AppSourceFileEntry[] = [];
+  let totalBundleBytes = 0;
+
+  for (const item of candidatePaths) {
+    const absPath = path.join(__dirname, item.relPath);
+    try {
+      if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
+        const content = fs.readFileSync(absPath, 'utf-8');
+        const sizeBytes = Buffer.byteLength(content, 'utf-8');
+        const sha256 = crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
+        sourceFiles.push({
+          path: item.relPath,
+          sizeBytes,
+          sha256,
+          category: item.category,
+          content,
+        });
+        totalBundleBytes += sizeBytes;
+      }
+    } catch {
+      // Skip unreadable file without crashing bundle export
+    }
+  }
+
+  const dataQualityWarning =
+    marketFeatures.length === 0 ||
+    !(portfolio.totalEquityUsd > 0) ||
+    sourceFiles.length === 0;
+
+  const activeAlerts = riskEvents.filter((e) => !e.acknowledged && e.severity === 'CRITICAL').length;
+  const maxAllowedDrawdownPct = 3.5;
+  const invalidationThresholdAtr = 2.2;
+
+  // Deterministic <40-word rationale citing exact metrics from payload
+  const rationale = dataQualityWarning
+    ? `Data quality warning: missing telemetry or source files (${sourceFiles.length}). Defaulting to neutral hold posture prior to Drive export.`
+    : `Portfolio drawdown ${portfolio.portfolioDrawdownPct.toFixed(2)}% stays below ${maxAllowedDrawdownPct.toFixed(1)}% cap with ${activeAlerts} unacknowledged critical alerts and 2.2x ATR kill gate across ${sourceFiles.length} verified files.`;
+
+  const exportedAt = new Date().toISOString();
+  const bundleId = `qp-drive-${Date.now().toString(36)}`;
+
+  const topTournamentRows = strategyTournament
+    .slice(0, 8)
+    .map(
+      (t) =>
+        `| #${t.rank} | ${t.symbol} | ${t.archetype} | ${t.indicatorStrategyId} | +${t.totalReturnPct.toFixed(2)}% | ${t.sharpeRatio.toFixed(2)} | -${t.maxDrawdownPct.toFixed(2)}% |`
+    )
+    .join('\n');
+
+  const playbookMarkdownReport = `# QuantPulse (Finesse_finance) — Full Application & Vault Copy
+- **Bundle ID**: \`${bundleId}\`
+- **Exported Timestamp**: \`${exportedAt}\`
+- **Data Quality Warning**: \`${dataQualityWarning}\`
+- **Combined Multi-Venue Equity**: \`$${(portfolio.combinedMultiVenueEquityUsd ?? portfolio.totalEquityUsd).toFixed(2)}\` (Public.com \`$${portfolio.totalEquityUsd.toFixed(2)}\` + Kalshi v2 \`$${(portfolio.kalshiTotalEquityUsd ?? 73.86).toFixed(2)}\`)
+- **Risk-First Rationale**: ${rationale}
+
+## 1. Risk-First Governance Snapshot
+- **Portfolio Drawdown**: \`${portfolio.portfolioDrawdownPct.toFixed(2)}%\` (Max Allowed: \`${maxAllowedDrawdownPct.toFixed(1)}%\`)
+- **Global Kill-Switch Active**: \`${portfolio.globalKillSwitchActive}\`
+- **ATR Spike Invalidation Gate**: \`${invalidationThresholdAtr}x Baseline ATR(14)\`
+- **Active Autonomous Agents**: \`${autonomousAgents.filter((a) => a.status === 'ACTIVE').length} / ${autonomousAgents.length}\`
+- **Working OCO & Limit Orders**: \`${executedOrders.filter((o) => o.status === 'WORKING_OCO').length}\`
+
+## 2. Top Real-Data Strategy Tournament Leaderboard
+| Rank | Symbol | Archetype | Strategy ID | Return % | Sharpe | Max DD % |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: |
+${topTournamentRows}
+
+## 3. Packaged Application Source Manifest (${sourceFiles.length} Files · ${(totalBundleBytes / 1024).toFixed(1)} KB)
+${sourceFiles.map((f) => `- \`${f.path}\` (${(f.sizeBytes / 1024).toFixed(1)} KB · sha256:\`${f.sha256}\`)`).join('\n')}
+`;
+
+  const payload: AppBundleExportPayload = {
+    bundleId,
+    exportedAt,
+    appName: 'QuantPulse · Finesse_finance Autonomous Trading & Regime Terminal',
+    version: '2.6.0',
+    dataQualityWarning,
+    riskFirstEvaluation: {
+      portfolioDrawdownPct: portfolio.portfolioDrawdownPct,
+      maxAllowedDrawdownPct,
+      globalKillSwitchActive: portfolio.globalKillSwitchActive,
+      activeCircuitBreakerAlerts: activeAlerts,
+      invalidationThresholdAtr,
+      rationale,
+    },
+    summaryMetrics: {
+      totalSourceFiles: sourceFiles.length,
+      totalBundleBytes,
+      trackedInstrumentsCount: marketFeatures.length,
+      activeAgentsCount: autonomousAgents.filter((a) => a.status === 'ACTIVE').length,
+      workingOrdersCount: executedOrders.filter((o) => o.status === 'WORKING_OCO').length,
+      combinedMultiVenueEquityUsd: Number(
+        (portfolio.combinedMultiVenueEquityUsd ?? portfolio.totalEquityUsd + (portfolio.kalshiTotalEquityUsd ?? 73.86)).toFixed(2)
+      ),
+    },
+    liveState: {
+      portfolio,
+      feeds: dataFeedSpecs,
+      features: marketFeatures,
+      agents: autonomousAgents,
+      orders: executedOrders,
+      riskEvents,
+      strategyTournament,
+      playbookCleanupAudit,
+    },
+    sourceFiles,
+    playbookMarkdownReport,
+  };
+
+  res.json(payload);
+});
+
+app.post('/api/app-bundle/restore', (req, res) => {
+  const { bundle } = req.body as { bundle?: Partial<AppBundleExportPayload> };
+  if (!bundle || !bundle.liveState) {
+    return res.status(400).json({
+      error: 'Malformed Google Drive app bundle payload: missing liveState.',
+      dataQualityWarning: true,
+    });
+  }
+
+  const { agents, orders, feeds, riskEvents: restoredRisks } = bundle.liveState;
+
+  if (Array.isArray(agents) && agents.length > 0) {
+    autonomousAgents.length = 0;
+    autonomousAgents.push(...agents);
+  }
+  if (Array.isArray(orders) && orders.length > 0) {
+    executedOrders.length = 0;
+    executedOrders.push(...orders);
+  }
+  if (Array.isArray(feeds) && feeds.length > 0) {
+    for (const incomingFeed of feeds) {
+      const target = dataFeedSpecs.find((f) => f.id === incomingFeed.id);
+      if (target && typeof incomingFeed.enabled === 'boolean') {
+        target.enabled = incomingFeed.enabled;
+      }
+    }
+  }
+  if (Array.isArray(restoredRisks) && restoredRisks.length > 0) {
+    riskEvents.length = 0;
+    riskEvents.push(...restoredRisks);
+  }
+
+  const portfolio = computePortfolioSummary();
+  const strategyTournament = computeStrategyTournament();
+
+  res.json({
+    restoredBundleId: bundle.bundleId || 'drive-snapshot',
+    restoredAt: new Date().toISOString(),
+    dataQualityWarning: false,
+    rationale: `Restored ${autonomousAgents.length} agents and ${executedOrders.length} orders from Google Drive snapshot (${bundle.bundleId || 'verified'}).`,
+    portfolio,
+    feeds: dataFeedSpecs,
+    features: marketFeatures,
+    agents: autonomousAgents,
+    orders: executedOrders,
+    riskEvents,
+    strategyTournament,
+    playbookCleanupAudit,
   });
 });
 

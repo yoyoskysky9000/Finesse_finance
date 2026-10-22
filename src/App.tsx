@@ -41,13 +41,17 @@ import { AlphaScannerBacktest } from './components/AlphaScannerBacktest.tsx';
 import { RiskEventsLog } from './components/RiskEventsLog.tsx';
 import { KalshiMcpHub } from './components/KalshiMcpHub.tsx';
 import { MasterPlaybookVault } from './components/MasterPlaybookVault.tsx';
+import { ArchetypeVarianceD3Lab } from './components/ArchetypeVarianceD3Lab.tsx';
+import { GoogleDriveCopyPanel } from './components/GoogleDriveCopyPanel.tsx';
 
 type WorkspaceTab =
   | 'COMMAND_CENTER'
   | 'ALPHA_SCANNER_BACKTEST'
+  | 'ARCHETYPE_VARIANCE_D3'
   | 'DATA_FEEDS_PLAN'
   | 'REGIME_EVALUATOR'
-  | 'AGENT_ORCHESTRATOR';
+  | 'AGENT_ORCHESTRATOR'
+  | 'GOOGLE_DRIVE_VAULT';
 
 const DEFAULT_ASSESSMENT: QuantitativeRegimeAssessment = {
   market_regime: 'LOW_VOLATILITY_COMPRESSION',
@@ -563,25 +567,16 @@ export default function App() {
               activeTab === 'ALPHA_SCANNER_BACKTEST' ? 'text-slate-100 border-cyan-400' : 'border-transparent'
             }`}
           >
-            Alpha Scanner & Backtest
+            Alpha Backtest
           </button>
           <button
             type="button"
-            onClick={() => setActiveTab('DATA_FEEDS_PLAN')}
+            onClick={() => setActiveTab('ARCHETYPE_VARIANCE_D3')}
             className={`hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
-              activeTab === 'DATA_FEEDS_PLAN' ? 'text-slate-100 border-cyan-400' : 'border-transparent'
+              activeTab === 'ARCHETYPE_VARIANCE_D3' ? 'text-slate-100 border-cyan-400' : 'border-transparent'
             }`}
           >
-            Data & Feeds Plan
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('REGIME_EVALUATOR')}
-            className={`hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
-              activeTab === 'REGIME_EVALUATOR' ? 'text-slate-100 border-cyan-400' : 'border-transparent'
-            }`}
-          >
-            Regime Evaluator
+            D3 Variance
           </button>
           <button
             type="button"
@@ -590,7 +585,16 @@ export default function App() {
               activeTab === 'AGENT_ORCHESTRATOR' ? 'text-slate-100 border-cyan-400' : 'border-transparent'
             }`}
           >
-            Agent Orchestrator
+            Agent Fleet
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('GOOGLE_DRIVE_VAULT')}
+            className={`hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
+              activeTab === 'GOOGLE_DRIVE_VAULT' ? 'text-slate-100 border-cyan-400' : 'border-transparent'
+            }`}
+          >
+            Drive Copy
           </button>
         </nav>
 
@@ -771,7 +775,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Meta-Agent Portfolio Optimizer Action */}
+            {/* Meta-Agent Portfolio Optimizer Action & Google Drive Copy Shortcut */}
             <div className="pt-2 border-t border-slate-800 space-y-2">
               <div className="text-xs font-medium text-slate-400">Dynamic Meta-Agent</div>
               <p className="text-xs text-slate-400 leading-relaxed">
@@ -784,6 +788,14 @@ export default function App() {
               >
                 <Zap className="w-3.5 h-3.5" />
                 <span>Auto-Spawn Optimal Agent</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('GOOGLE_DRIVE_VAULT')}
+                className="w-full py-2 px-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-medium text-xs rounded transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap"
+              >
+                <Database className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Copy App to Google Drive</span>
               </button>
             </div>
           </div>
@@ -959,6 +971,28 @@ export default function App() {
               >
                 05. Agent Spawner &amp; Risk Circuit Breakers
               </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('ARCHETYPE_VARIANCE_D3')}
+                className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap ${
+                  activeTab === 'ARCHETYPE_VARIANCE_D3'
+                    ? 'bg-slate-800 text-cyan-400'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                06. D3 Archetype Variance &amp; Lookback Lab
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('GOOGLE_DRIVE_VAULT')}
+                className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap ${
+                  activeTab === 'GOOGLE_DRIVE_VAULT'
+                    ? 'bg-slate-800 text-emerald-400'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                07. Copy App to Google Drive
+              </button>
             </div>
 
             {activeFeature && (
@@ -983,6 +1017,60 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {/* VIEW: GOOGLE DRIVE APP COPY & VAULT SYNC */}
+          {activeTab === 'GOOGLE_DRIVE_VAULT' && (
+            <GoogleDriveCopyPanel
+              onStateRestored={(restored) => {
+                if (restored.portfolio) setPortfolio(restored.portfolio);
+                if (restored.feeds) setFeeds(restored.feeds);
+                if (restored.features) setFeatures(restored.features);
+                if (restored.agents) setAgents(restored.agents);
+                if (restored.orders) setOrders(restored.orders);
+                if (restored.riskEvents) setRiskEvents(restored.riskEvents);
+                if (restored.strategyTournament) setStrategyTournament(restored.strategyTournament);
+                if (restored.playbookCleanupAudit) setPlaybookCleanupAudit(restored.playbookCleanupAudit);
+                if (restored.bannerMessage) {
+                  setStatusBanner({
+                    type: 'success',
+                    message: restored.bannerMessage,
+                  });
+                }
+              }}
+            />
+          )}
+
+          {/* VIEW: D3 ARCHETYPE VARIANCE & LOOKBACK REGIME DOMINANCE LAB */}
+          {activeTab === 'ARCHETYPE_VARIANCE_D3' && (
+            <ArchetypeVarianceD3Lab
+              features={features}
+              strategyTournament={strategyTournament}
+              agents={agents}
+              selectedSymbol={selectedSymbol}
+              onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+              onOpenInBacktestLab={(sym) => {
+                setSelectedSymbol(sym);
+                setActiveTab('ALPHA_SCANNER_BACKTEST');
+              }}
+              onDeployArchetypeWinner={async (config) => {
+                const res = await fetch('/api/agents/spawn', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(config),
+                });
+                if (res.ok) {
+                  const data = await res.json();
+                  setAgents(data.agents);
+                  setOrders(data.orders);
+                  setPortfolio(data.portfolio);
+                  setStatusBanner({
+                    type: 'success',
+                    message: `Deployed dominant archetype agent ${data.agent.name} (${data.agent.archetype}) on ${data.agent.targetSymbol} with initial OCO order (${data.order.id}).`,
+                  });
+                }
+              }}
+            />
+          )}
 
           {/* VIEW: ALPHA SCANNER & BACKTEST ENGINE */}
           {activeTab === 'ALPHA_SCANNER_BACKTEST' && (
