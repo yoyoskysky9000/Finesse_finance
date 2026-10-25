@@ -294,7 +294,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'btc_lead_lag_and_cleaner.py';
+    a.download = 'mcp_server.py';
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -389,7 +389,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
             }`}
           >
             <FileCode className="w-3.5 h-3.5" />
-            4. Python Engine (btc_lead_lag_and_cleaner.py)
+            4. Step 1 FastMCP Server (mcp_server.py · transport=&apos;http&apos;)
           </button>
         </div>
 
@@ -824,7 +824,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
         </div>
       )}
 
-      {/* TAB 4: PYTHON ENGINE VAULT (btc_lead_lag_and_cleaner.py) */}
+      {/* TAB 4: STEP 1 REFACTORED PYTHON FASTMCP SERVER VAULT (mcp_server.py) */}
       {activeTab === 'PYTHON_VAULT' && (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/80 border border-slate-800 rounded-xl p-3.5">
@@ -832,10 +832,14 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
               <Terminal className="w-4 h-4 text-purple-400" />
               <div>
                 <h3 className="text-xs font-mono font-bold text-white">
-                  btc_lead_lag_and_cleaner.py · DuckDB Telemetry Ledger + Coinbase WebSocket Sniper
+                  mcp_server.py · Step 1 Stateless Streamable HTTP (transport=&apos;http&apos;) + async def Tools + idempotency_key + route_to_dlq + @mcp.prompt()
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  Loaded directly from{' '}
+                  Synchronized with{' '}
+                  <code className="text-purple-300">
+                    /mcp_server.py
+                  </code>{' '}
+                  &amp;{' '}
                   <code className="text-purple-300">
                     /assets/aistudio/Master_Quant_Playbook___Code_Vault_8d64dfad
                   </code>
@@ -864,7 +868,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 transition cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
-                Download btc_lead_lag_and_cleaner.py
+                Download mcp_server.py
               </button>
             </div>
           </div>

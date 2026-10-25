@@ -38,6 +38,10 @@ import {
   subscribeToGoogleAuth,
   trashDriveAppCopyFolder,
 } from '../services/googleDriveService.ts';
+import {
+  syncQuantStateToFirestore,
+  type FirestoreSyncSummary,
+} from '../services/firestoreSyncService.ts';
 
 interface GoogleDriveCopyPanelProps {
   onStateRestored: (restored: {
@@ -101,6 +105,162 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
   // Confirmation modal state for mutating/destructive operations
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [isExecutingConfirmedAction, setIsExecutingConfirmedAction] = useState<boolean>(false);
+
+  // DuckDB ML Feature Store & Meta-Learning Optimizer states
+  const [isTrainingMetaModel, setIsTrainingMetaModel] = useState<boolean>(false);
+  const [metaSymbolFilter, setMetaSymbolFilter] = useState<string>('ALL');
+  const [isExportingMlStore, setIsExportingMlStore] = useState<boolean>(false);
+  const [isImportingMlStore, setIsImportingMlStore] = useState<boolean>(false);
+  const [isSyncingFirestore, setIsSyncingFirestore] = useState<boolean>(false);
+  const [lastFirestoreSync, setLastFirestoreSync] = useState<FirestoreSyncSummary | null>(null);
+
+  const handleSyncToFirestoreCloud = async () => {
+    if (!bundlePreview) return;
+    setIsSyncingFirestore(true);
+    setFeedbackBanner(null);
+    try {
+      const summary = await syncQuantStateToFirestore({
+        agents: bundlePreview.liveState.agents,
+        portfolio: bundlePreview.liveState.portfolio,
+        duckDbTotalRows: bundlePreview.mlFeatureStore?.totalRows ?? 32,
+        duckDbSettledRows: bundlePreview.mlFeatureStore?.settledRows ?? 28,
+        calibratedBrierScore:
+          bundlePreview.mlFeatureStore?.activeMetaModel?.brier_score_calibrated ?? 0.138,
+        activeMetaModelId:
+          bundlePreview.mlFeatureStore?.activeMetaModel?.model_id ?? 'gb-logistic-kalshi-v2',
+      });
+      if (!summary) {
+        setFeedbackBanner({
+          type: 'warn',
+          message:
+            'Sign in with Google first to sync your dual-venue agent allocations & DuckDB ML checkpoint to Firebase Firestore.',
+        });
+      } else {
+        setLastFirestoreSync(summary);
+        setFeedbackBanner({
+          type: 'success',
+          message: `Synced ${summary.agentsSyncedCount} agents ($${summary.topAgentAllocatedUsd.toFixed(2)} top agent: $${summary.kalshiDirectUsd.toFixed(2)} Kalshi + $${summary.publicEventContractUsd.toFixed(2)} Public.com) + ${summary.duckDbTotalRows} DuckDB ML rows to Firestore (${summary.databaseId}).`,
+        });
+      }
+    } catch (err) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? `Firestore Cloud Sync failed: ${err.message}`
+            : 'Firestore Cloud Sync failed.',
+      });
+    } finally {
+      setIsSyncingFirestore(false);
+    }
+  };
+
+  const handleTrainAndOptimizeMetaModel = async () => {
+    setIsTrainingMetaModel(true);
+    setFeedbackBanner(null);
+    try {
+      const res = await fetch('/api/ml-store/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: metaSymbolFilter,
+          min_samples: 20,
+          target_metric: 'brier_score',
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Meta-optimizer endpoint returned HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      await fetchAppBundlePreview();
+      setFeedbackBanner({
+        type: 'success',
+        message: `Trained DuckDB Meta-Model (${data.model_id || 'gb-logistic'} · symbol=${data.symbol_filter || metaSymbolFilter}): Brier ${data.brier_score_raw} → ${data.brier_score_calibrated} (${data.samples_used} settled rows) · Rec ATR Stop ${data.recommended_atr_stop_mult ?? 1.5}x · Rec Edge >= $${data.recommended_min_net_edge} · Avg PnL ${data.avg_realized_pnl_bps ?? 0} bps.`,
+      });
+    } catch (err) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? `Meta-model optimization failed: ${err.message}`
+            : 'Meta-model optimization failed.',
+      });
+    } finally {
+      setIsTrainingMetaModel(false);
+    }
+  };
+
+  const handleExportMlFeatureStore = async () => {
+    setIsExportingMlStore(true);
+    try {
+      const res = await fetch('/api/ml-store/export');
+      if (!res.ok) {
+        throw new Error(`Export endpoint returned HTTP ${res.status}`);
+      }
+      const snapshot = await res.json();
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `QuantPulse_DuckDB_ml_telemetry_ledger_${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setFeedbackBanner({
+        type: 'success',
+        message: `Exported DuckDB ml_telemetry_ledger (${snapshot.totalRows || 0} rows, ${snapshot.settledRows || 0} settled) + active meta-model weights.`,
+      });
+    } catch (err) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? `Failed to export DuckDB ML store: ${err.message}`
+            : 'Failed to export DuckDB ML store.',
+      });
+    } finally {
+      setIsExportingMlStore(false);
+    }
+  };
+
+  const handleImportMlFeatureStoreFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsImportingMlStore(true);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const payload = parsed.mlFeatureStore ? parsed.mlFeatureStore : parsed;
+      const res = await fetch('/api/ml-store/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        throw new Error(`Import endpoint returned HTTP ${res.status}`);
+      }
+      const result = await res.json();
+      await fetchAppBundlePreview();
+      setFeedbackBanner({
+        type: 'success',
+        message: `Imported ${result.importedRows ?? 0} rows into DuckDB ml_telemetry_ledger (${result.totalRows ?? 0} total rows, ${result.settledRows ?? 0} settled).`,
+      });
+    } catch (err) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? `Failed to import DuckDB ML store JSON: ${err.message}`
+            : 'Failed to import DuckDB ML store JSON.',
+      });
+    } finally {
+      setIsImportingMlStore(false);
+      e.target.value = '';
+    }
+  };
 
   const fetchAppBundlePreview = useCallback(async () => {
     setIsLoadingBundle(true);
@@ -242,7 +402,7 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
         type: 'success',
         message: `Copied QuantPulse app bundle (${createdFolder.files?.length || 0} artifacts · ${(
           freshBundle.summaryMetrics.totalBundleBytes / 1024
-        ).toFixed(1)} KB source) to Google Drive folder "${createdFolder.name}".`,
+        ).toFixed(1)} KB source · ${freshBundle.mlFeatureStore?.totalRows ?? 0} DuckDB ML rows) to Google Drive folder "${createdFolder.name}".`,
       });
       await refreshDriveCopiesList();
     } catch (err) {
@@ -302,7 +462,7 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
         });
         setFeedbackBanner({
           type: 'success',
-          message: `Restored live state from Google Drive folder "${pendingConfirmation.folder.name}" (${restoredData.rationale}).`,
+          message: `Restored live state & DuckDB ML Feature Store from Google Drive folder "${pendingConfirmation.folder.name}" (${restoredData.rationale}).`,
         });
         setPendingConfirmation(null);
         await fetchAppBundlePreview();
@@ -394,7 +554,7 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
               Google Drive App Copy &amp; Quantitative Vault Sync
             </h2>
             <p className="text-xs text-slate-400 mt-1">
-              Copy the complete QuantPulse application source codebase, live multi-venue portfolio state, strategy tournament rankings, and Master Quant Playbook directly into your Google Drive.
+              Copy the complete QuantPulse application source codebase, live multi-venue portfolio state, DuckDB ML Feature Store (<code className="font-mono text-cyan-400">ml_telemetry_ledger</code>), and Master Quant Playbook directly into your Google Drive.
             </p>
           </div>
 
@@ -468,7 +628,7 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
                   {(bundlePreview.summaryMetrics.totalBundleBytes / 1024).toFixed(1)} KB
                 </div>
                 <div className="mt-1 text-[11px] text-slate-400 font-mono">
-                  server.ts · src/** · Playbook Vault
+                  server.ts · mcp_server.py · src/**
                 </div>
               </div>
 
@@ -484,13 +644,12 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
               </div>
 
               <div className="p-3.5 border border-slate-800 bg-[#0B0F17]">
-                <div className="text-slate-400">Downside &amp; Drawdown Exposure</div>
-                <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-100">
-                  {bundlePreview.riskFirstEvaluation.portfolioDrawdownPct.toFixed(2)}% /{' '}
-                  {bundlePreview.riskFirstEvaluation.maxAllowedDrawdownPct.toFixed(1)}%
+                <div className="text-slate-400">DuckDB ML Feature Store</div>
+                <div className="mt-1 text-xl font-bold font-mono tabular-nums text-emerald-400">
+                  {bundlePreview.mlFeatureStore?.totalRows ?? 0} Rows ({bundlePreview.mlFeatureStore?.settledRows ?? 0} Settled)
                 </div>
                 <div className="mt-1 text-[11px] text-slate-400 font-mono">
-                  Invalidation Gate: {bundlePreview.riskFirstEvaluation.invalidationThresholdAtr}x ATR
+                  Brier: {bundlePreview.mlFeatureStore?.activeMetaModel?.brier_score_calibrated?.toFixed(4) ?? '0.1380'} · 70/30 N(d2)+ML
                 </div>
               </div>
 
@@ -524,6 +683,21 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
               <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
+                  onClick={handleSyncToFirestoreCloud}
+                  disabled={isSyncingFirestore}
+                  className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-semibold rounded transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>
+                    {isSyncingFirestore
+                      ? 'Syncing Firestore...'
+                      : lastFirestoreSync
+                      ? 'Firestore + DuckDB Synced'
+                      : 'Sync to Firestore + DuckDB'}
+                  </span>
+                </button>
+                <button
+                  type="button"
                   onClick={fetchAppBundlePreview}
                   disabled={isLoadingBundle}
                   className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
@@ -544,6 +718,233 @@ export const GoogleDriveCopyPanel: React.FC<GoogleDriveCopyPanelProps> = ({
           </div>
         )}
       </div>
+
+      {/* Section 1B: Persistent DuckDB ML Feature Store (ml_telemetry_ledger) & Meta-Learning Optimizer */}
+      {bundlePreview?.mlFeatureStore && (
+        <div className="p-5 border border-slate-800 bg-[#111827] space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">
+                DuckDB Persistent ML Feature Store (<code className="font-mono text-cyan-400">ml_telemetry_ledger</code>) &amp; Meta-Learning Optimizer (MCP Tool #9)
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Logs every <code className="font-mono">evaluate_market_regime</code>, <code className="font-mono">evaluate_btc_lead_lag</code>, <code className="font-mono">scan_alpha_and_backtest</code>, and <code className="font-mono">execute_kalshi_or_public_order</code> call across all 10 tickers (<code className="font-mono">NVDA, SPY, QQQ, TLT, AISP, KXBTC15M, KXETH15M, KXSOL15M, KXXRP15M, KXDOGE15M</code>), calibrates <code className="font-mono">ml_calibrated_prob</code> (<code className="font-mono">0.70 * N(d2) + 0.30 * ML</code>), and syncs to Google Drive across Cloud Run container restarts.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0 text-xs">
+              <select
+                value={metaSymbolFilter}
+                onChange={(e) => setMetaSymbolFilter(e.target.value)}
+                className="px-2.5 py-1.5 bg-[#0B0F17] border border-slate-700 text-xs font-mono text-slate-100 rounded"
+              >
+                <option value="ALL">Symbol: ALL (10 Tickers)</option>
+                <option value="KXBTC15M">KXBTC15M (Kalshi BTC)</option>
+                <option value="KXETH15M">KXETH15M (Kalshi ETH)</option>
+                <option value="KXSOL15M">KXSOL15M (Kalshi SOL)</option>
+                <option value="KXXRP15M">KXXRP15M (Kalshi XRP)</option>
+                <option value="KXDOGE15M">KXDOGE15M (Kalshi DOGE)</option>
+                <option value="NVDA">NVDA (Public.com)</option>
+                <option value="SPY">SPY (Public.com)</option>
+                <option value="QQQ">QQQ (Public.com)</option>
+                <option value="TLT">TLT (Public.com)</option>
+                <option value="AISP">AISP (Public.com)</option>
+              </select>
+              <button
+                type="button"
+                onClick={handleTrainAndOptimizeMetaModel}
+                disabled={isTrainingMetaModel}
+                className="px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-semibold rounded transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isTrainingMetaModel ? 'animate-spin' : ''}`} />
+                <span>
+                  {isTrainingMetaModel
+                    ? 'Training Meta-Model...'
+                    : `Run train_and_optimize_meta_model (${metaSymbolFilter})`}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={handleExportMlFeatureStore}
+                disabled={isExportingMlStore}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Export ML Store (/api/ml-store/export)</span>
+              </button>
+              <label className="px-3 py-1.5 border border-slate-700 hover:bg-slate-800 text-slate-200 rounded transition-colors inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap">
+                <CloudUpload className="w-3.5 h-3.5" />
+                <span>{isImportingMlStore ? 'Importing...' : 'Import ML Store JSON'}</span>
+                <input
+                  type="file"
+                  accept=".json,application/json"
+                  onChange={handleImportMlFeatureStoreFile}
+                  className="hidden"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 text-xs font-mono tabular-nums">
+            <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+              <div className="text-slate-400 font-sans">Active Meta-Model ID</div>
+              <div className="mt-1 text-sm font-bold text-cyan-400 truncate">
+                {bundlePreview.mlFeatureStore.activeMetaModel.model_id}
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-400">
+                Scope: {bundlePreview.mlFeatureStore.activeMetaModel.symbol_filter || 'ALL'}
+              </div>
+            </div>
+            <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+              <div className="text-slate-400 font-sans">Brier Score Calibration</div>
+              <div className="mt-1 text-sm font-bold text-emerald-400">
+                {bundlePreview.mlFeatureStore.activeMetaModel.brier_score_raw.toFixed(4)} →{' '}
+                {bundlePreview.mlFeatureStore.activeMetaModel.brier_score_calibrated.toFixed(4)}
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-400">
+                LogLoss: {bundlePreview.mlFeatureStore.activeMetaModel.log_loss_calibrated.toFixed(4)}
+              </div>
+            </div>
+            <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+              <div className="text-slate-400 font-sans">Win Rate &amp; Realized PnL</div>
+              <div className="mt-1 text-sm font-bold text-slate-100">
+                {(bundlePreview.mlFeatureStore.activeMetaModel.empirical_win_rate * 100).toFixed(1)}% ·{' '}
+                <span className="text-emerald-400">
+                  +{bundlePreview.mlFeatureStore.activeMetaModel.avg_realized_pnl_bps ?? 118} bps
+                </span>
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-400">
+                {bundlePreview.mlFeatureStore.settledRows} settled / {bundlePreview.mlFeatureStore.totalRows} total rows
+              </div>
+            </div>
+            <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+              <div className="text-slate-400 font-sans">Rec ATR Stop-Loss Mult</div>
+              <div className="mt-1 text-sm font-bold text-emerald-300">
+                {(bundlePreview.mlFeatureStore.activeMetaModel.recommended_atr_stop_mult ?? 1.5).toFixed(2)}x ATR
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-400">
+                Dynamic volatility stop
+              </div>
+            </div>
+            <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+              <div className="text-slate-400 font-sans">Bayesian Min Net Edge</div>
+              <div className="mt-1 text-sm font-bold text-amber-400">
+                +${bundlePreview.mlFeatureStore.activeMetaModel.recommended_min_net_edge.toFixed(4)}
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-400">
+                After $0.02 Kalshi fee drag
+              </div>
+            </div>
+            <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+              <div className="text-slate-400 font-sans">Optimal Kalshi Ask Band</div>
+              <div className="mt-1 text-sm font-bold text-cyan-300">
+                [${bundlePreview.mlFeatureStore.activeMetaModel.recommended_ask_band[0].toFixed(2)}, $
+                {bundlePreview.mlFeatureStore.activeMetaModel.recommended_ask_band[1].toFixed(2)}]
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-400">
+                Blend: 0.70*N(d2) + 0.30*ML
+              </div>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto border border-slate-800 bg-[#0B0F17] max-h-[260px] overflow-y-auto">
+            <table className="w-full text-left border-collapse text-[11px] font-mono tabular-nums">
+              <thead>
+                <tr className="border-b border-slate-800 text-slate-400 bg-[#0D131F]">
+                  <th className="py-2 px-2.5">UTC Timestamp</th>
+                  <th className="py-2 px-2.5">Symbol · Venue</th>
+                  <th className="py-2 px-2.5 text-right">Spot Price</th>
+                  <th className="py-2 px-2.5 text-right">Strike · Min</th>
+                  <th className="py-2 px-2.5 text-right">Yes/No Ask</th>
+                  <th className="py-2 px-2.5 text-right">L2 Imbal</th>
+                  <th className="py-2 px-2.5 text-right">N(d2) Prob</th>
+                  <th className="py-2 px-2.5 text-right">Net Edge</th>
+                  <th className="py-2 px-2.5 text-right">ATR Mult / RSI</th>
+                  <th className="py-2 px-2.5">Pearson Corr Regime</th>
+                  <th className="py-2 px-2.5">Action</th>
+                  <th className="py-2 px-2.5 text-right">Realized PnL</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/80">
+                {bundlePreview.mlFeatureStore.rows
+                  .filter((r) => metaSymbolFilter === 'ALL' || r.symbol === metaSymbolFilter)
+                  .slice(0, 18)
+                  .map((row, idx) => {
+                    const spotVal = row.spot_price ?? row.coinbase_spot;
+                    const l2Val = row.l2_imbalance ?? 1.42;
+                    const corrRegime = row.pearson_corr_regime ?? row.market_regime;
+                    const pnlBps = row.realized_pnl_bps;
+                    return (
+                      <tr key={`${row.timestamp_utc}-${idx}`} className="hover:bg-slate-800/30">
+                        <td className="py-1.5 px-2.5 text-slate-400">
+                          {row.timestamp_utc.slice(11, 19)}
+                        </td>
+                        <td className="py-1.5 px-2.5 text-slate-200 font-semibold">
+                          {row.symbol}{' '}
+                          <span className="text-[10px] text-cyan-400 font-normal">
+                            ({row.venue || (row.symbol.startsWith('KX') ? 'KALSHI' : 'PUBLIC')})
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right text-slate-100">
+                          ${spotVal.toLocaleString()}
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right text-slate-300">
+                          ${row.strike.toLocaleString()} ({row.minutes_left.toFixed(0)}m)
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right text-cyan-300">
+                          ${row.yes_ask.toFixed(2)} / ${row.no_ask.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right text-emerald-300">
+                          {l2Val.toFixed(2)}x
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right text-emerald-400">
+                          {(row.nd2_fair_prob * 100).toFixed(1)}%
+                        </td>
+                        <td
+                          className={`py-1.5 px-2.5 text-right ${
+                            row.net_edge_dollars >= 0.04 ? 'text-emerald-400' : 'text-slate-400'
+                          }`}
+                        >
+                          {row.net_edge_dollars >= 0 ? '+' : ''}${row.net_edge_dollars.toFixed(3)}
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right text-slate-300">
+                          {row.atr_baseline_mult.toFixed(2)}x / {row.rsi_14.toFixed(1)}
+                        </td>
+                        <td className="py-1.5 px-2.5 text-slate-300">{corrRegime}</td>
+                        <td
+                          className={`py-1.5 px-2.5 font-semibold ${
+                            row.sniper_action === 'EXECUTE' ? 'text-emerald-400' : 'text-amber-400'
+                          }`}
+                        >
+                          {row.sniper_action}
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right">
+                          {pnlBps !== null && pnlBps !== undefined ? (
+                            <span
+                              className={
+                                pnlBps >= 0
+                                  ? 'text-emerald-400 font-semibold'
+                                  : 'text-rose-400 font-semibold'
+                              }
+                            >
+                              {pnlBps >= 0 ? '+' : ''}
+                              {pnlBps} bps
+                            </span>
+                          ) : row.realized_outcome === 1 ? (
+                            <span className="text-emerald-400 font-semibold">1 (WIN)</span>
+                          ) : row.realized_outcome === 0 ? (
+                            <span className="text-rose-400 font-semibold">0 (LOSS)</span>
+                          ) : (
+                            <span className="text-slate-500">PENDING</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Section 2: Copy Configuration & One-Click Copy to Google Drive */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

@@ -1,55 +1,35 @@
-# Implementation Plan: Google Drive App Copy & Vault Sync
+# Cloud Persistence, Firestore Rules & Google Drive OAuth Deployment Plan
 
-## 1. Overview & Goals
-Enable users to connect their Google account and copy the complete **QuantPulse (Finesse_finance)** application—including its full source codebase, live quantitative state, strategy backtest benchmarks, Kalshi & Public.com execution ledger, and the Master Quant Playbook—directly into a dedicated, versioned folder in their Google Drive.
-
-Because the clarifying questions were skipped, we will implement the recommended comprehensive default workflow:
-- **Complete App Copy Payload**: Exports a structured Google Drive folder (`QuantPulse_Finesse_Finance_Copy_<TIMESTAMP>`) containing:
-  1. `quantpulse-app-bundle.json` — Complete portable snapshot of live engine state, active indicator weights, tournament leaderboard, Kalshi 15m ledger, and Public.com BTC limit order book.
-  2. `quantpulse-source-archive.json` — Complete application source tree (`server.ts`, `package.json`, `src/**`) packaged for instant portability and inspection.
-  3. `Master_Quant_Playbook_Report.md` — Formatted Markdown playbook & live risk telemetry summary.
-- **Versioned Drive Copies & Overwrite Protection**: Creates timestamped versioned copies by default and provides a browsing table of existing Google Drive app copies with an explicit confirmation modal before any overwrite or delete action.
+## 1. Executive Answer: Do You Need Permissions & Cloud Redeployment?
+- **Current Dev Status (`ais-dev`)**: Your `#1` top-performing agent (`agent-hft-15m-kxbtc` — `BTC Lead-Lag Sniper Agent`, Sharpe `3.68`, Win Rate `80.0%`) is **already live and funded (`$65.00 USD` total = `$30.00` Kalshi CLOB v2 Direct + `$35.00` Public.com Event Contracts)** using `KALSHI_CLOB_V2` + Coinbase BTC-USD spot data inside your active environment.
+- **Why Permissions & Cloud Deployment Matter**:
+  1. **Firestore & Local DuckDB Persistence**: When a Cloud Run container scales to zero or restarts on redeploy, in-memory state resets unless backed by your provisioned Firestore database (`ai-studio-tradepulseai-5afcfb28-f923-42f2-a189-b764775d8ca2`) and local DuckDB file (`tradepulse_quant.duckdb`). Deploying `firestore.rules` and syncing agent state + ML telemetry to Firestore ensures your `$65.00` dual-venue allocation and `ml_telemetry_ledger` survive every restart.
+  2. **Google Drive OAuth (`drive.file`)**: Authorizing the `https://www.googleapis.com/auth/drive.file` scope enables one-click export and restore of your DuckDB ML training ledger and quantitative agent bundle directly to your Google Drive Vault (`GoogleDriveCopyPanel.tsx`).
+  3. **Cloud Run Production Redeployment (`ais-pre`)**: Once Firestore rules and OAuth are active, clicking **Share / Deploy** in AI Studio publishes the container with `"start": "tsx server.ts"` so your public Cloud Run URL runs the exact same dual-venue agent state.
 
 ---
 
-## 2. Authentication & Google Workspace OAuth Architecture
-Following the AI Studio Workspace Integration guidelines:
-- **Provisioning**: Finalize OAuth client provisioning via `set_up_oauth` (`userConfirmedInUI: true`) with the approved Google Drive scopes (`drive`, `drive.file`, `drive.appdata`, `drive.metadata`, `drive.readonly`, etc.) and provision Firebase Authentication (`firebase` SDK + `firebase-applet-config.json`) so `GoogleAuthProvider` can authenticate in the preview iframe.
-- **Client-Side Token Management**:
-  - Authenticate via Firebase `signInWithPopup(auth, googleProvider)` requesting `https://www.googleapis.com/auth/drive.file` and `https://www.googleapis.com/auth/drive`.
-  - Store the Google OAuth `accessToken` **strictly in React memory** (never in `localStorage` or `sessionStorage`).
-  - Automatically handle `401 Unauthorized` responses by clearing the cached in-memory token and prompting re-authentication.
-  - Render the official Google-branded **"Sign in with Google"** button whenever the user is unauthenticated or when the Drive token has expired.
+## 2. Architecture & Implementation Phases
 
----
+### Phase 1: Firebase Firestore Schema, Security Rules & Cloud Sync
+1. **Create `/firebase-blueprint.json`**:
+   - Define structured entities for:
+     - `/agents/{agentId}`: Stores autonomous agent state (`id`, `name`, `status`, `allocatedCapitalUsd`, `kalshiAllocatedUsd`, `publicAllocatedUsd`, `predictionMarketDataSource`, `executionVenues`, `sharpe`, `winRate`, `totalPnlUsd`, `updatedAt`).
+     - `/executed_orders/{orderId}`: Stores dual-venue Kalshi CLOB v2 and Public.com `EVENTCONTRACT` executions (`id`, `agentId`, `venue`, `symbol`, `side`, `count`, `priceDollars`, `status`, `createdAt`).
+     - `/ml_telemetry_ledger/{rowId}`: Mirrors DuckDB feature store snapshots and calibrated meta-model weights (`timestamp_utc`, `symbol`, `venue`, `spot_price`, `strike`, `nd2_fair_prob`, `ml_calibrated_prob`, `net_edge_dollars`, `sniper_action`, `ownerUid`).
+2. **Create & Deploy `/firestore.rules`**:
+   - Enforce strict owner-based and authenticated validation (`isAuthenticated()`, owner `lakeskyler904@gmail.com` admin verification, strict field and type checks, zero open `allow read, write: if true` rules).
+   - Deploy rules to `ai-studio-tradepulseai-5afcfb28-f923-42f2-a189-b764775d8ca2` via the Firebase `DeployRules` RPC action.
+3. **Wire Firestore Sync in Frontend & Backend**:
+   - Create `/src/firebase.ts` initialized from `/firebase-applet-config.json` with Google Auth sign-in and automatic Firestore hydration/backup for `autonomousAgents`, `executedOrders`, and `ml_telemetry_ledger` checkpoints alongside local DuckDB storage.
 
-## 3. Planned Features & User Experience
-1. **Google Drive Copy & Vault Workspace Panel (`src/components/GoogleDriveVaultModal.tsx` & Header Action)**:
-   - Accessible directly from the top command bar (`Copy App to Drive` trigger) and as a dedicated control panel.
-   - **Connection Status & Official Google Sign-In**: Shows authenticated Google account identity (`User Email`, active Drive scope verification) or the official Google Sign-In button.
-   - **Configurable Copy Manifest**: Checkboxes allowing the user to include/exclude:
-     - Full Application Source Tree (`server.ts`, `src/**`, `package.json`)
-     - Live Quantitative Telemetry, Indicator Tournament & Comparative Backtest State
-     - Kalshi 15m Execution Ledger & Public.com BTC Order Book
-     - Master Quant Playbook Vault Document
-   - **One-Click "Copy App to Google Drive"**:
-     - Creates a dedicated folder in Google Drive (`application/vnd.google-apps.folder`) using `https://www.googleapis.com/drive/v3/files`.
-     - Uploads each manifest artifact via multipart Drive v3 upload (`https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`).
-     - Displays deterministic progress steps, file sizes (`tabular-nums`), and direct `webViewLink` links to open the copied folder and files in Google Drive.
-   - **Existing Drive Copies Manager & Restore**:
-     - Queries the user's Google Drive for previously created `QuantPulse_Finesse_Finance` folders and snapshots.
-     - Allows loading/restoring a saved state snapshot from Drive back into the running app.
-     - Enforces a **Confirmation Modal** before overwriting an existing Drive snapshot or deleting an old backup copy.
+### Phase 2: Google Drive OAuth Permissions (`drive.file`)
+1. **Trigger OAuth Provisioning (`set_up_oauth`)**:
+   - Request scope `https://www.googleapis.com/auth/drive.file` so you can approve Google Drive Vault access directly in the AI Studio prompt card.
+2. **Connect `GoogleDriveCopyPanel.tsx` to DuckDB ML Ledger & Agent State**:
+   - Ensure the Google Drive Vault export/import bundle includes the live `ml_telemetry_ledger` rows (`/api/ml-store/export` and `/api/ml-store/import`) plus the `$65.00` dual-venue Kalshi + Public.com agent allocation state.
 
----
-
-## 4. Backend & Frontend File Changes
-- **`/server.ts`**:
-  - Add `GET /api/app-bundle/export`: Packages the live engine state, indicator scoreboard, active orders, and key project source files (`package.json`, `server.ts`, `src/App.tsx`, `src/types/quant.ts`, `src/components/**`) into a deterministic export payload with SHA-like integrity metadata and `dataQualityWarning` validation.
-  - Add `POST /api/app-bundle/restore`: Validates and restores a state snapshot imported from Google Drive.
-- **`/src/services/googleDriveService.ts`**:
-  - Encapsulates Firebase Google Auth sign-in, in-memory OAuth access token management, Drive folder creation, multipart file uploads, existing copy listing, and Drive file download/deletion.
-- **`/src/components/GoogleDriveCopyPanel.tsx`**:
-  - Institutional dark-slate UI adhering to the `frontend-design` SaaS dashboard guidelines (tabular numerals, single-elevation cards, official "Sign in with Google" button, and mandatory confirmation dialog for destructive/overwrite actions).
-- **`/src/App.tsx`**:
-  - Integrate the **Google Drive App Copy** trigger in the workspace navigation and top bar so users can copy or sync their app to Google Drive from anywhere in the terminal.
+### Phase 3: Cloud Run Production Verification
+1. **Verify Production Start Script & Stateless MCP Transport**:
+   - Confirm `package.json` defines `"start": "tsx server.ts"` and `POST /api/mcp` operates strictly via stateless Streamable HTTP (`200 OK`) for zero-cost Cloud Run scale-to-zero compliance.
+   - Run `compile_applet` and verify live telemetry and persistence endpoints.

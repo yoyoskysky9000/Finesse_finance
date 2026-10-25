@@ -42,6 +42,9 @@ export interface LeadLagSignalEvaluation {
   annualVol: number;
   feePerContract: number;
   d2: number;
+  nd2_fair_prob?: number;
+  ml_calibrated_prob?: number;
+  ensemble_prob?: number;
   fairYesProb: number;
   fairNoProb: number;
   yesNetEdge: number;
@@ -50,11 +53,112 @@ export interface LeadLagSignalEvaluation {
   bestAsk: number;
   netEdgePerContract: number;
   action: 'BUY_YES' | 'BUY_NO' | 'HOLD';
+  sniper_action?: 'EXECUTE' | 'HOLD';
+  gate_blocked_reason?: string;
+  metaModelId?: string;
+  metaModelTrained?: boolean;
   contracts: number;
   totalRiskUsd: number;
   feeGatePassed: boolean;
   edgeGatePassed: boolean;
   rationale: string;
+}
+
+export type McpCommercialTier =
+  | 'FREE_DISCOVERY'
+  | 'PRO_QUANT_SAAS'
+  | 'AGENT_ORACLE_PAY_PER_CALL';
+
+export interface McpLicenseKeySpec {
+  licenseKey: string;
+  tier: McpCommercialTier;
+  label: string;
+  rateLimitPerHour: number;
+  requestsUsedThisHour: number;
+  permittedMethods: string[];
+  permittedTools: string[];
+  pricingModel: string;
+  x402MeteringConfig?: {
+    protocol: 'x402-v1';
+    httpStatusWhenUnpaid: 402;
+    pricePerCallUsd: number;
+    pricePerCallFet: number;
+    stripeMeterEventName: string;
+    fetSettlementAddress: string;
+    paymentHeader: string;
+  };
+}
+
+export interface MlTelemetryLedgerRow {
+  timestamp_utc: string;
+  symbol: string;
+  venue: string;
+  spot_price: number;
+  coinbase_spot: number;
+  strike: number;
+  spot_to_strike_bps: number;
+  minutes_left: number;
+  yes_ask: number;
+  no_ask: number;
+  l2_imbalance: number;
+  kalshi_spread_bps: number;
+  nd2_fair_prob: number;
+  ml_calibrated_prob?: number;
+  ensemble_prob?: number;
+  net_edge_dollars: number;
+  atr_pct: number;
+  atr_baseline_mult: number;
+  rsi_14: number;
+  ma_spread_short_pct: number;
+  pearson_corr_regime: string;
+  market_regime: MarketRegime;
+  sniper_action: 'EXECUTE' | 'HOLD';
+  gate_blocked_reason: string;
+  realized_pnl_bps: number;
+  realized_outcome: number | null;
+}
+
+export interface MlMetaModelState {
+  is_trained: boolean;
+  model_id: string;
+  trained_at: string;
+  engine: string;
+  symbol_filter?: string;
+  target_metric: string;
+  samples_used: number;
+  brier_score_raw: number;
+  brier_score_calibrated: number;
+  brier_score_ensemble?: number;
+  brier_improvement_bps?: number;
+  log_loss_calibrated: number;
+  empirical_win_rate: number;
+  avg_realized_pnl_bps?: number;
+  recommended_min_net_edge: number;
+  recommended_atr_stop_mult: number;
+  recommended_ask_band: [number, number];
+  weights: {
+    intercept: number;
+    nd2_fair_prob: number;
+    atr_baseline_mult: number;
+    rsi_14: number;
+    ma_spread_short_pct: number;
+    kalshi_spread_bps: number;
+    minutes_left: number;
+    l2_imbalance?: number;
+  };
+}
+
+export interface MlFeatureStoreSnapshot {
+  exportedAt: string;
+  format: 'DUCKDB_PARQUET_JSON_MIRROR';
+  tableName: 'ml_telemetry_ledger';
+  rowCount: number;
+  settledRowCount: number;
+  totalRows?: number;
+  settledRows?: number;
+  trackedSymbols?: string[];
+  activeMetaModel: MlMetaModelState;
+  rows: MlTelemetryLedgerRow[];
 }
 
 export interface PlaybookCleanupAuditRow {
@@ -270,8 +374,48 @@ export interface McpToolDefinition {
     | 'QUANT_REGIME'
     | 'ALPHA_BACKTEST'
     | 'ORDER_EXECUTION'
-    | 'RISK_GOVERNANCE';
+    | 'RISK_GOVERNANCE'
+    | 'DLQ_FALLBACK'
+    | 'ML_META_OPTIMIZER';
+  isAsync?: boolean;
+  isMutating?: boolean;
+  requiresIdempotencyKey?: boolean;
   inputSchema: Record<string, any>;
+}
+
+export interface McpPromptDefinition {
+  name: string;
+  description: string;
+  decoratorSignature: string;
+  arguments: Array<{
+    name: string;
+    description: string;
+    required: boolean;
+    defaultValue?: string | number;
+  }>;
+  templatePreview: string;
+}
+
+export interface McpDlqEntry {
+  dlqId: string;
+  idempotencyKey: string;
+  failedTool: string;
+  payloadJson: string;
+  errorReason: string;
+  severity: 'CRITICAL' | 'WARNING';
+  status: 'QUARANTINED_HOLD' | 'REPLAYED' | 'DISMISSED';
+  createdAt: string;
+  dataQualityWarning: boolean;
+  rationale: string;
+}
+
+export interface McpIdempotencyRecord {
+  idempotencyKey: string;
+  toolName: string;
+  payloadHash: string;
+  executedAt: string;
+  replayCount: number;
+  responsePreview: string;
 }
 
 export interface McpResourceDefinition {
@@ -284,7 +428,8 @@ export interface McpResourceDefinition {
 export interface McpServerConnection {
   id: string;
   name: string;
-  transport: 'HTTP_JSON_RPC' | 'SSE_STREAM' | 'STDIO_BRIDGE';
+  transport: 'http' | 'HTTP_JSON_RPC' | 'SSE_STREAM' | 'STDIO_BRIDGE';
+  statelessHttp?: boolean;
   endpointUrl: string;
   protocolVersion: string;
   status: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED';
@@ -292,6 +437,7 @@ export interface McpServerConnection {
   authType: string;
   toolsCount: number;
   resourcesCount: number;
+  promptsCount?: number;
   lastPingAt: string;
   capabilities: string[];
 }
@@ -302,9 +448,12 @@ export interface McpCallLogEntry {
   serverId: string;
   method: string;
   toolOrResourceName: string;
+  idempotencyKey?: string;
+  idempotentReplay?: boolean;
+  dlqRouted?: boolean;
   args: Record<string, any>;
   durationMs: number;
-  status: 'SUCCESS' | 'ERROR';
+  status: 'SUCCESS' | 'ERROR' | 'DLQ_FALLBACK';
   responsePreview: string;
   rawJsonRpcResponse?: Record<string, any>;
 }
@@ -565,7 +714,9 @@ export interface AppBundleExportPayload {
     riskEvents: RiskEventNotification[];
     strategyTournament: StrategyTournamentEntry[];
     playbookCleanupAudit: PlaybookCleanupAuditRow[];
+    mlFeatureStore?: MlFeatureStoreSnapshot;
   };
+  mlFeatureStore?: MlFeatureStoreSnapshot;
   sourceFiles: AppSourceFileEntry[];
   playbookMarkdownReport: string;
 }

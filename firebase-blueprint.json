@@ -1,0 +1,194 @@
+{
+  "entities": {
+    "QuantAgentState": {
+      "title": "QuantAgentState",
+      "description": "Persisted state for an autonomous quantitative execution agent across Kalshi CLOB v2 and Public.com Event Contracts.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Deterministic agent identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the portfolio owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable strategy agent name.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "targetSymbol": {
+          "type": "string",
+          "description": "Target ticker symbol (e.g., KXBTC15M, NVDA).",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "status": {
+          "type": "string",
+          "description": "Execution status of the agent.",
+          "enum": ["ACTIVE", "PAUSED", "KILLED_BY_RISK", "HALTED_BY_KILL_SWITCH"]
+        },
+        "allocatedCapitalUsd": {
+          "type": "number",
+          "description": "Total USD capital allocated to this agent."
+        },
+        "kalshiAllocatedUsd": {
+          "type": "number",
+          "description": "Direct Kalshi CLOB v2 cash allocation in USD."
+        },
+        "publicAllocatedUsd": {
+          "type": "number",
+          "description": "Public.com Event Contracts buying power allocation in USD."
+        },
+        "predictionMarketDataSource": {
+          "type": "string",
+          "description": "Primary prediction market data feed.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "sharpe": {
+          "type": "number",
+          "description": "Realized Sharpe ratio."
+        },
+        "winRate": {
+          "type": "number",
+          "description": "Realized win rate percentage."
+        },
+        "totalPnlUsd": {
+          "type": "number",
+          "description": "Cumulative PnL in USD."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "name",
+        "targetSymbol",
+        "status",
+        "allocatedCapitalUsd",
+        "kalshiAllocatedUsd",
+        "publicAllocatedUsd",
+        "predictionMarketDataSource",
+        "sharpe",
+        "winRate",
+        "totalPnlUsd",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "QuantVaultCheckpoint": {
+      "title": "QuantVaultCheckpoint",
+      "description": "Synchronized cloud checkpoint of dual-venue agent allocations, OCO orders, and DuckDB ml_telemetry_ledger calibration metrics.",
+      "type": "object",
+      "properties": {
+        "checkpointId": {
+          "type": "string",
+          "description": "Unique checkpoint identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "topAgentId": {
+          "type": "string",
+          "description": "ID of the #1 funded agent.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "topAgentAllocatedUsd": {
+          "type": "number",
+          "description": "Total USD allocated to top agent."
+        },
+        "kalshiDirectUsd": {
+          "type": "number",
+          "description": "USD allocated on Kalshi CLOB v2 Direct."
+        },
+        "publicEventContractUsd": {
+          "type": "number",
+          "description": "USD allocated on Public.com Event Contracts."
+        },
+        "combinedEquityUsd": {
+          "type": "number",
+          "description": "Combined multi-venue NLV in USD."
+        },
+        "duckDbTotalRows": {
+          "type": "number",
+          "description": "Total rows in DuckDB ml_telemetry_ledger."
+        },
+        "duckDbSettledRows": {
+          "type": "number",
+          "description": "Settled outcome rows in DuckDB ml_telemetry_ledger."
+        },
+        "calibratedBrierScore": {
+          "type": "number",
+          "description": "Active meta-model calibrated Brier score."
+        },
+        "activeMetaModelId": {
+          "type": "string",
+          "description": "Identifier of the trained DuckDB meta-model.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "checkpointId",
+        "ownerUid",
+        "topAgentId",
+        "topAgentAllocatedUsd",
+        "kalshiDirectUsd",
+        "publicEventContractUsd",
+        "combinedEquityUsd",
+        "duckDbTotalRows",
+        "duckDbSettledRows",
+        "calibratedBrierScore",
+        "activeMetaModelId",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/quant_agents/{agentId}": {
+      "schema": "QuantAgentState",
+      "description": "Stores autonomous agent configurations and dual-venue Kalshi + Public.com capital allocations."
+    },
+    "/quant_vault_checkpoints/{checkpointId}": {
+      "schema": "QuantVaultCheckpoint",
+      "description": "Stores cloud persistence checkpoints of dual-venue agent state and DuckDB ml_telemetry_ledger metrics across Cloud Run container restarts."
+    }
+  }
+}

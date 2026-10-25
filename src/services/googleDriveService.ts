@@ -381,7 +381,7 @@ export async function copyAppBundleToGoogleDrive(
   const uploadedFiles: DriveCopiedArtifact[] = [];
 
   if (options.includeLiveState) {
-    onProgress?.('Uploading quantpulse-app-bundle.json (Live State, Orders & Telemetry)...', 40);
+    onProgress?.('Uploading quantpulse-app-bundle.json (Live State, Orders & DuckDB ML Telemetry)...', 40);
     const statePayload = {
       bundleId: bundle.bundleId,
       exportedAt: bundle.exportedAt,
@@ -391,15 +391,28 @@ export async function copyAppBundleToGoogleDrive(
       riskFirstEvaluation: bundle.riskFirstEvaluation,
       summaryMetrics: bundle.summaryMetrics,
       liveState: bundle.liveState,
+      mlFeatureStore: bundle.mlFeatureStore,
     };
     const artifact = await uploadMultipartFileToDrive({
       name: 'quantpulse-app-bundle.json',
       mimeType: 'application/json',
       content: JSON.stringify(statePayload, null, 2),
       parentFolderId: folderId,
-      description: 'Portable QuantPulse Live State, Strategy Tournament, Kalshi v2 & Public.com Snapshot',
+      description: 'Portable QuantPulse Live State, Strategy Tournament, Kalshi v2, Public.com & DuckDB ML Telemetry Snapshot',
     });
     uploadedFiles.push(artifact);
+
+    if (bundle.mlFeatureStore) {
+      onProgress?.('Uploading quantpulse-ml-telemetry-ledger.json (DuckDB ml_telemetry_ledger & Meta-Model)...', 52);
+      const mlArtifact = await uploadMultipartFileToDrive({
+        name: 'quantpulse-ml-telemetry-ledger.json',
+        mimeType: 'application/json',
+        content: JSON.stringify(bundle.mlFeatureStore, null, 2),
+        parentFolderId: folderId,
+        description: `DuckDB Persistent ML Feature Store (ml_telemetry_ledger: ${bundle.mlFeatureStore.totalRows} rows, ${bundle.mlFeatureStore.settledRows} settled, Model ${bundle.mlFeatureStore.activeMetaModel?.model_id || 'v1'})`,
+      });
+      uploadedFiles.push(mlArtifact);
+    }
   }
 
   if (options.includeSourceArchive) {
