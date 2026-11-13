@@ -2,7 +2,7 @@
   "entities": {
     "QuantAgentState": {
       "title": "QuantAgentState",
-      "description": "Persisted state for an autonomous quantitative execution agent across Kalshi CLOB v2 and Public.com Event Contracts.",
+      "description": "Persisted state for an autonomous quantitative execution agent across Kalshi CLOB v2 and Public.com Event Contracts. Metrics and status fields (status, sharpe, winRate, totalPnlUsd) are server-written only via Firebase Admin SDK.",
       "type": "object",
       "properties": {
         "id": {
@@ -33,20 +33,20 @@
         },
         "status": {
           "type": "string",
-          "description": "Execution status of the agent.",
+          "description": "Server-managed execution status of the agent (Admin SDK only).",
           "enum": ["ACTIVE", "PAUSED", "KILLED_BY_RISK", "HALTED_BY_KILL_SWITCH"]
         },
         "allocatedCapitalUsd": {
           "type": "number",
-          "description": "Total USD capital allocated to this agent."
+          "description": "Total USD capital allocated to this agent (capped <= 1000 in rules and validated server-side against live account balances)."
         },
         "kalshiAllocatedUsd": {
           "type": "number",
-          "description": "Direct Kalshi CLOB v2 cash allocation in USD."
+          "description": "Direct Kalshi CLOB v2 cash allocation in USD (capped <= 500 in rules and validated server-side)."
         },
         "publicAllocatedUsd": {
           "type": "number",
-          "description": "Public.com Event Contracts buying power allocation in USD."
+          "description": "Public.com buying power allocation in USD (capped <= 500 in rules and validated server-side)."
         },
         "predictionMarketDataSource": {
           "type": "string",
@@ -56,15 +56,15 @@
         },
         "sharpe": {
           "type": "number",
-          "description": "Realized Sharpe ratio."
+          "description": "Server-computed realized Sharpe ratio (Admin SDK only)."
         },
         "winRate": {
           "type": "number",
-          "description": "Realized win rate percentage."
+          "description": "Server-computed realized win rate percentage (Admin SDK only)."
         },
         "totalPnlUsd": {
           "type": "number",
-          "description": "Cumulative PnL in USD."
+          "description": "Server-computed cumulative PnL in USD (Admin SDK only)."
         },
         "createdAt": {
           "type": "string",
@@ -96,7 +96,7 @@
     },
     "QuantVaultCheckpoint": {
       "title": "QuantVaultCheckpoint",
-      "description": "Synchronized cloud checkpoint of dual-venue agent allocations, OCO orders, and DuckDB ml_telemetry_ledger calibration metrics.",
+      "description": "Synchronized cloud checkpoint of dual-venue agent allocations, OCO orders, and telemetry calibration metrics.",
       "type": "object",
       "properties": {
         "checkpointId": {
@@ -137,11 +137,11 @@
         },
         "duckDbTotalRows": {
           "type": "number",
-          "description": "Total rows in DuckDB ml_telemetry_ledger."
+          "description": "Total rows in telemetry ledger."
         },
         "duckDbSettledRows": {
           "type": "number",
-          "description": "Settled outcome rows in DuckDB ml_telemetry_ledger."
+          "description": "Settled outcome rows in telemetry ledger."
         },
         "calibratedBrierScore": {
           "type": "number",
@@ -149,7 +149,7 @@
         },
         "activeMetaModelId": {
           "type": "string",
-          "description": "Identifier of the trained DuckDB meta-model.",
+          "description": "Identifier of the trained meta-model.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -179,16 +179,68 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "SystemKillSwitchState": {
+      "title": "SystemKillSwitchState",
+      "description": "Global emergency kill switch and execution mode flag persisted in Firestore (/system_controls/kill_switch) and checked before every order execution path.",
+      "type": "object",
+      "properties": {
+        "controlId": {
+          "type": "string",
+          "description": "Control document identifier (kill_switch).",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "globalKillSwitchActive": {
+          "type": "boolean",
+          "description": "When true, blocks all order execution across all venues."
+        },
+        "executionMode": {
+          "type": "string",
+          "description": "Global execution mode (defaults to PAPER).",
+          "enum": ["PAPER", "LIVE"]
+        },
+        "reason": {
+          "type": "string",
+          "description": "Reason for the current kill-switch state.",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "UID or system component that last updated the kill switch.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last update."
+        }
+      },
+      "required": [
+        "controlId",
+        "globalKillSwitchActive",
+        "executionMode",
+        "reason",
+        "updatedBy",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
     "/quant_agents/{agentId}": {
       "schema": "QuantAgentState",
-      "description": "Stores autonomous agent configurations and dual-venue Kalshi + Public.com capital allocations."
+      "description": "Stores autonomous agent configurations. Server-written via Admin SDK; owners may only update name, targetSymbol, and capped allocations when not in KILLED_BY_RISK or HALTED_BY_KILL_SWITCH."
     },
     "/quant_vault_checkpoints/{checkpointId}": {
       "schema": "QuantVaultCheckpoint",
-      "description": "Stores cloud persistence checkpoints of dual-venue agent state and DuckDB ml_telemetry_ledger metrics across Cloud Run container restarts."
+      "description": "Stores cloud persistence checkpoints of dual-venue agent state."
+    },
+    "/system_controls/{controlId}": {
+      "schema": "SystemKillSwitchState",
+      "description": "Stores global kill switch and execution mode flags checked before every order execution path."
     }
   }
 }

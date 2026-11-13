@@ -1,0 +1,9 @@
+node_modules/
+dist/
+server.js
+.aistudio/
+*.sqlite
+*.duckdb*
+ml_telemetry_ledger_mirror.json
+bun.lock
+package-lock.json

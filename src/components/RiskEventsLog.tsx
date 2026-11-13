@@ -62,6 +62,20 @@ const EVENT_TYPE_LABELS: Record<
     borderClass: 'border-emerald-500/40',
     bgClass: 'bg-emerald-950/20',
   },
+  GLOBAL_PROFIT_LOCK_STEPDOWN: {
+    label: 'Global Profit-Lock OCO Step-Down',
+    shortLabel: 'PROFIT_LOCK_STEPDOWN',
+    textClass: 'text-emerald-300',
+    borderClass: 'border-emerald-500/50',
+    bgClass: 'bg-emerald-950/30',
+  },
+  REALTIME_ROI_AUTO_EXIT: {
+    label: 'Real-Time ROI Threshold Auto-Exit',
+    shortLabel: 'REALTIME_ROI_EXIT',
+    textClass: 'text-cyan-300',
+    borderClass: 'border-cyan-500/50',
+    bgClass: 'bg-cyan-950/30',
+  },
 };
 
 export const RiskEventsLog: React.FC<RiskEventsLogProps> = ({
@@ -309,12 +323,12 @@ export const RiskEventsLog: React.FC<RiskEventsLogProps> = ({
             No circuit-breaker or risk notification events match the active filter criteria.
           </div>
         ) : (
-          filteredEvents.map((ev) => {
+          filteredEvents.map((ev, idx) => {
             const meta = EVENT_TYPE_LABELS[ev.eventType];
             const ts = formatTimestamp(ev.timestamp);
             return (
               <div
-                key={ev.id}
+                key={`${ev.id}-${idx}`}
                 className={`p-3.5 border transition-colors ${
                   !ev.acknowledged
                     ? `${meta.borderClass} ${meta.bgClass}`

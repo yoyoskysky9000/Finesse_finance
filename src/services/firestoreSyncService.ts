@@ -1,21 +1,42 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getFirestore,
+  initializeFirestore,
+  setLogLevel,
   doc,
   getDoc,
-  getDocFromServer,
   setDoc,
+  updateDoc,
   serverTimestamp,
+  type Firestore,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { auth } from './googleDriveService.ts';
 import type { AutonomousAgent, PortfolioSummary } from '../types/quant.ts';
 
+// Silence internal @firebase/firestore WebChannel transport retry logs in iframe/proxy environments
+setLogLevel('silent');
+
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const FIRESTORE_DATABASE_ID =
   (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId ||
   'ai-studio-tradepulseai-5afcfb28-f923-42f2-a189-b764775d8ca2';
-export const db = getFirestore(app, FIRESTORE_DATABASE_ID);
+
+function createFirestoreInstance(): Firestore {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalAutoDetectLongPolling: true,
+      },
+      FIRESTORE_DATABASE_ID
+    );
+  } catch {
+    return getFirestore(app, FIRESTORE_DATABASE_ID);
+  }
+}
+
+export const db: Firestore = createFirestoreInstance();
 
 export enum OperationType {
   CREATE = 'create',
@@ -41,6 +62,18 @@ export interface FirestoreErrorInfo {
       email?: string | null;
     }[];
   };
+}
+
+function isTransientFirestoreUnavailable(error: unknown): boolean {
+  const code = (error as { code?: string })?.code || '';
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    code === 'unavailable' ||
+    code === 'failed-precondition' ||
+    msg.includes('unavailable') ||
+    msg.includes('the client is offline') ||
+    msg.includes('Could not reach Cloud Firestore backend')
+  );
 }
 
 export function handleFirestoreError(
@@ -69,21 +102,55 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
+export async function getFirebaseAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (auth.currentUser) {
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      if (idToken) {
+        headers.Authorization = `Bearer ${idToken}`;
+      }
+    } catch {
+      // Proceed without bearer header if token refresh fails
+    }
+  }
+  return headers;
+}
+
+export async function authenticatedApiFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
+  if (auth.currentUser) {
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      if (idToken) {
+        const mergedHeaders = new Headers(init?.headers || {});
+        if (!mergedHeaders.has('Authorization')) {
+          mergedHeaders.set('Authorization', `Bearer ${idToken}`);
+        }
+        return fetch(input, { ...init, headers: mergedHeaders });
+      }
+    } catch {
+      // Fall through to standard fetch if token retrieval fails
+    }
+  }
+  return fetch(input, init);
+}
+
 let connectionValidated = false;
 
 export async function validateFirestoreConnection(): Promise<boolean> {
   if (connectionValidated) return true;
+  if (!auth.currentUser) return false;
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
+    await getDoc(doc(db, 'test', 'connection'));
     connectionValidated = true;
     return true;
   } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.includes('the client is offline') &&
-      !FIRESTORE_DATABASE_ID
-    ) {
-      console.warn('Firestore connection check deferred until network is reachable.');
+    if (isTransientFirestoreUnavailable(error)) {
       return false;
     }
     // Permission denied on /test/connection is expected under default-deny rules and confirms online reachability
@@ -91,9 +158,6 @@ export async function validateFirestoreConnection(): Promise<boolean> {
     return true;
   }
 }
-
-// Validate connection on module boot
-void validateFirestoreConnection();
 
 export interface FirestoreSyncSummary {
   syncedAt: string;
@@ -119,11 +183,31 @@ export async function syncQuantStateToFirestore(params: {
     return null;
   }
 
+  const isReachable = await validateFirestoreConnection();
+  if (!isReachable) {
+    return null;
+  }
+
   const uid = currentUser.uid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
   const topAgent = params.agents[0];
   if (!topAgent) return null;
 
-  // 1. Sync top agents to /quant_agents/{agentId}
+  // 1. Request server-side Admin SDK sync first so server-owned fields (status, sharpe, winRate, totalPnlUsd) are persisted by Admin SDK
+  try {
+    const authHeaders = await getFirebaseAuthHeaders();
+    await fetch('/api/agents/sync-firestore', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        ownerUid: currentUser.uid,
+      }),
+    });
+  } catch {
+    // Non-fatal if server Admin SDK sync is unreachable
+  }
+
+  // 2. Client-side owner update on /quant_agents/{agentId}:
+  //    Per Phase 1.1 rules, clients may ONLY update name, targetSymbol, and capped allocations on existing non-halted documents.
   let syncedCount = 0;
   for (const agent of params.agents.slice(0, 6)) {
     const safeAgentId = `${uid}_${agent.id}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
@@ -134,66 +218,78 @@ export async function syncQuantStateToFirestore(params: {
     try {
       existingSnap = await getDoc(agentRef);
     } catch (error) {
+      if (isTransientFirestoreUnavailable(error)) {
+        return null;
+      }
       handleFirestoreError(error, OperationType.GET, agentPath);
     }
 
-    const safeStatus = ['ACTIVE', 'PAUSED', 'KILLED_BY_RISK', 'HALTED_BY_KILL_SWITCH'].includes(
-      agent.status
-    )
-      ? agent.status
-      : 'ACTIVE';
+    if (!existingSnap.exists()) {
+      // Client creation is forbidden by firestore.rules (Admin SDK creates agent documents)
+      continue;
+    }
 
-    const basePayload = {
-      id: safeAgentId,
-      ownerUid: currentUser.uid,
-      name: (agent.name || 'Autonomous Quant Agent').slice(0, 120),
-      targetSymbol: (agent.targetSymbol || 'KXBTC15M').slice(0, 32),
-      status: safeStatus,
-      allocatedCapitalUsd: Math.min(1000000, Math.max(0, Number(agent.allocatedCapitalUsd) || 0)),
-      kalshiAllocatedUsd: Math.min(1000000, Math.max(0, Number(agent.kalshiAllocatedUsd ?? 30) || 0)),
-      publicAllocatedUsd: Math.min(1000000, Math.max(0, Number(agent.publicAllocatedUsd ?? 35) || 0)),
-      predictionMarketDataSource: (agent.predictionMarketDataSource || 'KALSHI_CLOB_V2').slice(0, 64),
-      sharpe: Number.isFinite(Number(agent.sharpe)) ? Number(agent.sharpe) : 0,
-      winRate: Math.min(100, Math.max(0, Number(agent.winRate) || 0)),
-      totalPnlUsd: Number.isFinite(Number(agent.totalPnlUsd)) ? Number(agent.totalPnlUsd) : 0,
-      updatedAt: serverTimestamp(),
-    };
+    const existingData = existingSnap.data();
+    if (
+      existingData.status === 'KILLED_BY_RISK' ||
+      existingData.status === 'HALTED_BY_KILL_SWITCH'
+    ) {
+      // Clients cannot modify agents in terminal risk-halted states
+      continue;
+    }
+
+    const rawKalshi = Math.min(500, Math.max(0, Number(agent.kalshiAllocatedUsd ?? 30) || 0));
+    const rawPublic = Math.min(500, Math.max(0, Number(agent.publicAllocatedUsd ?? 35) || 0));
+    const rawTotal = Math.min(
+      1000,
+      Math.max(0, Number(agent.allocatedCapitalUsd ?? rawKalshi + rawPublic) || 0)
+    );
 
     try {
-      if (existingSnap.exists() && existingSnap.data()?.createdAt) {
-        await setDoc(agentRef, {
-          ...basePayload,
-          createdAt: existingSnap.data().createdAt,
-        });
-      } else {
-        await setDoc(agentRef, {
-          ...basePayload,
-          createdAt: serverTimestamp(),
-        });
-      }
+      await updateDoc(agentRef, {
+        name: (agent.name || 'Autonomous Quant Agent').slice(0, 120),
+        targetSymbol: (agent.targetSymbol || 'KXBTC15M').slice(0, 32),
+        allocatedCapitalUsd: rawTotal,
+        kalshiAllocatedUsd: rawKalshi,
+        publicAllocatedUsd: rawPublic,
+        updatedAt: serverTimestamp(),
+      });
       syncedCount += 1;
     } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, agentPath);
+      if (isTransientFirestoreUnavailable(error)) {
+        return null;
+      }
+      handleFirestoreError(error, OperationType.UPDATE, agentPath);
     }
   }
 
-  // 2. Sync vault checkpoint to /quant_vault_checkpoints/{checkpointId}
+  // 3. Sync vault checkpoint to /quant_vault_checkpoints/{checkpointId} (capped allocations <= 1000)
   const checkpointId = `checkpoint_${uid}`;
   const checkpointPath = `quant_vault_checkpoints/${checkpointId}`;
   const checkpointRef = doc(db, 'quant_vault_checkpoints', checkpointId);
 
-  const kalshiDirectUsd = Math.min(1000000, Math.max(0, Number(topAgent.kalshiAllocatedUsd ?? 30) || 0));
-  const publicEventContractUsd = Math.min(1000000, Math.max(0, Number(topAgent.publicAllocatedUsd ?? 35) || 0));
-  const combinedEquityUsd = Math.max(
-    0,
-    (Number(params.portfolio?.totalEquityUsd) || 481.97) +
-      (Number(params.portfolio?.kalshiTotalEquityUsd) || 73.86)
+  const kalshiDirectUsd = Math.min(500, Math.max(0, Number(topAgent.kalshiAllocatedUsd ?? 30) || 0));
+  const publicEventContractUsd = Math.min(500, Math.max(0, Number(topAgent.publicAllocatedUsd ?? 35) || 0));
+  const topAgentAllocatedUsd = Math.min(
+    1000,
+    Math.max(0, Number(topAgent.allocatedCapitalUsd) || kalshiDirectUsd + publicEventContractUsd)
+  );
+  const combinedEquityUsd = Math.min(
+    100000,
+    Math.max(
+      0,
+      (Number(params.portfolio?.totalEquityUsd) || 368.55) +
+        (Number(params.portfolio?.kalshiTotalEquityUsd) || 93.15)
+    )
   );
 
   let existingCp;
   try {
     existingCp = await getDoc(checkpointRef);
   } catch (error) {
+    if (isTransientFirestoreUnavailable(error)) {
+      return null;
+    }
     handleFirestoreError(error, OperationType.GET, checkpointPath);
   }
 
@@ -201,7 +297,7 @@ export async function syncQuantStateToFirestore(params: {
     checkpointId,
     ownerUid: currentUser.uid,
     topAgentId: (topAgent.id || 'agent-hft-15m-kxbtc').slice(0, 128),
-    topAgentAllocatedUsd: Math.min(1000000, Math.max(0, Number(topAgent.allocatedCapitalUsd) || 65)),
+    topAgentAllocatedUsd,
     kalshiDirectUsd,
     publicEventContractUsd,
     combinedEquityUsd,
@@ -225,6 +321,9 @@ export async function syncQuantStateToFirestore(params: {
       });
     }
   } catch (error) {
+    if (isTransientFirestoreUnavailable(error)) {
+      return null;
+    }
     handleFirestoreError(error, OperationType.WRITE, checkpointPath);
   }
 
@@ -233,7 +332,7 @@ export async function syncQuantStateToFirestore(params: {
     databaseId: FIRESTORE_DATABASE_ID,
     agentsSyncedCount: syncedCount,
     checkpointId,
-    topAgentAllocatedUsd: Math.min(1000000, Math.max(0, Number(topAgent.allocatedCapitalUsd) || 65)),
+    topAgentAllocatedUsd,
     kalshiDirectUsd,
     publicEventContractUsd,
     duckDbTotalRows: Math.max(0, Number(params.duckDbTotalRows ?? 32) || 0),

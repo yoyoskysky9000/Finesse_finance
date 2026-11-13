@@ -1,0 +1,50 @@
+# Dependencies & Build Artifacts
+node_modules/
+dist/
+server.js
+*.tsbuildinfo
+
+# Environment & Secrets (Keep .env.example tracked)
+.env
+.env.*
+!.env.example
+firebase-adminsdk-*.json
+service-account*.json
+
+# Local Quant Ledgers, SQLite/DuckDB Stores & JSON Mirrors (Never track runtime state)
+quant_ledger.duckdb.sqlite
+quant_ledger.duckdb.sqlite-shm
+quant_ledger.duckdb.sqlite-wal
+ml_telemetry_ledger_mirror.json
+kalshi_brier_calibration.sqlite
+kalshi_brier_calibration.sqlite-shm
+kalshi_brier_calibration.sqlite-wal
+*.parquet
+*.duckdb*
+*.sqlite*
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# AI Studio & IDE Artifacts
+.aistudio/
+.vscode/
+.idea/
+.DS_Store
+
+# Accidental macOS / Finder Duplicate Files
+* 2.*
+*" 2"*
+*.bak
+*.tmp
+
+# Test & Coverage Reports
+coverage/
+playwright-report/
+test-results/
+*.log
+npm-debug.log*

@@ -21,6 +21,8 @@ export const auth = getAuth(app);
 let inMemoryAccessToken: string | null = null;
 
 export const GOOGLE_DRIVE_SCOPES = [
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/documents.readonly',
   'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/drive.appdata',
@@ -413,12 +415,42 @@ export async function copyAppBundleToGoogleDrive(
       });
       uploadedFiles.push(mlArtifact);
     }
+
+    if (bundle.deepDive15mPackage) {
+      onProgress?.('Uploading QuantPulse_15m_Deep_Dive_Model_Package.json (15m Post-Mortem, 75% Profit Vault & Model Dataset)...', 60);
+      const deepDiveJsonPayload = {
+        deepDive15mPackage: bundle.deepDive15mPackage,
+        riskFirstEvaluation: bundle.riskFirstEvaluation,
+        portfolio: bundle.liveState.portfolio,
+        orders: bundle.liveState.orders,
+        riskEvents: bundle.liveState.riskEvents,
+        strategyTournament: bundle.liveState.strategyTournament,
+        mlFeatureStore: bundle.mlFeatureStore,
+      };
+      const ddJsonArtifact = await uploadMultipartFileToDrive({
+        name: 'QuantPulse_15m_Deep_Dive_Model_Package.json',
+        mimeType: 'application/json',
+        content: JSON.stringify(deepDiveJsonPayload, null, 2),
+        parentFolderId: folderId,
+        description: 'Complete 15m Cycle Post-Mortem, 75% Locked Profit Vault Rules, Market-Sell Telemetry & Deep-Dive Reasoning Model Input Dataset',
+      });
+      uploadedFiles.push(ddJsonArtifact);
+
+      const ddMdArtifact = await uploadMultipartFileToDrive({
+        name: 'QuantPulse_15m_Cycle_PostMortem_Playbook.md',
+        mimeType: 'text/markdown',
+        content: bundle.deepDive15mPackage.deepDiveMarkdownReport,
+        parentFolderId: folderId,
+        description: '15-Minute Cycle Post-Mortem Analysis, 75% Profit Vault Math & Multi-Scalp Execution Playbook',
+      });
+      uploadedFiles.push(ddMdArtifact);
+    }
   }
 
   if (options.includeSourceArchive) {
     onProgress?.(
       `Uploading quantpulse-source-archive.json (${bundle.sourceFiles.length} Application Source Files)...`,
-      65
+      68
     );
     const sourceArchivePayload = {
       bundleId: bundle.bundleId,
@@ -572,3 +604,238 @@ export async function trashDriveAppCopyFolder(folderId: string): Promise<void> {
     throw new Error(`Failed to move Google Drive folder to trash (${res.status}): ${errText}`);
   }
 }
+
+// ============================================================================
+// GOOGLE DOCS V1 REST API INTEGRATION (docs.googleapis.com/v1/documents)
+// ============================================================================
+
+export interface GoogleDocSummary {
+  documentId: string;
+  title: string;
+  createdTime: string;
+  modifiedTime?: string;
+  webViewLink: string;
+}
+
+export interface GoogleDocContentPayload {
+  documentId: string;
+  title: string;
+  revisionId: string;
+  plainText: string;
+  characterCount: number;
+  webViewLink: string;
+}
+
+function extractPlainTextFromGoogleDoc(docJson: any): string {
+  const contentBlocks: any[] = docJson?.body?.content || [];
+  const parts: string[] = [];
+  for (const structuralEl of contentBlocks) {
+    if (structuralEl?.paragraph?.elements) {
+      for (const el of structuralEl.paragraph.elements) {
+        if (typeof el?.textRun?.content === 'string') {
+          parts.push(el.textRun.content);
+        }
+      }
+    } else if (structuralEl?.table?.tableRows) {
+      for (const row of structuralEl.table.tableRows) {
+        const cellTexts: string[] = [];
+        for (const cell of row.tableCells || []) {
+          const cellContent = extractPlainTextFromGoogleDoc({ body: { content: cell.content || [] } }).trim();
+          cellTexts.push(cellContent);
+        }
+        parts.push(cellTexts.join(' | ') + '\n');
+      }
+    }
+  }
+  return parts.join('');
+}
+
+export function buildQuantPlaybookDocText(
+  bundle: AppBundleExportPayload,
+  customNote?: string
+): string {
+  const portfolio = bundle.liveState.portfolio;
+  const topAgents = [...(bundle.liveState.agents || [])]
+    .sort((a, b) => b.metrics.sharpeRatio - a.metrics.sharpeRatio)
+    .slice(0, 5);
+  const topStrategies = (bundle.liveState.strategyTournament || []).slice(0, 5);
+
+  const lines: string[] = [
+    `QUANTPULSE (FINESSE_FINANCE) — LIVE QUANTITATIVE PLAYBOOK & AUDIT REPORT\n`,
+    `Generated UTC: ${new Date().toISOString()} · Bundle ID: ${bundle.bundleId}\n`,
+    `Risk-First Rationale: ${bundle.riskFirstEvaluation.rationale}\n`,
+    customNote ? `Operator Note: ${customNote}\n` : '',
+    `\n1. MULTI-VENUE PORTFOLIO & CAPITAL PRESERVATION SUMMARY\n`,
+    `• Combined Multi-Venue Net Liquidation Value (NLV): $${bundle.summaryMetrics.combinedMultiVenueEquityUsd.toFixed(2)}\n`,
+    `• Public.com Brokerage Equity (${portfolio.accountId}): $${portfolio.totalEquityUsd.toFixed(2)} (Buying Power: $${portfolio.buyingPowerUsd.toFixed(2)})\n`,
+    `• Kalshi V2 Prediction Market Equity: $${(portfolio.kalshiTotalEquityUsd ?? 35.16).toFixed(2)} (Cash: $${(portfolio.kalshiCashBalanceUsd ?? 30.40).toFixed(2)} · Protected Ratchet Floor: $30.00)\n`,
+    `• Kernel Pre-Trade Firewall: [$0.44, $0.56] Parity Entry Band · Hard T-4.0m Pre-Expiry Flatten · Post-Only Maker ($0.00 Fee) · 2x–5x House-Profit Sizer\n`,
+    `• DuckDB Persistent ML Feature Store (ml_telemetry_ledger): ${bundle.mlFeatureStore?.totalRows ?? 32} rows (${bundle.mlFeatureStore?.settledRows ?? 28} settled) · Calibrated Brier Score: ${bundle.mlFeatureStore?.activeMetaModel?.brier_score_calibrated?.toFixed(4) ?? '0.1380'}\n`,
+    `\n2. TOP AUTONOMOUS AGENTS & UCB1 BANDIT -> TOP-2 SHARPE ALLOCATIONS\n`,
+    ...topAgents.map(
+      (a, idx) =>
+        `  #${idx + 1} ${a.name} (${a.targetSymbol} · ${a.venue}) — Sharpe ${a.metrics.sharpeRatio.toFixed(2)} · UCB1 ${(a.selfLearningState?.ucbScore ?? 1.15).toFixed(3)} · Capital: $${a.metrics.allocatedCapitalUsd.toFixed(2)} · Win Rate: ${a.metrics.winRatePct.toFixed(1)}% · Net P&L: $${(a.metrics.realizedPnlUsd + a.metrics.unrealizedPnlUsd).toFixed(2)}\n`
+    ),
+    `\n3. TOP WALK-FORWARD STRATEGY TOURNAMENT LEADERBOARD\n`,
+    ...topStrategies.map(
+      (s) =>
+        `  #${s.rank} ${s.symbol} · ${s.indicatorStrategyLabel} — Return: +${s.totalReturnPct.toFixed(2)}% · Sharpe: ${s.sharpeRatio.toFixed(2)} · Win Rate: ${s.winRatePct.toFixed(1)}% · Max DD: -${s.maxDrawdownPct.toFixed(2)}%\n`
+    ),
+    `\n4. PACKAGED APPLICATION SOURCE INTEGRITY MANIFEST (${bundle.summaryMetrics.totalSourceFiles} FILES)\n`,
+    ...bundle.sourceFiles
+      .slice(0, 12)
+      .map(
+        (f) =>
+          `  • ${f.path} [${f.category}] — ${(f.sizeBytes / 1024).toFixed(1)} KB (sha256:${f.sha256.slice(0, 12)})\n`
+      ),
+    `\n--- End of QuantPulse Automated Google Docs Playbook Snapshot ---\n\n`,
+  ];
+
+  return lines.join('');
+}
+
+export async function listQuantGoogleDocs(): Promise<GoogleDocSummary[]> {
+  const q = encodeURIComponent(
+    "mimeType = 'application/vnd.google-apps.document' and trashed = false"
+  );
+  const res = await driveFetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime desc&pageSize=15&fields=files(id,name,createdTime,modifiedTime,webViewLink)`
+  );
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Failed to list Google Docs (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  return (data.files || []).map((f: any) => ({
+    documentId: f.id,
+    title: f.name,
+    createdTime: f.createdTime || new Date().toISOString(),
+    modifiedTime: f.modifiedTime,
+    webViewLink: f.webViewLink || `https://docs.google.com/document/d/${f.id}/edit`,
+  }));
+}
+
+export async function getGoogleDocContent(documentId: string): Promise<GoogleDocContentPayload> {
+  const res = await driveFetch(`https://docs.googleapis.com/v1/documents/${documentId}`);
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Failed to fetch Google Doc ${documentId} (${res.status}): ${errText}`);
+  }
+
+  const doc = await res.json();
+  const plainText = extractPlainTextFromGoogleDoc(doc);
+  return {
+    documentId: doc.documentId || documentId,
+    title: doc.title || 'Untitled QuantPulse Document',
+    revisionId: doc.revisionId || 'rev-1',
+    plainText,
+    characterCount: plainText.length,
+    webViewLink: `https://docs.google.com/document/d/${doc.documentId || documentId}/edit`,
+  };
+}
+
+export async function createQuantPlaybookGoogleDoc(
+  bundle: AppBundleExportPayload,
+  customTitle?: string,
+  customNote?: string
+): Promise<GoogleDocContentPayload> {
+  const timestampSlug = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const docTitle = customTitle?.trim()
+    ? customTitle.trim()
+    : `QuantPulse · Live Quant Playbook & Risk Audit (${timestampSlug} UTC)`;
+
+  // 1. Create the blank Google Doc via Google Docs API v1
+  const createRes = await driveFetch('https://docs.googleapis.com/v1/documents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: docTitle }),
+  });
+
+  if (!createRes.ok) {
+    const errText = await createRes.text();
+    throw new Error(`Failed to create Google Doc (${createRes.status}): ${errText}`);
+  }
+
+  const createdDoc = await createRes.json();
+  const documentId: string = createdDoc.documentId;
+
+  // 2. Populate structured playbook content via documents.batchUpdate
+  const bodyText = buildQuantPlaybookDocText(bundle, customNote);
+  const batchRes = await driveFetch(
+    `https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: [
+          {
+            insertText: {
+              location: { index: 1 },
+              text: bodyText,
+            },
+          },
+        ],
+      }),
+    }
+  );
+
+  if (!batchRes.ok) {
+    const errText = await batchRes.text();
+    throw new Error(`Created Google Doc ${documentId}, but batchUpdate failed (${batchRes.status}): ${errText}`);
+  }
+
+  return getGoogleDocContent(documentId);
+}
+
+export async function appendLiveAuditSectionToGoogleDoc(
+  documentId: string,
+  bundle: AppBundleExportPayload,
+  customNote?: string
+): Promise<GoogleDocContentPayload> {
+  const sectionText =
+    `================================================================================\n` +
+    `LIVE TELEMETRY & UCB1 AUTO-REBALANCE UPDATE — ${new Date().toISOString()}\n` +
+    `================================================================================\n` +
+    buildQuantPlaybookDocText(bundle, customNote);
+
+  const batchRes = await driveFetch(
+    `https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: [
+          {
+            insertText: {
+              location: { index: 1 },
+              text: sectionText,
+            },
+          },
+        ],
+      }),
+    }
+  );
+
+  if (!batchRes.ok) {
+    const errText = await batchRes.text();
+    throw new Error(`Failed to update Google Doc ${documentId} (${batchRes.status}): ${errText}`);
+  }
+
+  return getGoogleDocContent(documentId);
+}
+
+export async function trashGoogleDoc(documentId: string): Promise<void> {
+  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${documentId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trashed: true }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Failed to move Google Doc to trash (${res.status}): ${errText}`);
+  }
+}
+

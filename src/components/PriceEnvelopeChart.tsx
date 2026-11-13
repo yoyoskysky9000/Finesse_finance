@@ -282,7 +282,7 @@ export const PriceEnvelopeChart: React.FC<PriceEnvelopeChartProps> = ({
 
               return (
                 <g
-                  key={ord.id}
+                  key={`${ord.id}-${orderIndex}`}
                   className="cursor-pointer"
                   onMouseEnter={() => setHoveredOrderId(ord.id)}
                   onMouseLeave={() => setHoveredOrderId(null)}
@@ -404,12 +404,12 @@ export const PriceEnvelopeChart: React.FC<PriceEnvelopeChartProps> = ({
               Plotted Agent Executions ({symbolOrders.length}) — Click or hover marker to inspect OCO brackets:
             </span>
             <div className="flex flex-wrap items-center gap-1.5">
-              {symbolOrders.map((ord) => {
+              {symbolOrders.map((ord, idx) => {
                 const isSelected = ord.id === activeInspectOrderId;
                 const { pnlUsd } = computeOrderPnl(ord);
                 return (
                   <button
-                    key={ord.id}
+                    key={`${ord.id}-${idx}`}
                     type="button"
                     onClick={() => setSelectedOrderId(ord.id)}
                     onMouseEnter={() => setHoveredOrderId(ord.id)}

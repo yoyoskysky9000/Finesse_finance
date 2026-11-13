@@ -24,11 +24,17 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    // Phase 1.3: Custom claim admin check (hardcoded email removed)
     function isAdmin() {
-      return isSignedIn() && (
-        request.auth.token.email == 'lakeskyler904@gmail.com' ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
+      return isSignedIn() && request.auth.token.admin == true;
+    }
+
+    // Configurable rule-level allocation caps (enforced alongside stricter server-side live balance validation)
+    function isWithinAllocationCap(allocatedUsd, kalshiUsd, publicUsd) {
+      return allocatedUsd is number && allocatedUsd >= 0 && allocatedUsd <= 1000 &&
+        kalshiUsd is number && kalshiUsd >= 0 && kalshiUsd <= 500 &&
+        publicUsd is number && publicUsd >= 0 && publicUsd <= 500 &&
+        (kalshiUsd + publicUsd) <= 1000;
     }
 
     // Validation Blueprint: QuantAgentState
@@ -71,9 +77,7 @@ service cloud.firestore {
       data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
       data.targetSymbol is string && data.targetSymbol.size() >= 1 && data.targetSymbol.size() <= 32 &&
       data.status is string && data.status in ['ACTIVE', 'PAUSED', 'KILLED_BY_RISK', 'HALTED_BY_KILL_SWITCH'] &&
-      data.allocatedCapitalUsd is number && data.allocatedCapitalUsd >= 0 && data.allocatedCapitalUsd <= 1000000 &&
-      data.kalshiAllocatedUsd is number && data.kalshiAllocatedUsd >= 0 && data.kalshiAllocatedUsd <= 1000000 &&
-      data.publicAllocatedUsd is number && data.publicAllocatedUsd >= 0 && data.publicAllocatedUsd <= 1000000 &&
+      isWithinAllocationCap(data.allocatedCapitalUsd, data.kalshiAllocatedUsd, data.publicAllocatedUsd) &&
       data.predictionMarketDataSource is string && data.predictionMarketDataSource.size() >= 1 && data.predictionMarketDataSource.size() <= 64 &&
       data.sharpe is number &&
       data.winRate is number && data.winRate >= 0 && data.winRate <= 100 &&
@@ -118,10 +122,8 @@ service cloud.firestore {
       data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 && data.ownerUid.matches('^[a-zA-Z0-9_\\-]+$') &&
       data.ownerUid == request.auth.uid &&
       data.topAgentId is string && data.topAgentId.size() >= 1 && data.topAgentId.size() <= 128 &&
-      data.topAgentAllocatedUsd is number && data.topAgentAllocatedUsd >= 0 && data.topAgentAllocatedUsd <= 1000000 &&
-      data.kalshiDirectUsd is number && data.kalshiDirectUsd >= 0 && data.kalshiDirectUsd <= 1000000 &&
-      data.publicEventContractUsd is number && data.publicEventContractUsd >= 0 && data.publicEventContractUsd <= 1000000 &&
-      data.combinedEquityUsd is number && data.combinedEquityUsd >= 0 &&
+      isWithinAllocationCap(data.topAgentAllocatedUsd, data.kalshiDirectUsd, data.publicEventContractUsd) &&
+      data.combinedEquityUsd is number && data.combinedEquityUsd >= 0 && data.combinedEquityUsd <= 100000 &&
       data.duckDbTotalRows is number && data.duckDbTotalRows >= 0 &&
       data.duckDbSettledRows is number && data.duckDbSettledRows >= 0 &&
       data.calibratedBrierScore is number && data.calibratedBrierScore >= 0 && data.calibratedBrierScore <= 1 &&
@@ -130,43 +132,67 @@ service cloud.firestore {
       data.updatedAt is timestamp;
     }
 
+    // Validation Blueprint: SystemKillSwitchState
+    function isValidSystemKillSwitchState(data) {
+      return data.keys().hasAll([
+        'controlId',
+        'globalKillSwitchActive',
+        'executionMode',
+        'reason',
+        'updatedBy',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'controlId',
+        'globalKillSwitchActive',
+        'executionMode',
+        'reason',
+        'updatedBy',
+        'updatedAt'
+      ]) &&
+      data.controlId is string && data.controlId.size() >= 1 && data.controlId.size() <= 128 && data.controlId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.globalKillSwitchActive is bool &&
+      data.executionMode is string && data.executionMode in ['PAPER', 'LIVE'] &&
+      data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 256 &&
+      data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 128 &&
+      data.updatedAt is timestamp;
+    }
+
+    // Phase 1.1: /quant_agents/{agentId}
+    // - Creation and server telemetry fields (status, sharpe, winRate, totalPnlUsd) are server-written ONLY (Admin SDK bypasses rules).
+    // - Clients cannot transition status out of KILLED_BY_RISK or HALTED_BY_KILL_SWITCH.
+    // - Owners may ONLY update name, targetSymbol, and capped allocations (allocatedCapitalUsd, kalshiAllocatedUsd, publicAllocatedUsd).
     match /quant_agents/{agentId} {
       allow get: if isSignedIn() && isValidId(agentId) && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
 
-      allow create: if isSignedIn() &&
-        isValidId(agentId) &&
-        isValidQuantAgentState(incoming()) &&
-        incoming().id == agentId &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
+      // Server-written only via Firebase Admin SDK
+      allow create: if false;
 
       allow update: if isSignedIn() &&
         isValidId(agentId) &&
         isValidQuantAgentState(incoming()) &&
-        (existing().ownerUid == request.auth.uid || isAdmin()) &&
+        existing().ownerUid == request.auth.uid &&
+        !(existing().status in ['KILLED_BY_RISK', 'HALTED_BY_KILL_SWITCH']) &&
         incoming().id == existing().id &&
         incoming().ownerUid == existing().ownerUid &&
+        incoming().status == existing().status &&
+        incoming().predictionMarketDataSource == existing().predictionMarketDataSource &&
+        incoming().sharpe == existing().sharpe &&
+        incoming().winRate == existing().winRate &&
+        incoming().totalPnlUsd == existing().totalPnlUsd &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
-        (
-          isAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'name',
-            'targetSymbol',
-            'status',
-            'allocatedCapitalUsd',
-            'kalshiAllocatedUsd',
-            'publicAllocatedUsd',
-            'predictionMarketDataSource',
-            'sharpe',
-            'winRate',
-            'totalPnlUsd',
-            'updatedAt'
-          ])
-        );
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name',
+          'targetSymbol',
+          'allocatedCapitalUsd',
+          'kalshiAllocatedUsd',
+          'publicAllocatedUsd',
+          'updatedAt'
+        ]);
 
-      allow delete: if isSignedIn() && isValidId(agentId) && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow delete: if false;
     }
 
     match /quant_vault_checkpoints/{checkpointId} {
@@ -183,28 +209,39 @@ service cloud.firestore {
       allow update: if isSignedIn() &&
         isValidId(checkpointId) &&
         isValidQuantVaultCheckpoint(incoming()) &&
-        (existing().ownerUid == request.auth.uid || isAdmin()) &&
+        existing().ownerUid == request.auth.uid &&
         incoming().checkpointId == existing().checkpointId &&
         incoming().ownerUid == existing().ownerUid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
-        (
-          isAdmin() ||
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'topAgentId',
-            'topAgentAllocatedUsd',
-            'kalshiDirectUsd',
-            'publicEventContractUsd',
-            'combinedEquityUsd',
-            'duckDbTotalRows',
-            'duckDbSettledRows',
-            'calibratedBrierScore',
-            'activeMetaModelId',
-            'updatedAt'
-          ])
-        );
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'topAgentId',
+          'topAgentAllocatedUsd',
+          'kalshiDirectUsd',
+          'publicEventContractUsd',
+          'combinedEquityUsd',
+          'duckDbTotalRows',
+          'duckDbSettledRows',
+          'calibratedBrierScore',
+          'activeMetaModelId',
+          'updatedAt'
+        ]);
 
       allow delete: if isSignedIn() && isValidId(checkpointId) && (existing().ownerUid == request.auth.uid || isAdmin());
+    }
+
+    // Phase 1.5: Global Kill Switch & Execution Mode Control Document (/system_controls/kill_switch)
+    match /system_controls/{controlId} {
+      allow get: if isSignedIn() && isValidId(controlId);
+      allow list: if false;
+
+      allow create, update: if isAdmin() &&
+        isValidId(controlId) &&
+        isValidSystemKillSwitchState(incoming()) &&
+        incoming().controlId == controlId &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if false;
     }
   }
 }

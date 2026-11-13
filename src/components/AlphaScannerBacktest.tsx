@@ -1991,8 +1991,8 @@ export const AlphaScannerBacktest: React.FC<AlphaScannerBacktestProps> = ({
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/80">
-                          {inspectedRes.trades.map((tr) => (
-                            <tr key={tr.id} className="hover:bg-slate-800/30">
+                          {inspectedRes.trades.map((tr, idx) => (
+                            <tr key={`${tr.id}-${idx}`} className="hover:bg-slate-800/30">
                               <td className="py-2 px-3 text-slate-300">{tr.id}</td>
                               <td className="py-2 px-3">
                                 <span
@@ -2135,8 +2135,8 @@ export const AlphaScannerBacktest: React.FC<AlphaScannerBacktestProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {backtestResult.trades.map((tr) => (
-                          <tr key={tr.id} className="hover:bg-slate-800/30">
+                        {backtestResult.trades.map((tr, idx) => (
+                          <tr key={`${tr.id}-${idx}`} className="hover:bg-slate-800/30">
                             <td className="py-2 px-3 text-slate-300">{tr.id}</td>
                             <td className="py-2 px-3">
                               <span

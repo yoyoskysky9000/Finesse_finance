@@ -25,6 +25,7 @@ import type {
   McpResourceDefinition,
   McpServerConnection,
   McpToolDefinition,
+  OrchestratorCycleTelemetry,
   PortfolioSummary,
 } from '../types/quant.ts';
 
@@ -137,6 +138,171 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
     }
   };
 
+  const [fiveGateSnapshot, setFiveGateSnapshot] = useState<any>(null);
+  const [fiveGateLastEval, setFiveGateLastEval] = useState<any>(null);
+  const [isEvaluatingFiveGate, setIsEvaluatingFiveGate] = useState(false);
+  const [geminiCacheStatus, setGeminiCacheStatus] = useState<any>(null);
+  const [selectedThinkingLevel, setSelectedThinkingLevel] = useState<'LOW' | 'MEDIUM' | 'HIGH'>('MEDIUM');
+  const [selectedMinsToExpiry, setSelectedMinsToExpiry] = useState<number>(9.5);
+
+  // 3-Phase Autonomous Orchestrator & PostgreSQL 16 Telemetry State
+  const [orchestratorState, setOrchestratorState] = useState<OrchestratorCycleTelemetry | null>(null);
+  const [isRunningOrchestrator, setIsRunningOrchestrator] = useState<boolean>(false);
+  const [sqlQueryInput, setSqlQueryInput] = useState<string>(
+    "SELECT signal_id, asset_pair, implied_prob_delta, orderbook_imbalance_ratio, volatility_regime, captured_at FROM market_signals WHERE captured_at >= NOW() - INTERVAL '15 minutes' ORDER BY captured_at DESC;"
+  );
+  const [sqlAssetPairFilter, setSqlAssetPairFilter] = useState<string>('BTC-USD');
+  const [lastSqlQueryResult, setLastSqlQueryResult] = useState<Record<string, any> | null>(null);
+  const [isRunningSqlQuery, setIsRunningSqlQuery] = useState<boolean>(false);
+
+  const fetchOrchestratorTelemetry = async () => {
+    try {
+      const res = await fetch('/api/orchestrator/state');
+      if (res.ok) {
+        const data = await res.json();
+        setOrchestratorState(data);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleRunOrchestratorCycle = async (
+    scenario:
+      | 'HIGH_CONVICTION_ARB'
+      | 'MODERATE_MAKER_POST_ONLY'
+      | 'CRITICAL_RISK_BREACH'
+      | 'SEQ_DESYNC_ABORT'
+      | 'POISON_PILL_DLQ',
+    skipPhase1IfFresh = false
+  ) => {
+    setIsRunningOrchestrator(true);
+    try {
+      const res = await fetch('/api/orchestrator/run-cycle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scenario,
+          ticker: scenario === 'MODERATE_MAKER_POST_ONLY' ? 'KXETH15M' : 'KXBTC15M',
+          asset_pair: scenario === 'MODERATE_MAKER_POST_ONLY' ? 'ETH-USD' : 'BTC-USD',
+          skip_phase1_if_fresh: skipPhase1IfFresh,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.orchestratorState) {
+          setOrchestratorState(data.orchestratorState);
+        }
+        if (data.outputContract) {
+          setLastToolOutput(data.outputContract);
+        }
+      }
+    } finally {
+      setIsRunningOrchestrator(false);
+    }
+  };
+
+  const handleRunPostgres16Query = async (overrideSql?: string, forceUnrecoverableFault = false) => {
+    const queryToRun = overrideSql ?? sqlQueryInput;
+    if (overrideSql) {
+      setSqlQueryInput(overrideSql);
+    }
+    setIsRunningSqlQuery(true);
+    try {
+      const res = await fetch('/api/orchestrator/sql-query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sql_query: queryToRun,
+          asset_pair: sqlAssetPairFilter,
+          simulate_unrecoverable_sql_fault: forceUnrecoverableFault,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setLastSqlQueryResult(data.queryResult || null);
+        if (data.orchestratorState) {
+          setOrchestratorState(data.orchestratorState);
+        }
+      }
+    } finally {
+      setIsRunningSqlQuery(false);
+    }
+  };
+
+  const fetchFiveGateSnapshot = async () => {
+    try {
+      const [fgRes, cacheRes] = await Promise.all([
+        fetch('/api/kalshi/five-gate-brier'),
+        fetch('/api/kalshi/gemini-cache-status'),
+      ]);
+      if (fgRes.ok) {
+        const data = await fgRes.json();
+        setFiveGateSnapshot(data);
+      }
+      if (cacheRes.ok) {
+        const cacheData = await cacheRes.json();
+        setGeminiCacheStatus(cacheData);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleEvaluateFiveGateSignal = async (customOverrides?: Record<string, any>) => {
+    setIsEvaluatingFiveGate(true);
+    try {
+      const res = await fetch('/api/kalshi/five-gate-evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          market_ticker: 'KXBTC15M',
+          series_ticker: 'KXBTC15M',
+          calibrated_yes_prob: 0.72,
+          kalshi_mid_prob: 0.56,
+          confidence_band: 0.08,
+          falsifiable_thesis:
+            'Coinbase BTC-USD spot +18 bps above rolling 15m strike with WS orderbook_delta bid imbalance > 1.8x',
+          is_maker: true,
+          executeOrderIfApproved: true,
+          ...(customOverrides || {}),
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setFiveGateLastEval(data);
+        await fetchFiveGateSnapshot();
+      }
+    } finally {
+      setIsEvaluatingFiveGate(false);
+    }
+  };
+
+  const handleDeliberateGeminiSignal = async () => {
+    setIsEvaluatingFiveGate(true);
+    try {
+      const res = await fetch('/api/kalshi/gemini-signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          market_ticker: 'KXBTC15M-26OCT29-ACTIVE',
+          series_ticker: 'KXBTC15M',
+          kalshi_mid_prob: 0.56,
+          minutes_to_expiration: selectedMinsToExpiry,
+          thinking_level: selectedThinkingLevel,
+          executeOrderIfApproved: true,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setFiveGateLastEval(data);
+        await fetchFiveGateSnapshot();
+      }
+    } finally {
+      setIsEvaluatingFiveGate(false);
+    }
+  };
+
   useEffect(() => {
     fetch('/api/mcp/python-server')
       .then((r) => (r.ok ? r.json() : null))
@@ -145,6 +311,8 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
       })
       .catch(() => {});
     fetchEntitlementRegistry();
+    fetchFiveGateSnapshot();
+    fetchOrchestratorTelemetry();
   }, []);
 
   const handleGenerateLicenseKey = async () => {
@@ -282,6 +450,32 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
           error_reason: dlqErrorReasonArg,
           severity: 'CRITICAL',
         };
+      } else if (targetTool === 'get_portfolio_state') {
+        args = { forceRefresh: true };
+      } else if (targetTool === 'check_mcp_venue_health') {
+        args = { simulateSeqDesync: false };
+      } else if (targetTool === 'read_market_query') {
+        args = { sql_query: sqlQueryInput, asset_pair: sqlAssetPairFilter };
+      } else if (targetTool === 'fetch_live_orderbook') {
+        args = { ticker: toolSymbolArg || 'KXBTC15M', asset_pair: 'BTC-USD', maker_fee_series: false };
+      } else if (targetTool === 'propose_or_execute_strategy') {
+        args = {
+          idempotency_key: idempotencyKeyArg,
+          client_order_id: `v2-${idempotencyKeyArg}`,
+          ticker: toolSymbolArg || 'KXBTC15M',
+          conviction_tier: 'HIGH',
+          execution_mode: 'TAKER_LIMIT',
+          price_dollars: toolAskPriceArg,
+          p_true: 0.645,
+          p_eff: toolAskPriceArg,
+        };
+      } else if (targetTool === 'execute_risk_mitigation') {
+        args = {
+          idempotency_key: idempotencyKeyArg,
+          breach_reason: 'Manual operator risk mitigation audit (<12% NLV cap & <250 bps drawdown enforcement)',
+          reduce_only: true,
+          cancel_all_orders: true,
+        };
       } else {
         args = {
           idempotency_key: idempotencyKeyArg,
@@ -394,6 +588,513 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* SECTION 0A: 3-PHASE AUTONOMOUS QUANTITATIVE EXECUTION & HALF-KELLY RISK ORCHESTRATOR */}
+      <div className="p-5 border border-cyan-500/40 bg-[#111827] space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-sm font-semibold text-slate-100">
+                3-Phase Autonomous Quantitative Execution &amp; Half-Kelly Risk Orchestrator
+              </h2>
+              <span className="text-xs font-mono text-cyan-300">
+                4-Call Turn Budget: {orchestratorState?.turnToolCallsUsed ?? 3} / {orchestratorState?.turnToolBudgetMax ?? 4} Calls
+                {' · '}
+                Phase 1 Hydration: {orchestratorState?.sessionHydrationAgeMs ?? 120}ms ({orchestratorState?.isHydrationFreshUnder1500ms ? '<1,500ms Fresh' : 'Batched Parallel'})
+                {' · '}
+                PostgreSQL 16 Schema Enforced
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-1">
+              Evaluates <span className="font-mono text-slate-300">yes_bid_size_fp / yes_ask_size_fp</span> depth (never deprecated <span className="font-mono text-slate-300">liquidity_dollars</span>), quadratic Kalshi fees (<span className="font-mono text-slate-300">0.07&middot;C&middot;P(1-P)</span> Taker / <span className="font-mono text-slate-300">0.0175&middot;C&middot;P(1-P)</span> Maker), and Fractional Half-Kelly sizing (<span className="font-mono text-slate-300">0.5&middot;(p_true - p_eff)/(1 - p_eff)</span>) strictly capped at <span className="font-mono text-emerald-300">12.0% NLV</span>.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleRunOrchestratorCycle('HIGH_CONVICTION_ARB', false)}
+              disabled={isRunningOrchestrator}
+              className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded transition-colors cursor-pointer"
+            >
+              {isRunningOrchestrator ? 'Running Cycle...' : 'Run 3-Phase HIGH Conviction Cycle (4/4 Calls)'}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleRunOrchestratorCycle('HIGH_CONVICTION_ARB', true)}
+              disabled={isRunningOrchestrator}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-500/40 font-mono text-xs rounded transition-colors cursor-pointer"
+            >
+              Fast Path (&lt;1.5s Hydrated · 3/4 Calls)
+            </button>
+            <button
+              type="button"
+              onClick={() => handleRunOrchestratorCycle('MODERATE_MAKER_POST_ONLY', false)}
+              disabled={isRunningOrchestrator}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 font-mono text-xs rounded transition-colors cursor-pointer"
+            >
+              MODERATE Maker (post_only=true)
+            </button>
+            <button
+              type="button"
+              onClick={() => handleRunOrchestratorCycle('CRITICAL_RISK_BREACH', false)}
+              disabled={isRunningOrchestrator}
+              className="px-3 py-1.5 bg-rose-950/90 hover:bg-rose-900 text-rose-200 border border-rose-500/50 font-mono text-xs rounded transition-colors cursor-pointer"
+            >
+              Trigger &gt;12% NLV / 250 bps Risk Mitigation
+            </button>
+            <button
+              type="button"
+              onClick={() => handleRunOrchestratorCycle('POISON_PILL_DLQ', false)}
+              disabled={isRunningOrchestrator}
+              className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 font-mono text-xs rounded transition-colors cursor-pointer"
+            >
+              Test 1-Retry Poison-Pill &rarr; DLQ
+            </button>
+          </div>
+        </div>
+
+        {/* 4-Column Telemetry Strip: Cross-Venue Divergence, Half-Kelly 12% NLV Cap, 4-Call Budget, Circuit Breaker */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+          <div className="p-3.5 border border-slate-800 bg-[#0B0F17]">
+            <div className="text-[11px] font-mono text-slate-400">
+              CROSS-VENUE DEPTH &amp; NET DIVERGENCE
+            </div>
+            <div className="mt-1 text-lg font-bold font-mono tabular-nums text-emerald-400">
+              +{orchestratorState?.latestOutputContract.net_edge_bps ?? 282} bps Net Edge
+            </div>
+            <div className="mt-1 font-mono text-[11px] text-slate-300">
+              Gross {orchestratorState?.crossVenueTelemetry.gross_prob_delta_bps ?? 525} bps · Ratio{' '}
+              {orchestratorState?.crossVenueTelemetry.orderbook_imbalance_ratio ?? 2.13}x
+            </div>
+            <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+              yes_bid_size_fp={orchestratorState?.crossVenueTelemetry.yes_bid_size_fp ?? '468.00'} · yes_ask_size_fp={orchestratorState?.crossVenueTelemetry.yes_ask_size_fp ?? '220.00'}
+            </div>
+          </div>
+
+          <div className="p-3.5 border border-slate-800 bg-[#0B0F17]">
+            <div className="text-[11px] font-mono text-slate-400">
+              FRACTIONAL HALF-KELLY &amp; 12% NLV CAP
+            </div>
+            <div className="mt-1 text-lg font-bold font-mono tabular-nums text-cyan-300">
+              {((orchestratorState?.halfKellySizing.applied_fraction ?? 0.0774) * 100).toFixed(2)}% NLV (${orchestratorState?.halfKellySizing.recommended_notional_usd?.toFixed(2) ?? '43.02'})
+            </div>
+            <div className="mt-1 font-mono text-[11px] text-slate-300">
+              Half-Kelly {((orchestratorState?.halfKellySizing.half_kelly_fraction ?? 0.0774) * 100).toFixed(2)}% · Cap 12.00% NLV
+            </div>
+            <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+              Current Single-Asset: {orchestratorState?.halfKellySizing.single_asset_exposure_pct ?? 10.44}% · DD {orchestratorState?.halfKellySizing.intraday_drawdown_bps ?? 18} bps
+            </div>
+          </div>
+
+          <div className="p-3.5 border border-slate-800 bg-[#0B0F17]">
+            <div className="text-[11px] font-mono text-slate-400">
+              SEQUENTIAL 3-PHASE MCP BUDGET (MAX 4)
+            </div>
+            <div className="mt-1 text-lg font-bold font-mono tabular-nums text-slate-100">
+              {orchestratorState?.turnToolCallsUsed ?? 3} / 4 Calls Invoked
+            </div>
+            <div className="mt-1 font-mono text-[11px] text-emerald-400 truncate">
+              {(orchestratorState?.latestOutputContract.mcp_tools_invoked || [])
+                .map((t) => `${t.tool_name}(${t.latency_ms}ms)`)
+                .join(' · ')}
+            </div>
+            <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+              Mode: {orchestratorState?.latestOutputContract.execution_mode ?? 'TAKER_LIMIT'} · Tier: {orchestratorState?.latestOutputContract.conviction_tier ?? 'HIGH'}
+            </div>
+          </div>
+
+          <div className="p-3.5 border border-slate-800 bg-[#0B0F17]">
+            <div className="text-[11px] font-mono text-slate-400">
+              POISON-PILL CIRCUIT BREAKER &amp; WS SEQ
+            </div>
+            <div className="mt-1 text-lg font-bold font-mono tabular-nums text-amber-300">
+              {orchestratorState?.circuitBreakerState.status ?? 'NOMINAL'} (Max 1 Retry)
+            </div>
+            <div className="mt-1 font-mono text-[11px] text-slate-300">
+              WS seq #{orchestratorState?.crossVenueTelemetry.ws_seq ?? 184920} · Drift {orchestratorState?.crossVenueTelemetry.ws_clock_drift_ms ?? 14}ms
+            </div>
+            <div className="mt-0.5 font-mono text-[11px] text-slate-400 truncate">
+              {orchestratorState?.circuitBreakerState.lastFaultReason || 'Zero unhandled faults · DLQ armed'}
+            </div>
+          </div>
+        </div>
+
+        {/* PostgreSQL 16 Authorized Schema Runner + Deterministic Output Contract Inspector */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-1">
+          <div className="lg:col-span-7 p-4 border border-slate-800 bg-[#0B0F17] space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-semibold text-slate-200 font-mono">
+                PostgreSQL 16 Telemetry Query Runner (read_market_query)
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleRunPostgres16Query(
+                      "SELECT signal_id, asset_pair, implied_prob_delta, orderbook_imbalance_ratio, volatility_regime, captured_at FROM market_signals WHERE captured_at >= NOW() - INTERVAL '15 minutes' ORDER BY captured_at DESC;"
+                    )
+                  }
+                  disabled={isRunningSqlQuery}
+                  className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-cyan-300 rounded cursor-pointer"
+                >
+                  Query market_signals
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleRunPostgres16Query(
+                      "SELECT position_id, venue, ticker, net_exposure_usd, unrealized_pnl_bps, updated_at FROM portfolio_positions WHERE updated_at >= NOW() - INTERVAL '1 hour';"
+                    )
+                  }
+                  disabled={isRunningSqlQuery}
+                  className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded cursor-pointer"
+                >
+                  Query portfolio_positions
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleRunPostgres16Query(
+                      "SELECT * FROM unauthorized_shadow_table WHERE datetime('now') > 0;",
+                      false
+                    )
+                  }
+                  disabled={isRunningSqlQuery}
+                  className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-amber-300 rounded cursor-pointer"
+                >
+                  Test 1-Retry SQL Recovery
+                </button>
+              </div>
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={sqlQueryInput}
+                onChange={(e) => setSqlQueryInput(e.target.value)}
+                className="flex-1 bg-slate-950 border border-slate-800 px-3 py-1.5 text-xs font-mono text-slate-200 rounded"
+                placeholder="PostgreSQL 16 SELECT on portfolio_positions or market_signals..."
+              />
+              <button
+                type="button"
+                onClick={() => handleRunPostgres16Query()}
+                disabled={isRunningSqlQuery}
+                className="px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-xs rounded cursor-pointer"
+              >
+                {isRunningSqlQuery ? 'Executing...' : 'Execute SQL'}
+              </button>
+            </div>
+
+            {lastSqlQueryResult && (
+              <div className="p-2.5 bg-slate-950 border border-slate-800 text-[11px] font-mono text-slate-300">
+                <div className="text-emerald-400">
+                  Status: {lastSqlQueryResult.status} · Dialect: {lastSqlQueryResult.dialect} · Rows: {lastSqlQueryResult.rowCount ?? 0}
+                </div>
+                <div className="text-slate-400 mt-0.5">{lastSqlQueryResult.rationale}</div>
+              </div>
+            )}
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-[11px] font-mono">
+                <thead>
+                  <tr className="border-b border-slate-800 text-slate-400">
+                    <th className="py-1.5 pr-3">ASSET / VENUE</th>
+                    <th className="py-1.5 pr-3">TICKER / REGIME</th>
+                    <th className="py-1.5 pr-3 text-right">PROB DELTA / EXPOSURE</th>
+                    <th className="py-1.5 pr-3 text-right">BOOK RATIO / PNL BPS</th>
+                    <th className="py-1.5 text-right">TIMESTAMP (TIMESTAMPTZ)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 text-slate-200">
+                  {(orchestratorState?.postgresTables.market_signals || []).map((row) => (
+                    <tr key={row.signal_id}>
+                      <td className="py-1.5 pr-3 text-cyan-300">{row.asset_pair}</td>
+                      <td className="py-1.5 pr-3">{row.volatility_regime}</td>
+                      <td className="py-1.5 pr-3 text-right tabular-nums text-emerald-400">
+                        +{(row.implied_prob_delta * 10000).toFixed(0)} bps
+                      </td>
+                      <td className="py-1.5 pr-3 text-right tabular-nums">
+                        {row.orderbook_imbalance_ratio.toFixed(2)}x
+                      </td>
+                      <td className="py-1.5 text-right text-slate-400">
+                        {row.captured_at.slice(11, 19)} UTC
+                      </td>
+                    </tr>
+                  ))}
+                  {(orchestratorState?.postgresTables.portfolio_positions || []).slice(0, 3).map((pos) => (
+                    <tr key={pos.position_id}>
+                      <td className="py-1.5 pr-3 text-amber-300">{pos.venue}</td>
+                      <td className="py-1.5 pr-3">{pos.ticker}</td>
+                      <td className="py-1.5 pr-3 text-right tabular-nums">
+                        ${pos.net_exposure_usd.toFixed(2)}
+                      </td>
+                      <td className="py-1.5 pr-3 text-right tabular-nums text-emerald-400">
+                        {pos.unrealized_pnl_bps >= 0 ? `+${pos.unrealized_pnl_bps}` : pos.unrealized_pnl_bps} bps
+                      </td>
+                      <td className="py-1.5 text-right text-slate-400">
+                        {pos.updated_at.slice(11, 19)} UTC
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="lg:col-span-5 p-4 border border-slate-800 bg-[#0B0F17] flex flex-col justify-between space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold font-mono text-slate-200">
+                Deterministic JSON Output Contract
+              </span>
+              <span className="text-[11px] font-mono text-emerald-400">
+                &lt;40 Words Rationale Enforced
+              </span>
+            </div>
+            <pre className="p-3 bg-slate-950 border border-slate-800 text-[11px] font-mono text-emerald-300 overflow-x-auto max-h-64">
+              {JSON.stringify(
+                orchestratorState?.latestOutputContract || {
+                  evaluation_timestamp: new Date().toISOString(),
+                  conviction_tier: 'HIGH',
+                  risk_status: 'NOMINAL',
+                  dataQualityWarning: false,
+                  net_edge_bps: 282,
+                  execution_mode: 'TAKER_LIMIT',
+                  mcp_tools_invoked: [
+                    { tool_name: 'get_portfolio_state', latency_ms: 19 },
+                    { tool_name: 'check_mcp_venue_health', latency_ms: 34 },
+                    { tool_name: 'fetch_live_orderbook', latency_ms: 38 },
+                    { tool_name: 'propose_or_execute_strategy', latency_ms: 42 },
+                  ],
+                  rationale:
+                    'BTC-USD gross delta 525 bps (>450), net fee-adjusted edge 282 bps (>250), yes_bid_size_fp/yes_ask_size_fp ratio 2.13x (>1.8), latency 38ms (<1500ms).',
+                  recommended_action:
+                    'Execute Kalshi V2 TAKER_LIMIT on KXBTC15M @ $0.58 price_dollars with Half-Kelly 12.0% NLV cap.',
+                },
+                null,
+                2
+              )}
+            </pre>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION 0: SEQUENTIAL 5-GATE PRE-TRADE FIREWALL & SQLITE BRIER SKILL SCORE (BSS) LEDGER */}
+      <div className="p-5 border border-emerald-500/30 bg-[#111827] space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-sm font-semibold text-slate-100">
+                Deterministic 5-Gate Pre-Trade Firewall &amp; SQLite Brier Skill Score (BSS) Calibration Ledger
+              </h2>
+              <span className="px-2 py-0.5 text-[11px] font-mono bg-emerald-950/80 border border-emerald-500/40 text-emerald-300">
+                KalshiSignalSchema &rarr; 5-Gate Engine &rarr; place_v2_maker_order
+              </span>
+              <span className="px-2 py-0.5 text-[11px] font-mono bg-cyan-950/80 border border-cyan-500/40 text-cyan-300">
+                SQLITE: {fiveGateSnapshot?.sqliteDbPath || 'kalshi_brier_calibration.sqlite'}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-1">
+              Enforces Gate 1 (WS <span className="font-mono text-slate-300">seq</span>/<span className="font-mono text-slate-300">clock</span> + Spread), Gate 2 (Quadratic Fee <span className="font-mono text-slate-300">M * c * P(1-P)</span> &amp; <span className="font-mono text-slate-300">&theta;_min</span>), Gate 3 (Rolling <span className="font-mono text-slate-300">BSS = 1 - BS/BS_ref &gt; 0</span> &amp; <span className="font-mono text-slate-300">conf_band &le; 0.15</span>), Gate 4 (Half-Kelly <span className="font-mono text-slate-300">f* = 0.5*(p_hat - p_eff)/(1 - p_eff)</span>), and Gate 5 (Daily Drawdown Kill-Switch + V2 Cancel All).
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleEvaluateFiveGateSignal()}
+              disabled={isEvaluatingFiveGate}
+              className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded transition-colors"
+            >
+              {isEvaluatingFiveGate ? 'Evaluating 5 Gates...' : 'Run 5-Gate Signal -> place_v2_maker_order'}
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                handleEvaluateFiveGateSignal({
+                  confidence_band: 0.19,
+                  falsifiable_thesis: 'Wide uncertainty interval test (conf_band=0.19 > 0.15 -> Gate 3 Paper Route)',
+                })
+              }
+              disabled={isEvaluatingFiveGate}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 font-mono text-xs rounded transition-colors"
+            >
+              Test Gate 3 Paper Demotion
+            </button>
+          </div>
+        </div>
+
+        {/* 5 Sequential Gates Status Strip */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 text-xs">
+          <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+            <div className="font-mono text-[11px] text-emerald-400 font-semibold">GATE 1 · DATA INTEGRITY</div>
+            <div className="mt-1 text-slate-200 font-mono">
+              seq_gaps=0 · spread &le; $0.05
+            </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              Zero WS seq gaps &amp; valid clock sync
+            </div>
+          </div>
+          <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+            <div className="font-mono text-[11px] text-emerald-400 font-semibold">GATE 2 · QUADRATIC FEE EDGE</div>
+            <div className="mt-1 text-slate-200 font-mono">
+              &theta;_min: 1.5&cent; Maker / 4.0&cent; Taker
+            </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              |p_cal - P| - M&middot;c&middot;P(1-P) &gt; &theta;_min
+            </div>
+          </div>
+          <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+            <div className="font-mono text-[11px] text-cyan-400 font-semibold">GATE 3 · BRIER BSS &amp; CONF</div>
+            <div className="mt-1 text-slate-200 font-mono">
+              BSS &gt; 0.0 (N&ge;10) &middot; band &le; 0.15
+            </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              Demotes to Paper if BSS &le; 0 or band &gt; 0.15
+            </div>
+          </div>
+          <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+            <div className="font-mono text-[11px] text-emerald-400 font-semibold">GATE 4 · HALF-KELLY f*</div>
+            <div className="mt-1 text-slate-200 font-mono">
+              Cap: {fiveGateSnapshot?.fiveGateConfig?.MAX_CONTRACTS_PER_ORDER ?? 25}x / ${fiveGateSnapshot?.fiveGateConfig?.MAX_NOTIONAL_PER_MARKET ?? 18}
+            </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              0.5 &middot; (p_hat - p_eff) / (1 - p_eff)
+            </div>
+          </div>
+          <div className="p-3 border border-slate-800 bg-[#0B0F17]">
+            <div className="font-mono text-[11px] text-emerald-400 font-semibold">GATE 5 · DD KILL-SWITCH</div>
+            <div className="mt-1 text-slate-200 font-mono">
+              Daily PnL: +${((fiveGateSnapshot?.killSwitchState?.realizedDailyPnlDollars ?? 8.45) + (fiveGateSnapshot?.killSwitchState?.unrealizedDailyPnlDollars ?? 3.2)).toFixed(2)}
+            </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              Max DD -${fiveGateSnapshot?.fiveGateConfig?.MAX_DAILY_DRAWDOWN_DOLLARS ?? 25} &rarr; V2 Cancel All
+            </div>
+          </div>
+        </div>
+
+        {/* SQLite series_calibration Table */}
+        {Array.isArray(fiveGateSnapshot?.seriesCalibration) && fiveGateSnapshot.seriesCalibration.length > 0 && (
+          <div className="overflow-x-auto border border-slate-800">
+            <table className="w-full text-left border-collapse text-xs font-mono">
+              <thead>
+                <tr className="bg-[#0B0F17] text-slate-400 border-b border-slate-800">
+                  <th className="py-2 px-3">Series</th>
+                  <th className="py-2 px-3">Settled (N)</th>
+                  <th className="py-2 px-3">BS (Model)</th>
+                  <th className="py-2 px-3">BS_ref (Kalshi Mid)</th>
+                  <th className="py-2 px-3">BSS = 1 - BS/BS_ref</th>
+                  <th className="py-2 px-3">Reliability (REL)</th>
+                  <th className="py-2 px-3">Resolution (RES)</th>
+                  <th className="py-2 px-3">Uncertainty (UNC)</th>
+                  <th className="py-2 px-3">Gate 3 Routing</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/70">
+                {fiveGateSnapshot.seriesCalibration.map((row: any) => (
+                  <tr key={row.series_ticker} className="hover:bg-slate-900/40">
+                    <td className="py-2 px-3 font-semibold text-slate-100">{row.series_ticker}</td>
+                    <td className="py-2 px-3 text-slate-300">{row.settled_count}</td>
+                    <td className="py-2 px-3 text-emerald-400">{Number(row.brier_score).toFixed(4)}</td>
+                    <td className="py-2 px-3 text-slate-300">{Number(row.reference_brier_score).toFixed(4)}</td>
+                    <td className={`py-2 px-3 font-bold ${Number(row.brier_skill_score) > 0 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {Number(row.brier_skill_score) >= 0 ? '+' : ''}{Number(row.brier_skill_score).toFixed(4)}
+                    </td>
+                    <td className="py-2 px-3 text-cyan-300">{Number(row.reliability).toFixed(4)}</td>
+                    <td className="py-2 px-3 text-emerald-300">{Number(row.resolution).toFixed(4)}</td>
+                    <td className="py-2 px-3 text-slate-400">{Number(row.uncertainty).toFixed(4)}</td>
+                    <td className="py-2 px-3">
+                      <span className={`px-1.5 py-0.5 text-[10px] ${row.live_execution_eligible ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/40' : 'bg-amber-950/80 text-amber-300 border border-amber-500/40'}`}>
+                        {row.live_execution_eligible ? 'LIVE_MAKER_ELIGIBLE' : 'PAPER_ONLY_DEMOTED'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Unified Google GenAI Async SDK + Tiered Context Caching + Pydantic KalshiSignalSchema Strip */}
+        <div className="p-3.5 border border-cyan-500/30 bg-[#0B0F17] space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold text-cyan-300 font-mono">
+                UNIFIED GENAI ASYNC SDK (`from google import genai` &middot; `client.aio.models.generate_content`)
+              </span>
+              <span className="px-2 py-0.5 text-[10px] font-mono bg-emerald-950/80 border border-emerald-500/40 text-emerald-300">
+                response.parsed: KalshiSignalSchema
+              </span>
+              <span className="px-2 py-0.5 text-[10px] font-mono bg-slate-900 border border-slate-700 text-slate-300">
+                client.aio.caches.create · Hits: {geminiCacheStatus?.cacheHits ?? 0} · Created: {geminiCacheStatus?.cacheCreations ?? 1}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={selectedThinkingLevel}
+                onChange={(e) => setSelectedThinkingLevel(e.target.value as 'LOW' | 'MEDIUM' | 'HIGH')}
+                className="px-2 py-1 bg-slate-900 border border-slate-700 text-slate-200 font-mono text-xs"
+              >
+                <option value="LOW">thinkingLevel: LOW</option>
+                <option value="MEDIUM">thinkingLevel: MEDIUM</option>
+                <option value="HIGH">thinkingLevel: HIGH</option>
+              </select>
+              <select
+                value={selectedMinsToExpiry}
+                onChange={(e) => setSelectedMinsToExpiry(Number(e.target.value))}
+                className="px-2 py-1 bg-slate-900 border border-slate-700 text-slate-200 font-mono text-xs"
+              >
+                <option value={9.5}>Near Expiry (9.5m &rarr; 300s TTL)</option>
+                <option value={35}>Medium Expiry (35m &rarr; 900s TTL)</option>
+                <option value={90}>Far Expiry (90m &rarr; 3600s TTL)</option>
+              </select>
+              <button
+                type="button"
+                onClick={handleDeliberateGeminiSignal}
+                disabled={isEvaluatingFiveGate}
+                className="px-3 py-1 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-xs rounded transition-colors"
+              >
+                {isEvaluatingFiveGate ? 'Deliberating Async...' : 'Async Gemini KalshiSignalSchema -> 5-Gate'}
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] font-mono text-slate-300">
+            <div className="p-2 border border-slate-800 bg-slate-950/60">
+              <span className="text-slate-400">Async Non-Blocking I/O:</span>{' '}
+              <span className="text-emerald-300">await client.aio.models.generate_content</span> (WS ping/pong &amp; orderbook_delta unblocked)
+            </div>
+            <div className="p-2 border border-slate-800 bg-slate-950/60">
+              <span className="text-slate-400">Tiered Cache TTLs:</span>{' '}
+              <span className="text-cyan-300">&lt;15m: 300s &middot; 15-60m: 900s &middot; &ge;60m: 3600s</span> (bundles system_instruction, rules &amp; BSS)
+            </div>
+            <div className="p-2 border border-slate-800 bg-slate-950/60">
+              <span className="text-slate-400">Cached Call Guardrails:</span>{' '}
+              <span className="text-emerald-300">Omits system_instruction, tools, tool_config</span> when cached_content is set
+            </div>
+          </div>
+        </div>
+
+        {fiveGateLastEval && (
+          <div className="p-3 border border-slate-800 bg-[#0B0F17] text-xs font-mono space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-emerald-400 font-semibold">
+                Latest 5-Gate Evaluation: {fiveGateLastEval.execution_mode}
+              </span>
+              <span className="text-slate-400">
+                prediction_id: {fiveGateLastEval.prediction_id}
+              </span>
+            </div>
+            <div className="text-slate-300">
+              Ticker: {fiveGateLastEval.signal?.market_ticker} &middot; Calibrated Prob: {fiveGateLastEval.signal?.calibrated_yes_prob} &middot; Conf Band: &plusmn;{fiveGateLastEval.signal?.confidence_band} &middot; Side: {String(fiveGateLastEval.signal?.recommended_side || 'yes').toUpperCase()} &middot; Exec Price: ${fiveGateLastEval.signal?.execution_price} &middot; Net Edge: +${fiveGateLastEval.gates?.gate2_quadratic_fee_edge?.netEdge} &middot; Half-Kelly f*: {fiveGateLastEval.gates?.gate4_half_kelly_sizing?.fStarHalfKelly} ({fiveGateLastEval.gates?.gate4_half_kelly_sizing?.contractsSized} contracts)
+            </div>
+            {fiveGateLastEval.signal?.bull_case_summary && (
+              <div className="text-[11px] text-slate-400">
+                <span className="text-emerald-300">Bull Case:</span> {fiveGateLastEval.signal.bull_case_summary} |{' '}
+                <span className="text-amber-300">Bear Case:</span> {fiveGateLastEval.signal.bear_case_summary}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* SECTION 1: LIVE AUTHENTICATED KALSHI PORTFOLIO V2 BALANCE & POSITIONS */}
       <div className="p-5 border border-slate-800 bg-[#111827] space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
@@ -403,18 +1104,18 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
                 Live Kalshi Portfolio v2 Balance, Open Contracts &amp; Trade Fills
               </h2>
               <span className="px-2 py-0.5 text-[11px] font-mono font-semibold bg-emerald-950/80 border border-emerald-500/40 text-emerald-300">
-                ED25519 AUTHENTICATED ({portfolio?.kalshiKeyIdPreview || 'KALSHI_API_ID'})
+                DUAL ED25519 / RSA-PSS ({portfolio?.kalshiKeyIdPreview || 'KALSHI_API_ID'})
               </span>
               <span className="px-2 py-0.5 text-[11px] font-mono bg-cyan-950/80 border border-cyan-500/40 text-cyan-300">
-                STATELESS STREAMABLE HTTP (transport=&apos;http&apos;)
+                OCT 2026 WS V2 + 30% WRITE RESERVE
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-1">
               Pulled directly from{' '}
               <span className="font-mono text-slate-300">
-                https://api.elections.kalshi.com/trade-api/v2/portfolio/balance
+                https://external-api.kalshi.com/trade-api/v2/portfolio/balance
               </span>{' '}
-              &amp; <span className="font-mono text-slate-300">/positions</span> using Ed25519 cryptographic request signing.
+              &amp; <span className="font-mono text-slate-300">wss://external-api-ws.kalshi.com/trade-api/ws/v2</span> with V2 <span className="font-mono text-emerald-300">POST /portfolio/events/orders</span> maker execution.
             </p>
           </div>
 

@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan to persist dual-venue agent allocations, executed orders, and DuckDB ML telemetry in Firebase Firestore and local DuckDB, deploy hardened Firestore security rules, and enable Google Drive OAuth permissions for vault backups across Cloud Run restarts.",
-  "updatedAt":  "2026-10-24T14:58:36.797064353Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
