@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0.0",
+  "champion_id": "btc-lead-lag-sniper-v3-baseline",
+  "updated_at": "2026-11-13T17:00:00-08:00",
+  "updated_by": "gemini-4-hydrogen",
+  "source_params_file": "strategy_params.json",
+  "active_strategy": {
+    "id": "BTC_LEAD_LAG_SNIPER",
+    "label": "BTC 15m Lead-Lag Sniper V3",
+    "timeframe": "15m",
+    "execution_mode": "MAKER_POST_ONLY",
+    "params": {
+      "askGateMin": 0.52,
+      "askGateMax": 0.74,
+      "minNetEdgeDollars": 0.065,
+      "timeWindowMinutes": [4.5, 13.5],
+      "volCushionNearExpiryThresholdMins": 6.0,
+      "volCushionNearExpiryMult": 1.18,
+      "volCushionStandardMult": 1.06,
+      "nd2Weight": 0.4,
+      "mlWeight": 0.6,
+      "maxContracts": 22,
+      "maxRiskUsd": 15.0,
+      "feePerContract": 0.02,
+      "stopAtr": 0.9,
+      "tpAtr": 2.5
+    }
+  },
+  "risk_caps": {
+    "sizing_basis": "SETTLED_AVAILABLE_CASH_ONLY",
+    "max_risk_per_trade_pct_of_settled_cash": 3.0,
+    "allowed_per_trade_cash_band_pct": [2.0, 5.0],
+    "max_total_open_exposure_pct_of_settled_cash": 25.0,
+    "max_single_asset_exposure_pct": 12.0,
+    "max_intraday_drawdown_bps": 250,
+    "kalshi_equity_hard_floor_usd": 30.0,
+    "require_deterministic_idempotency_key": true,
+    "idempotency_key_format": "symbol:side:strategy_id:time_bucket",
+    "require_cancel_open_orders_and_confirm_settled_before_exit": true
+  },
+  "simulation_assumptions": {
+    "kalshi_maker_fee_per_contract_usd": 0.0,
+    "kalshi_taker_fee_formula": "0.07 * C * P * (1 - P)",
+    "default_slippage_bps": 15,
+    "latency_ceiling_ms": 1500
+  },
+  "baseline_metrics": {
+    "status": "PENDING_TASK_03_REAL_DATA_BACKTEST",
+    "is_simulation": true,
+    "data_source": null,
+    "period_start": null,
+    "period_end": null,
+    "bars_tested": 0,
+    "total_trades": null,
+    "net_return_pct": null,
+    "net_pnl_usd": null,
+    "sharpe_ratio": null,
+    "win_rate_pct": null,
+    "profit_factor": null,
+    "max_drawdown_pct": null,
+    "total_fees_usd": null
+  },
+  "regime_sweep_metrics": {
+    "status": "PENDING_TASK_04",
+    "choppy_compression": null,
+    "high_volatility_expansion": null
+  }
+}
