@@ -15,13 +15,11 @@
     "label": "2.5.0 Unified Champion · Regime + LHS + Post-Mortem Vault",
     "timeframe": "15m",
     "execution_mode": "MAKER_POST_ONLY",
+    "params_ref": "strategy_params.json#btcLeadLagSniper",
     "entry": {
-      "min_edge_formula": "max(0.18, 0.12 + 1.1 * atr14_usd)",
-      "min_edge_floor_usd": 0.18,
+      "min_edge_formula": "max(strategy_params.btcLeadLagSniper.minNetEdgeDollars, 0.12 + 1.1 * atr14_usd)",
       "min_edge_base_usd": 0.12,
       "min_edge_atr_mult": 1.1,
-      "ask_gate": [0.52, 0.74],
-      "window_minutes": [5, 12],
       "drag_floor_usd": 0.12
     },
     "regime_filters": {
@@ -61,23 +59,6 @@
       "dead_trade_time_stop_minutes": 6.0,
       "dead_trade_min_pnl_atr_mult": 0.3,
       "forced_flat_seconds_before_expiry": 90
-    },
-    "params": {
-      "askGateMin": 0.52,
-      "askGateMax": 0.74,
-      "minNetEdgeDollars": 0.18,
-      "timeWindowMinutes": [5, 12],
-      "dragFloorUsd": 0.12,
-      "volCushionNearExpiryThresholdMins": 6.0,
-      "volCushionNearExpiryMult": 1.18,
-      "volCushionStandardMult": 1.06,
-      "nd2Weight": 0.4,
-      "mlWeight": 0.6,
-      "maxContracts": 22,
-      "maxRiskUsd": 15.0,
-      "feePerContract": 0.02,
-      "stopAtr": 0.9,
-      "tpAtr": 2.5
     }
   },
   "risk_caps": {

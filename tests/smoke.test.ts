@@ -1,25 +1,38 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+const tempLedgerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quantpulse-smoke-'));
 process.env.QUANTPULSE_TEST_MODE = 'true';
+process.env.QUANTPULSE_VAULT_LEDGER_PATH = path.join(tempLedgerDir, 'vault-ledger.json');
+process.env.QUANTPULSE_EXEC_IDEMPOTENCY_PATH = path.join(tempLedgerDir, 'exec-idempotency.json');
 delete process.env.STRICT_API_AUTH_REQUIRED;
 
 async function runSmokeSuite() {
   const { setCustomTokenVerifier } = await import('../src/server/phase1Security');
+  const { ExecutionVault } = await import('../src/server/ExecutionVault');
+  const { LEAD_LAG_PARAMS } = await import('../src/config/strategyParams');
+  const serverMod = await import('../server');
   const {
     app,
     autonomousAgents,
     executedOrders,
     marketFeatures,
-    venueOrderSubmissionCount,
     resetVenueOrderSubmissionCount,
     setTestLiveCashBalances,
+    setTestVenueExitHooks,
     orderRejectionLog,
     exitMonitorEvaluationLog,
     evaluateRealTimeRoiAndGlobalProfitLock,
-  } = await import('../server');
+    executeTradeIdempotencyStore,
+    loadExecuteTradeIdempotencyStoreFromDisk,
+    syncLiveKalshiPortfolio,
+    computePortfolioSummary,
+  } = serverMod;
   const { StrategyBacktester, runDeterministicRegimeBacktest } = await import(
     '../src/components/StrategyBacktester'
   );
@@ -76,7 +89,6 @@ async function runSmokeSuite() {
       body: JSON.stringify({
         agentId: targetAgent.id,
         notionalUsd: 50, // Exceeds $15 maxPositionNotionalUsd cap
-        skipLiveCashSync: true,
       }),
     });
     assert.equal(
@@ -88,9 +100,9 @@ async function runSmokeSuite() {
     assert.equal(capBody.rejected, true);
     assert.equal(capBody.code, 'POSITION_CAP_EXCEEDED');
     assert.equal(
-      venueOrderSubmissionCount,
+      serverMod.venueOrderSubmissionCount,
       0,
-      `Expected 0 venue calls on position-cap rejection, got ${venueOrderSubmissionCount}`
+      `Expected 0 venue calls on position-cap rejection, got ${serverMod.venueOrderSubmissionCount}`
     );
     assert.equal(
       executedOrders.length,
@@ -124,7 +136,6 @@ async function runSmokeSuite() {
         agentId: targetAgent.id,
         idempotencyKey: sharedIdempotencyKey,
         notionalUsd: 10,
-        skipLiveCashSync: true,
       }),
     });
     assert.equal(firstExecRes.status, 200, `Expected 200 on first submission, got ${firstExecRes.status}`);
@@ -133,7 +144,7 @@ async function runSmokeSuite() {
     assert.equal(firstExecBody.order.idempotencyKey, sharedIdempotencyKey);
 
     const ordersCountAfterFirst = executedOrders.length;
-    const venueCallsAfterFirst = venueOrderSubmissionCount;
+    const venueCallsAfterFirst = serverMod.venueOrderSubmissionCount;
 
     const secondExecRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
       method: 'POST',
@@ -145,7 +156,6 @@ async function runSmokeSuite() {
         agentId: targetAgent.id,
         idempotencyKey: sharedIdempotencyKey,
         notionalUsd: 10,
-        skipLiveCashSync: true,
       }),
     });
     assert.equal(
@@ -166,7 +176,7 @@ async function runSmokeSuite() {
       'Duplicate idempotency submission must not create a second order'
     );
     assert.equal(
-      venueOrderSubmissionCount,
+      serverMod.venueOrderSubmissionCount,
       venueCallsAfterFirst,
       'Duplicate idempotency submission must not invoke any venue calls'
     );
@@ -216,7 +226,7 @@ async function runSmokeSuite() {
     );
 
     // -------------------------------------------------------------------------
-    // Smoke Test (e): A position whose price crosses its take-profit gets an exit action from the daemon evaluation
+    // Smoke Test (e): Exit monitor dispatches Rule 3 pre-sweep + venue close order and updates status ONLY on confirmation
     // -------------------------------------------------------------------------
     const testSymbol = 'SPY';
     const spyFeature = marketFeatures.find((f) => f.symbol === testSymbol) || marketFeatures[0];
@@ -244,6 +254,86 @@ async function runSmokeSuite() {
     };
     executedOrders.unshift(testWorkingOrder);
 
+    // 1) Venue rejects close -> must NOT mark FILLED; must log EXIT_VENUE_REJECTED
+    let sweepCancelCalls = 0;
+    setTestVenueExitHooks({
+      cancelOpenOrders: async () => {
+        sweepCancelCalls += 1;
+        return 1;
+      },
+      getOpenOrdersCount: async () => 0,
+      getSettledPositionQty: async () => 1,
+      submitPublicExit: async () => ({
+        ok: false,
+        liveSubmitted: false,
+        orderId: 'pub-exit-rejected-001',
+        lastErrorMessage: 'Simulated Public.com SELL rejection',
+      }),
+    });
+
+    await evaluateRealTimeRoiAndGlobalProfitLock({
+      forceStepDownNow: false,
+      applyYesterdayProfitableSetup: false,
+    });
+    assert.equal(
+      testWorkingOrder.status,
+      'WORKING_OCO',
+      `Expected order to remain WORKING_OCO when venue rejects exit, got ${testWorkingOrder.status}`
+    );
+    assert.equal(testWorkingOrder.lastExitEvaluationResult, 'EXIT_VENUE_REJECTED');
+    assert(sweepCancelCalls >= 1, 'Expected Rule 3 CancelAllOpenOrders sweep before exit');
+
+    // 2) Venue confirms close -> status transitions to FILLED + logs TRIGGERED_TAKE_PROFIT
+    const submittedKalshiExitFlags: Array<{ reduceOnly: boolean; timeInForce: string }> = [];
+    setTestVenueExitHooks({
+      cancelOpenOrders: async () => {
+        sweepCancelCalls += 1;
+        return 1;
+      },
+      getOpenOrdersCount: async () => 0,
+      getSettledPositionQty: async (_venue, sym) => (sym.startsWith('KX') ? 2 : 1),
+      submitPublicExit: async () => ({
+        ok: true,
+        liveSubmitted: true,
+        orderId: 'pub-exit-confirmed-001',
+      }),
+      submitKalshiExit: async (p) => {
+        submittedKalshiExitFlags.push({ reduceOnly: p.reduceOnly, timeInForce: p.timeInForce });
+        return {
+          ok: true,
+          exchangeOrderId: 'kalshi-exit-confirmed-001',
+          statusLabel: 'LIVE_KALSHI_IOC_FILLED',
+          fillCount: p.contracts,
+          remainingCount: 0,
+        };
+      },
+    });
+
+    const testKalshiWorkingOrder: (typeof executedOrders)[number] = {
+      id: 'ord-smoke-kalshi-tp-001',
+      idempotencyKey: 'smoke-kalshi-tp-key-001',
+      notionalUsd: 1.20,
+      timestamp: new Date().toISOString(),
+      agentId: targetAgent.id,
+      agentName: targetAgent.name,
+      symbol: 'KXSOL15M-SMOKE',
+      venue: 'PREDICTION_MARKET',
+      side: 'BUY_YES',
+      orderType: 'LIMIT_OCO',
+      quantity: 2,
+      fillPrice: 0.55,
+      stopLossPrice: 0.45,
+      takeProfitPrice: 0.60,
+      regimeAtEntry: 'TRENDING_BULL',
+      status: 'WORKING_OCO',
+      rationale: 'Smoke test Kalshi position for reduce_only IoC exit',
+    };
+    const solFeature = marketFeatures.find((f) => f.symbol === 'KXSOL15M') || marketFeatures[0];
+    const origSolFeaturePx = solFeature.price;
+    solFeature.price = 0.64;
+    executedOrders.unshift(testKalshiWorkingOrder);
+
+    const venueCallsBeforeExit = serverMod.venueOrderSubmissionCount;
     const evalSummary = await evaluateRealTimeRoiAndGlobalProfitLock({
       forceStepDownNow: false,
       applyYesterdayProfitableSetup: false,
@@ -252,35 +342,50 @@ async function runSmokeSuite() {
     assert.equal(
       testWorkingOrder.status,
       'FILLED',
-      `Expected position crossing take-profit to be exited (status=FILLED), got ${testWorkingOrder.status}`
+      `Expected Public position crossing take-profit to be exited (status=FILLED), got ${testWorkingOrder.status}`
     );
     assert.equal(
       testWorkingOrder.lastExitEvaluationResult,
       'TRIGGERED_TAKE_PROFIT',
       `Expected lastExitEvaluationResult=TRIGGERED_TAKE_PROFIT, got ${testWorkingOrder.lastExitEvaluationResult}`
     );
+    assert.equal(
+      testKalshiWorkingOrder.status,
+      'FILLED',
+      `Expected Kalshi position crossing take-profit to be exited (status=FILLED), got ${testKalshiWorkingOrder.status}`
+    );
+    assert(
+      submittedKalshiExitFlags.some((f) => f.reduceOnly === true && f.timeInForce === 'immediate_or_cancel'),
+      'Expected Kalshi exit to submit reduce_only immediate_or_cancel order'
+    );
+    assert(
+      serverMod.venueOrderSubmissionCount > venueCallsBeforeExit,
+      'Expected real venue exit submission counter to increment'
+    );
     assert(
       Boolean(testWorkingOrder.lastExitEvaluatedAt),
       'Expected lastExitEvaluatedAt timestamp to be populated on open position'
     );
     assert(
-      evalSummary.roiSellsTriggered >= 1,
-      'Expected roiSellsTriggered >= 1 when take-profit is crossed'
+      evalSummary.roiSellsTriggered >= 2,
+      'Expected roiSellsTriggered >= 2 when Public and Kalshi take-profits are venue-confirmed'
     );
     const matchingLogEntry = exitMonitorEvaluationLog.find(
-      (entry) => entry.targetId === testWorkingOrder.id
+      (entry) => entry.targetId === testWorkingOrder.id && entry.status === 'TRIGGERED'
     );
     assert(
       matchingLogEntry && matchingLogEntry.result === 'TRIGGERED_TAKE_PROFIT',
       'Expected exitMonitorEvaluationLog to record TRIGGERED_TAKE_PROFIT for the position'
     );
+    setTestVenueExitHooks(null);
     spyFeature.price = originalSpyPrice;
+    solFeature.price = origSolFeaturePx;
     console.log(
-      'PASS [Smoke Test (e)]: Open position crossing take-profit received exit action and log entry from daemon evaluation.'
+      'PASS [Smoke Test (e)]: Exit monitor enforced Rule 3 sweep, withheld FILLED on rejection, and confirmed Public SELL + Kalshi reduce_only IoC exits.'
     );
 
     // -------------------------------------------------------------------------
-    // TASK-04 Smoke Test (f): Champion Config 2.5.0-UNIFIED-CHAMPION thresholds
+    // TASK-04 Smoke Test (f): Champion Config 2.5.0-UNIFIED-CHAMPION thresholds (consolidated from strategy_params.json)
     // -------------------------------------------------------------------------
     const {
       executionVault,
@@ -290,7 +395,18 @@ async function runSmokeSuite() {
     } = await import('../server');
     assert.equal(CHAMPION_CONFIG.champion_id, '2.5.0-UNIFIED-CHAMPION');
     assert.equal(CHAMPION_CONFIG.active_strategy.entry.drag_floor_usd, 0.12);
-    assert.deepEqual(CHAMPION_CONFIG.active_strategy.entry.window_minutes, [5, 12]);
+    assert.equal(
+      CHAMPION_CONFIG.active_strategy.entry.min_edge_floor_usd,
+      LEAD_LAG_PARAMS.minNetEdgeDollars
+    );
+    assert.deepEqual(
+      CHAMPION_CONFIG.active_strategy.entry.ask_gate,
+      [LEAD_LAG_PARAMS.askGateMin, LEAD_LAG_PARAMS.askGateMax]
+    );
+    assert.deepEqual(
+      CHAMPION_CONFIG.active_strategy.entry.window_minutes,
+      LEAD_LAG_PARAMS.timeWindowMinutes
+    );
     assert.equal(CHAMPION_CONFIG.active_strategy.regime_filters.chop14_entry_max, 50);
     assert.equal(CHAMPION_CONFIG.active_strategy.regime_filters.chop14_regime_flip_pause, 61.8);
     assert.equal(CHAMPION_CONFIG.active_strategy.liquidity_filters.min_lhs_threshold, 0.65);
@@ -510,10 +626,212 @@ async function runSmokeSuite() {
     console.log(
       'PASS [TASK-04 Tests (f)-(j)]: Champion 2.5.0 config, Regime/LHS filter, ExecutionVault Rules 1-3, and Champion exits passed.'
     );
-    console.log('\nALL SMOKE TESTS (a)-(j) PASSED.');
+
+    // -------------------------------------------------------------------------
+    // Fix A Tests: Fail-closed live cash check & no false connected status without creds
+    // -------------------------------------------------------------------------
+    setTestLiveCashBalances({
+      kalshiCashUsd: null,
+      kalshiSyncOk: false,
+      kalshiSyncError: 'Simulated sync failure',
+    });
+    resetVenueOrderSubmissionCount();
+    const rejCountBeforeFixA = orderRejectionLog.length;
+
+    const missingCashRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: targetAgent.id,
+        notionalUsd: 10,
+        skipLiveCashSync: true, // Bypass flag must have NO effect
+      }),
+    });
+    assert.equal(missingCashRes.status, 400);
+    const missingCashBody = (await missingCashRes.json()) as Record<string, any>;
+    assert.equal(missingCashBody.code, 'BALANCE_SYNC_UNAVAILABLE');
+    assert.equal(serverMod.venueOrderSubmissionCount, 0);
+    assert.equal(orderRejectionLog.length, rejCountBeforeFixA + 1);
+
+    // Stale cash (> 60s old) must also fail closed even if skipLiveCashSync=true is sent
+    setTestLiveCashBalances({
+      kalshiCashUsd: 500,
+      kalshiSyncedAtMs: Date.now() - 120_000,
+      kalshiSyncOk: true,
+    });
+    const staleCashRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: targetAgent.id,
+        notionalUsd: 10,
+        skipLiveCashSync: true,
+      }),
+    });
+    assert.equal(staleCashRes.status, 400);
+    const staleCashBody = (await staleCashRes.json()) as Record<string, any>;
+    assert.equal(staleCashBody.code, 'BALANCE_SYNC_UNAVAILABLE');
+    assert.equal(serverMod.venueOrderSubmissionCount, 0);
+
+    // syncLiveKalshiPortfolio must NOT report kalshiApiConnected=true when credentials are absent
+    const savedKeyId = process.env.KALSHI_API_KEY_ID;
+    const savedPem = process.env.KALSHI_PRIVATE_KEY_PEM;
+    delete process.env.KALSHI_API_KEY_ID;
+    delete process.env.KALSHI_PRIVATE_KEY_PEM;
+    await syncLiveKalshiPortfolio(5);
+    assert.equal(
+      computePortfolioSummary().kalshiApiConnected,
+      false,
+      'kalshiApiConnected must be false when Kalshi credentials are missing'
+    );
+    if (savedKeyId !== undefined) process.env.KALSHI_API_KEY_ID = savedKeyId;
+    if (savedPem !== undefined) process.env.KALSHI_PRIVATE_KEY_PEM = savedPem;
+    console.log(
+      'PASS [Fix A]: Fail-closed cash sync rejects missing/stale balances, ignores skipLiveCashSync, and reports disconnected without creds.'
+    );
+
+    // -------------------------------------------------------------------------
+    // Fix B Tests: Default 3% settled-cash cap (cannot be disabled)
+    // -------------------------------------------------------------------------
+    setTestLiveCashBalances({
+      kalshiCashUsd: 500, // 3% cap = $15.00
+      publicCashUsd: 500,
+      publicBuyingPowerUsd: 500,
+      publicCashOnlyBuyingPowerUsd: 500,
+    });
+    targetAgent.riskGovernance.maxPositionNotionalUsd = 100;
+    resetVenueOrderSubmissionCount();
+
+    const capBypassAttemptRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: targetAgent.id,
+        notionalUsd: 20, // Exceeds 3% of $500 ($15.00) even with enforceSettledCash3PctCap=false
+        enforceSettledCash3PctCap: false,
+      }),
+    });
+    assert.equal(capBypassAttemptRes.status, 400);
+    const capBypassBody = (await capBypassAttemptRes.json()) as Record<string, any>;
+    assert.equal(capBypassBody.code, 'SETTLED_CASH_CAP_EXCEEDED');
+    assert.equal(serverMod.venueOrderSubmissionCount, 0);
+    console.log(
+      'PASS [Fix B]: 3% settled-cash cap enforced by default pre-venue and cannot be disabled by request flags.'
+    );
+
+    // -------------------------------------------------------------------------
+    // Fix D Tests: Deterministic fallback SHA-256 key & disk persistence across restarts
+    // -------------------------------------------------------------------------
+    const secondAgent = autonomousAgents.find((a) => a.id !== targetAgent.id) || targetAgent;
+    secondAgent.riskGovernance.maxPositionNotionalUsd = 100;
+    setTestLiveCashBalances({
+      kalshiCashUsd: 500,
+      publicCashUsd: 500,
+      publicBuyingPowerUsd: 500,
+      publicCashOnlyBuyingPowerUsd: 500,
+    });
+    resetVenueOrderSubmissionCount();
+
+    const noKeyFirstRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: secondAgent.id,
+        notionalUsd: 10,
+      }),
+    });
+    assert.equal(noKeyFirstRes.status, 200);
+    const noKeyFirstBody = (await noKeyFirstRes.json()) as Record<string, any>;
+    assert.equal(noKeyFirstBody.idempotentReplay, false);
+    assert(
+      /^[a-f0-9]{64}$/.test(noKeyFirstBody.idempotencyKey),
+      `Expected deterministic 64-char SHA-256 fallback key, got ${noKeyFirstBody.idempotencyKey}`
+    );
+
+    const venueCallsAfterNoKeyFirst = serverMod.venueOrderSubmissionCount;
+    const noKeySecondRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: secondAgent.id,
+        notionalUsd: 10,
+      }),
+    });
+    assert.equal(noKeySecondRes.status, 200);
+    const noKeySecondBody = (await noKeySecondRes.json()) as Record<string, any>;
+    assert.equal(noKeySecondBody.idempotentReplay, true);
+    assert.equal(noKeySecondBody.idempotencyKey, noKeyFirstBody.idempotencyKey);
+    assert.equal(noKeySecondBody.order.id, noKeyFirstBody.order.id);
+    assert.equal(serverMod.venueOrderSubmissionCount, venueCallsAfterNoKeyFirst);
+
+    // Simulate server restart: wipe in-memory map + orders and reload from disk
+    executeTradeIdempotencyStore.clear();
+    const orderIdx = executedOrders.findIndex((o) => o.idempotencyKey === noKeyFirstBody.idempotencyKey);
+    if (orderIdx >= 0) executedOrders.splice(orderIdx, 1);
+    loadExecuteTradeIdempotencyStoreFromDisk();
+
+    const noKeyAfterRestartRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: secondAgent.id,
+        notionalUsd: 10,
+      }),
+    });
+    assert.equal(noKeyAfterRestartRes.status, 200);
+    const noKeyAfterRestartBody = (await noKeyAfterRestartRes.json()) as Record<string, any>;
+    assert.equal(noKeyAfterRestartBody.idempotentReplay, true);
+    assert.equal(noKeyAfterRestartBody.order.id, noKeyFirstBody.order.id);
+    assert.equal(serverMod.venueOrderSubmissionCount, venueCallsAfterNoKeyFirst);
+
+    // Also verify ExecutionVault disk ledger reloads active locks across simulated restarts
+    const activeBucketMs = Math.floor(Date.now() / (2700 * 1000)) * 2700 * 1000 + 1000;
+    const preRestartLock = executionVault.acquireIdempotencyLock({
+      symbol: 'KXSOL15M-PERSIST',
+      side: 'BUY_YES',
+      strategyId: 'BTC_LEAD_LAG_SNIPER',
+      timeframe: '15m',
+      timestampMs: activeBucketMs,
+    });
+    assert.equal(preRestartLock.allowed, true);
+    const restartedVault = new ExecutionVault(process.env.QUANTPULSE_VAULT_LEDGER_PATH);
+    const lockAcrossRestart = restartedVault.acquireIdempotencyLock({
+      symbol: 'KXSOL15M-PERSIST',
+      side: 'BUY_YES',
+      strategyId: 'BTC_LEAD_LAG_SNIPER',
+      timeframe: '15m',
+      timestampMs: activeBucketMs + 5000, // Same active 2700s bucket after restart
+    });
+    assert.equal(lockAcrossRestart.allowed, false);
+    assert.equal(lockAcrossRestart.duplicateBlocked, true);
+    console.log(
+      'PASS [Fix D]: Deterministic SHA-256 fallback deduplicates keyless calls and both idempotency stores survive simulated restarts.'
+    );
+
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) PASSED.');
   } finally {
+    setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempLedgerDir, { recursive: true, force: true });
   }
 }
 

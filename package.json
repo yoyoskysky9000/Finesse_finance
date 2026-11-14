@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
+    "test": "tsx tests/smoke.test.ts",
     "lint:eslint": "eslint src scripts --max-warnings=999",
     "format:check": "prettier --check \"src/**/*.{ts,tsx}\" \"scripts/**/*.ts\"",
     "git:hygiene": "bash scripts/git-hygiene-untrack.sh",

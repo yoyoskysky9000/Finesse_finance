@@ -2749,14 +2749,14 @@ let cachedPublicTokenExpiry = 0;
 let livePublicAccountId: string | null = process.env.PUBLIC_ACCOUNT_ID || null;
 let livePublicAccountType = 'BROKERAGE';
 let livePublicConnected = false;
-let livePublicEquity: number | null = 368.55;
-let livePublicBuyingPower: number | null = 128.13;
-let livePublicCashOnlyBuyingPower: number | null = 128.13;
-let livePublicOptionsBuyingPower: number | null = 128.13;
-let livePublicCashBalance: number | null = 128.13;
-let livePublicStockEquity: number | null = 240.35;
-let livePublicEventContractsEquity: number | null = 0.07;
-let livePublicDailyPnl: number | null = 4.18;
+let livePublicEquity: number | null = null;
+let livePublicBuyingPower: number | null = null;
+let livePublicCashOnlyBuyingPower: number | null = null;
+let livePublicOptionsBuyingPower: number | null = null;
+let livePublicCashBalance: number | null = null;
+let livePublicStockEquity: number | null = null;
+let livePublicEventContractsEquity: number | null = null;
+let livePublicDailyPnl: number | null = null;
 let livePublicPositions: PublicApiPosition[] = PLAYBOOK_PORTFOLIO_SNAPSHOT.map((pos) => ({
   symbol: pos.symbol,
   name:
@@ -2791,6 +2791,9 @@ let livePublicOrders: PublicApiOrder[] = [
   },
 ];
 let publicLastSyncStatus = 'Awaiting initial Public.com API gateway handshake';
+let publicCashLastSyncAtMs: number | null = null;
+let publicCashLastSyncOk = false;
+let publicCashLastSyncError: string | null = 'Initial Public.com balance sync has not succeeded yet';
 
 // ============================================================================
 // KALSHI OCTOBER 2026 PRODUCTION SPECIFICATION EXCHANGE CLIENT,
@@ -2817,41 +2820,130 @@ const KALSHI_WS_URL =
     : KALSHI_OCT2026_HOSTS.PRODUCTION_WS;
 const KALSHI_EXTERNAL_FEEDS_WS_URL = KALSHI_OCT2026_HOSTS.EXTERNAL_FEEDS_WS;
 
-// Kalshi API v2 Live Telemetry & Authenticated Portfolio State
+// Kalshi API v2 Live Telemetry & Authenticated Portfolio State (Fail-Closed: null until live sync succeeds)
 let kalshiApiConnected = false;
 let kalshiAuthMethod: 'Ed25519PrivateKey (ED25519_DIRECT_V2)' | 'RSAPrivateKey (RSA_PSS_SHA256_V2)' =
   'Ed25519PrivateKey (ED25519_DIRECT_V2)';
-let kalshiLastSyncStatus = 'Live Kalshi v2 Reset ($100.00 Cash · $80.00 Active 15m Bandit Sleeve + $20.00 Vault · Running)';
-let liveKalshiCashBalanceUsd: number | null = 100.00;
-let liveKalshiPortfolioValueUsd: number | null = 0.00;
-let liveKalshiTotalEquityUsd: number | null = 100.00;
-let liveKalshiBalanceBreakdown: KalshiBalanceBreakdown[] = [
-  { exchangeIndex: 0, balanceUsd: 99.80 },
-  { exchangeIndex: 2, balanceUsd: 0.20 },
-];
+let kalshiLastSyncStatus = 'Awaiting live Kalshi v2 portfolio balance sync';
+let liveKalshiCashBalanceUsd: number | null = null;
+let liveKalshiPortfolioValueUsd: number | null = null;
+let liveKalshiTotalEquityUsd: number | null = null;
+let kalshiCashLastSyncAtMs: number | null = null;
+let kalshiCashLastSyncOk = false;
+let kalshiCashLastSyncError: string | null = 'Initial Kalshi balance sync has not succeeded yet';
+let liveKalshiBalanceBreakdown: KalshiBalanceBreakdown[] = [];
 let liveKalshiPositions: KalshiPosition[] = [];
 let liveKalshiRecentFills: KalshiFill[] = [];
 const kalshiMarketTitleCache = new Map<string, { title: string; yesPrice: number; yesAskPrice?: number }>();
 let lastRealBarsSyncMs = 0;
 
-// Fix 3, 5, 6 & 7 State Stores & Telemetry Counters
+// Fix 3, 5, 6, 7 & Fixes A-F State Stores, Persistence & Telemetry Counters
 export let venueOrderSubmissionCount = 0;
 export function resetVenueOrderSubmissionCount(): void {
   venueOrderSubmissionCount = 0;
 }
+
+export interface TestVenueExitHooks {
+  cancelOpenOrders?: (venue: 'PREDICTION_MARKET' | 'PUBLIC_BROKERAGE', symbol: string) => Promise<number>;
+  getOpenOrdersCount?: (venue: 'PREDICTION_MARKET' | 'PUBLIC_BROKERAGE', symbol: string) => Promise<number>;
+  getSettledPositionQty?: (venue: 'PREDICTION_MARKET' | 'PUBLIC_BROKERAGE', symbol: string) => Promise<number>;
+  submitKalshiExit?: (params: {
+    ticker: string;
+    side: 'bid' | 'ask';
+    contracts: number;
+    desiredYesPrice: number;
+    reduceOnly: boolean;
+    timeInForce: 'good_till_canceled' | 'immediate_or_cancel';
+    postOnly: boolean;
+    idempotencySeed: string;
+  }) => Promise<{ ok: boolean; exchangeOrderId?: string; statusLabel: string; fillCount?: number; remainingCount?: number }>;
+  submitPublicExit?: (params: {
+    symbol: string;
+    orderSide: 'BUY' | 'SELL';
+    orderType: 'LIMIT' | 'MARKET';
+    quantity: string;
+    limitPrice?: string;
+    idempotencyKey?: string;
+  }) => Promise<{ ok: boolean; liveSubmitted: boolean; orderId: string; lastErrorMessage?: string }>;
+}
+
+let testVenueExitHooks: TestVenueExitHooks | null = null;
+export function setTestVenueExitHooks(hooks: TestVenueExitHooks | null): void {
+  testVenueExitHooks = process.env.QUANTPULSE_TEST_MODE === 'true' ? hooks : null;
+}
+
 export function setTestLiveCashBalances(params: {
-  kalshiCashUsd?: number;
-  publicCashUsd?: number;
-  publicBuyingPowerUsd?: number;
+  kalshiCashUsd?: number | null;
+  publicCashUsd?: number | null;
+  publicBuyingPowerUsd?: number | null;
+  publicCashOnlyBuyingPowerUsd?: number | null;
+  kalshiSyncedAtMs?: number | null;
+  publicSyncedAtMs?: number | null;
+  kalshiSyncOk?: boolean;
+  publicSyncOk?: boolean;
+  kalshiSyncError?: string | null;
+  publicSyncError?: string | null;
 }): void {
-  if (typeof params.kalshiCashUsd === 'number') {
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') return;
+  const nowMs = Date.now();
+  if (params.kalshiCashUsd !== undefined) {
     liveKalshiCashBalanceUsd = params.kalshiCashUsd;
+    kalshiCashLastSyncAtMs =
+      params.kalshiSyncedAtMs !== undefined
+        ? params.kalshiSyncedAtMs
+        : params.kalshiCashUsd !== null
+        ? nowMs
+        : null;
+    kalshiCashLastSyncOk =
+      params.kalshiSyncOk !== undefined ? params.kalshiSyncOk : params.kalshiCashUsd !== null;
+    kalshiCashLastSyncError =
+      params.kalshiSyncError !== undefined
+        ? params.kalshiSyncError
+        : kalshiCashLastSyncOk
+        ? null
+        : 'Test Kalshi balance sync unavailable';
   }
-  if (typeof params.publicCashUsd === 'number') {
+  if (params.publicCashUsd !== undefined) {
     livePublicCashBalance = params.publicCashUsd;
+    livePublicCashOnlyBuyingPower =
+      params.publicCashOnlyBuyingPowerUsd !== undefined
+        ? params.publicCashOnlyBuyingPowerUsd
+        : params.publicCashUsd;
+    publicCashLastSyncAtMs =
+      params.publicSyncedAtMs !== undefined
+        ? params.publicSyncedAtMs
+        : params.publicCashUsd !== null
+        ? nowMs
+        : null;
+    publicCashLastSyncOk =
+      params.publicSyncOk !== undefined ? params.publicSyncOk : params.publicCashUsd !== null;
+    publicCashLastSyncError =
+      params.publicSyncError !== undefined
+        ? params.publicSyncError
+        : publicCashLastSyncOk
+        ? null
+        : 'Test Public.com balance sync unavailable';
   }
-  if (typeof params.publicBuyingPowerUsd === 'number') {
+  if (params.publicBuyingPowerUsd !== undefined) {
     livePublicBuyingPower = params.publicBuyingPowerUsd;
+  }
+  if (params.kalshiSyncedAtMs !== undefined && params.kalshiCashUsd === undefined) {
+    kalshiCashLastSyncAtMs = params.kalshiSyncedAtMs;
+  }
+  if (params.publicSyncedAtMs !== undefined && params.publicCashUsd === undefined) {
+    publicCashLastSyncAtMs = params.publicSyncedAtMs;
+  }
+  if (params.kalshiSyncOk !== undefined && params.kalshiCashUsd === undefined) {
+    kalshiCashLastSyncOk = params.kalshiSyncOk;
+  }
+  if (params.publicSyncOk !== undefined && params.publicCashUsd === undefined) {
+    publicCashLastSyncOk = params.publicSyncOk;
+  }
+  if (params.kalshiSyncError !== undefined && params.kalshiCashUsd === undefined) {
+    kalshiCashLastSyncError = params.kalshiSyncError;
+  }
+  if (params.publicSyncError !== undefined && params.publicCashUsd === undefined) {
+    publicCashLastSyncError = params.publicSyncError;
   }
 }
 
@@ -2861,7 +2953,11 @@ export interface ExecuteTradeRejectionRecord {
   agentId: string;
   symbol: string;
   venue: string;
-  code: 'POSITION_CAP_EXCEEDED' | 'INSUFFICIENT_LIVE_CASH';
+  code:
+    | 'POSITION_CAP_EXCEEDED'
+    | 'INSUFFICIENT_LIVE_CASH'
+    | 'BALANCE_SYNC_UNAVAILABLE'
+    | 'SETTLED_CASH_CAP_EXCEEDED';
   reason: string;
   requestedNotionalUsd: number;
   maxPositionNotionalUsd: number;
@@ -2870,6 +2966,67 @@ export interface ExecuteTradeRejectionRecord {
 
 export const orderRejectionLog: ExecuteTradeRejectionRecord[] = [];
 export const executeTradeIdempotencyStore = new Map<string, Record<string, any>>();
+
+export function getExecuteTradeIdempotencyPersistencePath(): string {
+  return (
+    process.env.QUANTPULSE_EXEC_IDEMPOTENCY_PATH ||
+    path.resolve(process.cwd(), '.quantpulse_execute_trade_idempotency.json')
+  );
+}
+
+export function loadExecuteTradeIdempotencyStoreFromDisk(): void {
+  executeTradeIdempotencyStore.clear();
+  const filePath = getExecuteTradeIdempotencyPersistencePath();
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw.trim()) return;
+    const parsed = JSON.parse(raw) as { entries?: Array<[string, Record<string, any>]> };
+    for (const pair of parsed.entries || []) {
+      if (Array.isArray(pair) && typeof pair[0] === 'string' && pair[1] && typeof pair[1] === 'object') {
+        executeTradeIdempotencyStore.set(pair[0], pair[1]);
+      }
+    }
+  } catch {
+    // Fail safe if persistence file is corrupted or absent
+  }
+}
+
+function persistExecuteTradeIdempotencyStoreToDisk(): void {
+  const filePath = getExecuteTradeIdempotencyPersistencePath();
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const entries: Array<[string, Record<string, any>]> = [];
+    for (const [k, v] of executeTradeIdempotencyStore.entries()) {
+      entries.push([
+        k,
+        {
+          order: v.order,
+          idempotencyKey: v.idempotencyKey || k,
+          publicEventContractOrderId: v.publicEventContractOrderId ?? null,
+          kalshiExchangeStatus: v.kalshiExchangeStatus,
+          publicExchangeStatus: v.publicExchangeStatus,
+          predictionMarketDataSource: v.predictionMarketDataSource,
+          executionVenues: v.executionVenues,
+        },
+      ]);
+    }
+    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    fs.writeFileSync(
+      tmpPath,
+      JSON.stringify({ updatedAt: new Date().toISOString(), entries }, null, 2),
+      'utf8'
+    );
+    fs.renameSync(tmpPath, filePath);
+  } catch {
+    // Ignore write failures in read-only environments
+  }
+}
+
+loadExecuteTradeIdempotencyStoreFromDisk();
 
 export interface ExitMonitorEvaluationRecord {
   id: string;
@@ -2881,13 +3038,14 @@ export interface ExitMonitorEvaluationRecord {
   livePrice: number;
   stopLossPrice: number;
   takeProfitPrice: number;
-  status: 'EVALUATED' | 'TRIGGERED' | 'NOT_TRIGGERED';
+  status: 'EVALUATED' | 'TRIGGERED' | 'NOT_TRIGGERED' | 'REJECTED';
   result:
     | 'EVALUATED_NO_ACTION'
     | 'TRIGGERED_STOP_LOSS'
     | 'TRIGGERED_TAKE_PROFIT'
     | 'TRIGGERED_PROFIT_LOCK'
-    | 'TRIGGERED_EXPIRATION_CLIFF';
+    | 'TRIGGERED_EXPIRATION_CLIFF'
+    | 'EXIT_VENUE_REJECTED';
   actionSummary: string;
 }
 
@@ -3693,6 +3851,32 @@ async function submitKalshiV2EventsOrder(params: {
     };
   }
 
+  // Test-mode venue exit simulator hook (ONLY when QUANTPULSE_TEST_MODE === 'true')
+  if (process.env.QUANTPULSE_TEST_MODE === 'true' && testVenueExitHooks?.submitKalshiExit && reduceOnly) {
+    const simRes = await testVenueExitHooks.submitKalshiExit({
+      ticker: cleanTicker,
+      side: params.side,
+      contracts: Math.max(1, Math.round(params.contracts)),
+      desiredYesPrice: Number(priceDollars),
+      reduceOnly,
+      timeInForce,
+      postOnly,
+      idempotencySeed: params.idempotencySeed,
+    });
+    return {
+      ok: simRes.ok,
+      clientOrderId,
+      exchangeOrderId: simRes.exchangeOrderId,
+      statusLabel: simRes.statusLabel,
+      priceDollars,
+      postOnly,
+      timeInForce,
+      cancelOrderOnPause,
+      fillCount: simRes.fillCount,
+      remainingCount: simRes.remainingCount,
+    };
+  }
+
   // Phase 1 Default Paper Mode: Never submit live orders when in PAPER mode
   if (isPaperModeEnabled()) {
     const paperExchangeId = `paper-k-${clientOrderId.slice(0, 8)}`;
@@ -4068,8 +4252,8 @@ const kernelFirewallStats = {
 };
 
 function getCurrentKalshiTotalEquityUsd(): number {
-  const cash = liveKalshiCashBalanceUsd ?? 30.4;
-  const posVal = liveKalshiPortfolioValueUsd ?? 4.76;
+  const cash = liveKalshiCashBalanceUsd ?? 0;
+  const posVal = liveKalshiPortfolioValueUsd ?? 0;
   const reportedEq = liveKalshiTotalEquityUsd ?? cash + posVal;
   return Number(Math.max(cash, reportedEq).toFixed(2));
 }
@@ -5911,15 +6095,18 @@ async function syncRealMarketBarsAndKalshi(force = false): Promise<void> {
   await syncLiveKalshiPortfolio(kalshiSuccessCount);
 }
 
-async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
+export async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
   const kalshiCreds = resolveKalshiCredentials();
-  const keyPreview = kalshiCreds?.keyId ? `${kalshiCreds.keyId.slice(0, 8)}...` : 'PUBLIC-V2';
+  const keyPreview = kalshiCreds?.keyId ? `${kalshiCreds.keyId.slice(0, 8)}...` : 'UNCONFIGURED';
 
   if (!kalshiCreds) {
-    if (kalshiMarketCount > 0) {
-      kalshiApiConnected = true;
-      kalshiLastSyncStatus = `Live Kalshi CLOB v2 Connected · ${kalshiMarketCount} Contracts Synced`;
-    }
+    kalshiApiConnected = false;
+    kalshiCashLastSyncOk = false;
+    kalshiCashLastSyncError = 'Kalshi API credentials not configured';
+    kalshiLastSyncStatus =
+      kalshiMarketCount > 0
+        ? `Kalshi Public Market Feed (${kalshiMarketCount} Contracts) · Disconnected (No Credentials)`
+        : 'Kalshi API credentials not configured (Disconnected)';
     return;
   }
 
@@ -5954,6 +6141,12 @@ async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
 
       if (cashUsd !== null) {
         liveKalshiCashBalanceUsd = Number(cashUsd.toFixed(4));
+        kalshiCashLastSyncAtMs = Date.now();
+        kalshiCashLastSyncOk = true;
+        kalshiCashLastSyncError = null;
+      } else {
+        kalshiCashLastSyncOk = false;
+        kalshiCashLastSyncError = 'Kalshi portfolio/balance response missing balance field';
       }
       if (portValUsd !== null) {
         liveKalshiPortfolioValueUsd = Number(portValUsd.toFixed(2));
@@ -5975,6 +6168,9 @@ async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
           liveKalshiBalanceBreakdown = breakdown;
         }
       }
+    } else {
+      kalshiCashLastSyncOk = false;
+      kalshiCashLastSyncError = `Kalshi balance HTTP ${balRes.status}`;
     }
 
     // Root Cause #1 Fix: Merge positions from BOTH exchange_index=0 and exchange_index=2 (15m crypto series) with count_filter=position
@@ -6154,17 +6350,17 @@ async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
       }
     }
 
-    kalshiApiConnected = true;
+    kalshiApiConnected = kalshiCashLastSyncOk;
     kalshiLastSyncStatus = `Live Kalshi Portfolio v2 Authenticated (${kalshiAuthMethod} · Key ${keyPreview}) · Total $${(
       liveKalshiTotalEquityUsd ?? 0
     ).toFixed(2)} (Cash $${(liveKalshiCashBalanceUsd ?? 0).toFixed(2)} + Contracts $${(
       liveKalshiPortfolioValueUsd ?? 0
     ).toFixed(2)} · ${liveKalshiPositions.length} Open Positions)`;
-  } catch {
-    if (kalshiMarketCount > 0) {
-      kalshiApiConnected = true;
-      kalshiLastSyncStatus = `Live Kalshi API v2 Connected (Key ${keyPreview}) · ${kalshiMarketCount} CLOB Contracts Synced`;
-    }
+  } catch (err) {
+    kalshiApiConnected = false;
+    kalshiCashLastSyncOk = false;
+    kalshiCashLastSyncError = err instanceof Error ? err.message : 'Kalshi portfolio sync failed';
+    kalshiLastSyncStatus = `Kalshi Portfolio v2 Sync Failed (Key ${keyPreview}): ${kalshiCashLastSyncError}`;
   }
 }
 
@@ -6176,6 +6372,8 @@ async function syncWithPublicApiGateway(forceBars = false): Promise<void> {
   const resolved = resolvePublicSecretEnv();
   if (!resolved) {
     livePublicConnected = false;
+    publicCashLastSyncOk = false;
+    publicCashLastSyncError = 'Public.com secret not configured';
     publicLastSyncStatus = 'No Public.com secret detected in environment; running live exchange & Kalshi stream';
     return;
   }
@@ -6183,6 +6381,8 @@ async function syncWithPublicApiGateway(forceBars = false): Promise<void> {
   const bearer = await getPublicBearerToken();
   if (!bearer) {
     livePublicConnected = false;
+    publicCashLastSyncOk = false;
+    publicCashLastSyncError = 'Public.com token exchange returned empty token';
     publicLastSyncStatus = `Detected ${resolved.envName}, but token exchange returned empty token`;
     return;
   }
@@ -6287,7 +6487,15 @@ async function syncWithPublicApiGateway(forceBars = false): Promise<void> {
         if (bpTotal !== null) livePublicBuyingPower = bpTotal;
         if (bpCashOnly !== null) livePublicCashOnlyBuyingPower = bpCashOnly;
         if (bpOptions !== null) livePublicOptionsBuyingPower = bpOptions;
-        if (cashVal !== null) livePublicCashBalance = cashVal;
+        if (cashVal !== null) {
+          livePublicCashBalance = cashVal;
+          publicCashLastSyncAtMs = Date.now();
+          publicCashLastSyncOk = true;
+          publicCashLastSyncError = null;
+        } else {
+          publicCashLastSyncOk = false;
+          publicCashLastSyncError = 'Public.com portfolio/v2 response missing cash balance';
+        }
         if (stockEq !== null) livePublicStockEquity = stockEq;
 
         const rawPositions = Array.isArray(portData.positions) ? portData.positions : [];
@@ -6518,10 +6726,14 @@ async function syncWithPublicApiGateway(forceBars = false): Promise<void> {
         livePublicCashBalance ?? 0
       ).toFixed(2)}`;
     } else {
+      publicCashLastSyncOk = false;
+      publicCashLastSyncError = 'Public.com gateway did not return live portfolio data';
       publicLastSyncStatus = `Public.com credential (${resolved.envName}) loaded · Standing by for gateway response`;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Network error';
+    publicCashLastSyncOk = false;
+    publicCashLastSyncError = msg;
     publicLastSyncStatus = `Public.com API (${resolved.envName}) configured · Gateway fallback active (${msg})`;
   }
 }
@@ -6585,7 +6797,7 @@ function computePortfolioSummary(): PortfolioSummary {
     0
   );
 
-  const kalshiCashUsd = liveKalshiCashBalanceUsd ?? 100.00;
+  const kalshiCashUsd = liveKalshiCashBalanceUsd ?? 0.00;
   const kalshiPortValUsd = liveKalshiPortfolioValueUsd ?? 0.00;
   const kalshiTotalUsd = Number((kalshiCashUsd + kalshiPortValUsd).toFixed(2));
   const combinedMultiVenueEquityUsd = Number((totalEquityUsd + kalshiTotalUsd).toFixed(2));
@@ -6605,7 +6817,7 @@ function computePortfolioSummary(): PortfolioSummary {
     publicOrders: livePublicOrders,
     predictionApiConfigured,
     kalshiApiConfigured,
-    kalshiApiConnected: kalshiApiConnected || kalshiApiConfigured,
+    kalshiApiConnected: Boolean(kalshiApiConnected && kalshiApiConfigured),
     kalshiAuthMethod,
     kalshiKeyIdPreview: kalshiCreds?.keyId ? `${kalshiCreds.keyId.slice(0, 8)}...` : undefined,
     kalshiLastSyncStatus,
@@ -9065,6 +9277,316 @@ const globalProfitLockState: GlobalProfitLockState = {
   ],
 };
 
+async function cancelPublicOpenOrdersForSymbol(symbol: string): Promise<number> {
+  if (isPaperModeEnabled()) {
+    return 0;
+  }
+  const bearer = await getPublicBearerToken().catch(() => null);
+  if (!bearer || !livePublicAccountId) {
+    return 0;
+  }
+  const cleanSym = symbol.trim().toUpperCase();
+  const headers = {
+    Authorization: `Bearer ${bearer}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  let cancelled = 0;
+  try {
+    const pRes = await fetch(
+      `https://api.public.com/userapigateway/trading/${livePublicAccountId}/portfolio/v2`,
+      { method: 'GET', headers }
+    );
+    if (pRes.ok) {
+      const pJson = (await pRes.json()) as { orders?: Array<Record<string, any>> };
+      for (const o of pJson.orders || []) {
+        const orderSym = String(o.instrument?.symbol || o.symbol || '').trim().toUpperCase();
+        const statusUpper = String(o.status || '').toUpperCase();
+        const isOpen = ['NEW', 'OPEN', 'WORKING', 'PARTIALLY_FILLED', 'PENDING'].includes(statusUpper);
+        if (orderSym === cleanSym && isOpen && o.orderId) {
+          const delRes = await fetch(
+            `https://api.public.com/userapigateway/trading/${livePublicAccountId}/order/${o.orderId}`,
+            { method: 'DELETE', headers }
+          );
+          if (delRes.ok) cancelled += 1;
+        }
+      }
+    }
+  } catch {
+    // Transient Public.com open-order sweep failure handled by release confirmation
+  }
+  return cancelled;
+}
+
+async function getPublicOpenOrdersCountForSymbol(symbol: string): Promise<number> {
+  if (isPaperModeEnabled()) {
+    return 0;
+  }
+  const bearer = await getPublicBearerToken().catch(() => null);
+  if (!bearer || !livePublicAccountId) {
+    return 0;
+  }
+  const cleanSym = symbol.trim().toUpperCase();
+  const headers = {
+    Authorization: `Bearer ${bearer}`,
+    Accept: 'application/json',
+  };
+  try {
+    const pRes = await fetch(
+      `https://api.public.com/userapigateway/trading/${livePublicAccountId}/portfolio/v2`,
+      { method: 'GET', headers }
+    );
+    if (!pRes.ok) return 0;
+    const pJson = (await pRes.json()) as { orders?: Array<Record<string, any>> };
+    return (pJson.orders || []).filter((o) => {
+      const orderSym = String(o.instrument?.symbol || o.symbol || '').trim().toUpperCase();
+      const statusUpper = String(o.status || '').toUpperCase();
+      return (
+        orderSym === cleanSym &&
+        ['NEW', 'OPEN', 'WORKING', 'PARTIALLY_FILLED', 'PENDING'].includes(statusUpper)
+      );
+    }).length;
+  } catch {
+    return 0;
+  }
+}
+
+async function getPublicSettledPositionQtyForSymbol(
+  symbol: string,
+  fallbackQty: number
+): Promise<number> {
+  const cleanSym = symbol.trim().toUpperCase();
+  const bearer = await getPublicBearerToken().catch(() => null);
+  if (bearer && livePublicAccountId) {
+    try {
+      const pRes = await fetch(
+        `https://api.public.com/userapigateway/trading/${livePublicAccountId}/portfolio/v2`,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${bearer}`,
+            Accept: 'application/json',
+          },
+        }
+      );
+      if (pRes.ok) {
+        const pJson = (await pRes.json()) as { positions?: Array<Record<string, any>> };
+        const match = (pJson.positions || []).find(
+          (p) => String(p.instrument?.symbol || p.symbol || '').trim().toUpperCase() === cleanSym
+        );
+        if (match) {
+          const q = parseNumericField(match.quantity ?? match.shares) ?? 0;
+          return Math.max(0, q);
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+  }
+  if (publicCashLastSyncOk) {
+    const syncedPos = livePublicPositions.find(
+      (p) => p.symbol.trim().toUpperCase() === cleanSym
+    );
+    if (syncedPos && Number(syncedPos.quantity) > 0) {
+      return Number(syncedPos.quantity);
+    }
+  }
+  return Math.max(0, fallbackQty);
+}
+
+async function executeExitOrderWithPreSweepAndConfirmation(params: {
+  venue: 'PREDICTION_MARKET' | 'PUBLIC_BROKERAGE';
+  symbol: string;
+  entrySide: string;
+  requestedQty: number;
+  livePrice: number;
+  orderIdForSeed: string;
+  reasonLabel: string;
+}): Promise<{
+  confirmed: boolean;
+  venueOrderId: string | null;
+  detail: string;
+  cancelledOpenOrders: number;
+}> {
+  const isPredictionVenue = params.venue === 'PREDICTION_MARKET';
+  const cleanKalshiSym = params.symbol
+    .replace('KALSHI.', '')
+    .replace('.Y', '')
+    .replace('.N', '')
+    .trim()
+    .toUpperCase();
+  const sweepSym = isPredictionVenue ? cleanKalshiSym : params.symbol.trim().toUpperCase();
+  const exitBucket = Math.floor(Date.now() / 60000);
+  const exitSeed = crypto
+    .createHash('sha256')
+    .update(`exit:${params.orderIdForSeed}:${sweepSym}:${params.reasonLabel}:${exitBucket}`)
+    .digest('hex')
+    .slice(0, 12);
+
+  const wsBook = isPredictionVenue
+    ? kalshiWsState.books.get(cleanKalshiSym) || kalshiWsState.books.get(params.symbol)
+    : undefined;
+  const bestBidUsd = isPredictionVenue
+    ? Number(Math.max(0.01, wsBook?.yesBidDollars ?? params.livePrice - 0.01).toFixed(2))
+    : Number(Math.max(0.01, params.livePrice - 0.01).toFixed(2));
+  const bestAskUsd = isPredictionVenue
+    ? Number(Math.min(0.99, Math.max(bestBidUsd + 0.01, wsBook?.yesAskDollars ?? params.livePrice + 0.01)).toFixed(2))
+    : Number((params.livePrice + 0.01).toFixed(2));
+  const bboDepthUsd = isPredictionVenue
+    ? Math.max(
+        5000,
+        ((wsBook?.yesBidSizeFp ?? 100) * bestBidUsd + (wsBook?.yesAskSizeFp ?? 100) * bestAskUsd) * 50
+      )
+    : 50000;
+
+  let trancheCounter = 0;
+  let lastVenueError = '';
+  const venueOrderIds: string[] = [];
+
+  const unwindResult = await executionVault.unwindPositionSafely({
+    symbol: sweepSym,
+    exitSide: isPredictionVenue
+      ? params.entrySide.toUpperCase().includes('NO')
+        ? 'SELL_NO'
+        : 'SELL_YES'
+      : 'SELL',
+    requestedQty: params.requestedQty,
+    bestBidUsd,
+    bestAskUsd,
+    bboDepthUsd,
+    balanceConfirmDelayMs: process.env.QUANTPULSE_TEST_MODE === 'true' ? 0 : 250,
+    cancelAllOpenOrders: async (sym) => {
+      if (process.env.QUANTPULSE_TEST_MODE === 'true' && testVenueExitHooks?.cancelOpenOrders) {
+        return await testVenueExitHooks.cancelOpenOrders(params.venue, sym);
+      }
+      if (isPredictionVenue) {
+        return await cancelRestingKalshiOrdersForTicker(sym);
+      }
+      return await cancelPublicOpenOrdersForSymbol(sym);
+    },
+    fetchOpenOrdersCount: async (sym) => {
+      if (process.env.QUANTPULSE_TEST_MODE === 'true' && testVenueExitHooks?.getOpenOrdersCount) {
+        return await testVenueExitHooks.getOpenOrdersCount(params.venue, sym);
+      }
+      if (isPredictionVenue) {
+        const resting = await getRestingOrdersForTicker(sym);
+        return resting.length;
+      }
+      return await getPublicOpenOrdersCountForSymbol(sym);
+    },
+    fetchSettledPositionQty: async (sym) => {
+      if (process.env.QUANTPULSE_TEST_MODE === 'true' && testVenueExitHooks?.getSettledPositionQty) {
+        return await testVenueExitHooks.getSettledPositionQty(params.venue, sym);
+      }
+      if (isPredictionVenue) {
+        if (resolveKalshiCredentials()) {
+          await syncLiveKalshiPortfolio(0).catch(() => {});
+          if (kalshiCashLastSyncOk) {
+            const matched = liveKalshiPositions.find((p) => p.ticker.toUpperCase() === sym);
+            if (matched) return Math.max(0, matched.contracts);
+          }
+        }
+        return Math.max(0, params.requestedQty);
+      }
+      return await getPublicSettledPositionQtyForSymbol(sym, params.requestedQty);
+    },
+    executeLimitOrder: async ({ quantity, limitPriceUsd }) => {
+      trancheCounter += 1;
+      if (isPredictionVenue) {
+        const hasTestHook =
+          process.env.QUANTPULSE_TEST_MODE === 'true' && Boolean(testVenueExitHooks?.submitKalshiExit);
+        if (!isPaperModeEnabled() && !resolveKalshiCredentials() && !hasTestHook) {
+          lastVenueError = 'Kalshi API credentials missing for live reduce_only exit order';
+          return { ok: false, error: lastVenueError };
+        }
+        const isYesSide = !params.entrySide.toUpperCase().includes('NO');
+        const desiredYesPx = Number(
+          Math.max(0.01, Math.min(0.99, isYesSide ? limitPriceUsd : 1.0 - limitPriceUsd)).toFixed(2)
+        );
+        const kRes = await submitKalshiV2EventsOrder({
+          ticker: sweepSym,
+          idempotencySeed: `exit-${exitSeed}-${trancheCounter}`,
+          side: isYesSide ? 'bid' : 'ask',
+          contracts: Math.max(1, Math.round(quantity)),
+          desiredYesPrice: desiredYesPx,
+          yesBidDollars: bestBidUsd,
+          yesAskDollars: bestAskUsd,
+          postOnly: false,
+          reduceOnly: true,
+          timeInForce: 'immediate_or_cancel',
+          cancelOrderOnPause: true,
+        });
+        const isFilledOrConfirmed = Boolean(
+          kRes.ok &&
+            ((kRes.fillCount ?? 0) > 0 ||
+              kRes.statusLabel.includes('FILLED') ||
+              kRes.statusLabel.includes('CONFIRMED') ||
+              isPaperModeEnabled())
+        );
+        if (isFilledOrConfirmed) {
+          if (kRes.exchangeOrderId) venueOrderIds.push(kRes.exchangeOrderId);
+          return { ok: true, orderId: kRes.exchangeOrderId || `kalshi-exit-${exitSeed}` };
+        }
+        lastVenueError = `Kalshi reduce_only exit not confirmed (${kRes.statusLabel})`;
+        return { ok: false, orderId: kRes.exchangeOrderId, error: lastVenueError };
+      }
+
+      const isEvContract = params.symbol.toUpperCase().startsWith('KALSHI.');
+      const pubSymbol = isEvContract ? params.symbol : params.symbol.replace('-USD', '');
+      const instType: 'EQUITY' | 'EVENTCONTRACT' | 'CRYPTO' = isEvContract
+        ? 'EVENTCONTRACT'
+        : params.symbol.includes('-USD')
+        ? 'CRYPTO'
+        : 'EQUITY';
+      const pubQty =
+        instType === 'EVENTCONTRACT'
+          ? String(Math.max(1, Math.round(quantity)))
+          : String(Number(quantity.toFixed(4)));
+      const pRes = await submitPublicOrderWithExponentialRetry({
+        symbol: pubSymbol,
+        idempotencyKey: `exit-pub-${exitSeed}-${trancheCounter}`,
+        instrumentType: instType,
+        orderSide: 'SELL',
+        orderType: 'MARKET',
+        quantity: pubQty,
+        maxRetries: 2,
+      });
+      const isPubConfirmed = Boolean(
+        pRes.ok && (pRes.liveSubmitted === true || isPaperModeEnabled())
+      );
+      if (isPubConfirmed) {
+        venueOrderIds.push(pRes.orderId);
+        return { ok: true, orderId: pRes.orderId };
+      }
+      lastVenueError =
+        pRes.lastErrorMessage ||
+        `Public.com SELL exit rejected or not live-confirmed (${pRes.failureClassification || 'UNCONFIRMED'})`;
+      return { ok: false, orderId: pRes.orderId, error: lastVenueError };
+    },
+  });
+
+  const executedAllOk =
+    unwindResult.ok &&
+    unwindResult.tranchesExecuted.length > 0 &&
+    unwindResult.tranchesExecuted.every((t) => t.ok);
+
+  if (!executedAllOk) {
+    return {
+      confirmed: false,
+      venueOrderId: venueOrderIds[0] || null,
+      detail: lastVenueError || unwindResult.reason || 'Venue exit failed or did not confirm fill',
+      cancelledOpenOrders: unwindResult.cancelledOpenOrders,
+    };
+  }
+
+  return {
+    confirmed: true,
+    venueOrderId: venueOrderIds.join(',') || unwindResult.tranchesExecuted[0]?.orderId || null,
+    detail: `${unwindResult.reason} (venueOrderId=${venueOrderIds.join(',') || 'confirmed'})`,
+    cancelledOpenOrders: unwindResult.cancelledOpenOrders,
+  };
+}
+
 async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
   forceStepDownNow?: boolean;
   applyYesterdayProfitableSetup?: boolean;
@@ -9207,16 +9729,66 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       highWaterMarkPriceMap.set(hwmKey, peakPx);
       const pullbackFromPeakPct = peakPx > 0 ? ((peakPx - livePx) / peakPx) * 100 : 0;
 
-      // TRIGGER 0: STOP-LOSS EVALUATION & EXIT ACTION
+      // TRIGGER 0: STOP-LOSS EVALUATION & VENUE-CONFIRMED EXIT ACTION (Fix E)
       const stopLossHit = ord.stopLossPrice > 0 && livePx <= ord.stopLossPrice;
       if (stopLossHit) {
+        const exitRes = await executeExitOrderWithPreSweepAndConfirmation({
+          venue: ord.venue === 'PREDICTION_MARKET' ? 'PREDICTION_MARKET' : 'PUBLIC_BROKERAGE',
+          symbol: ord.symbol,
+          entrySide: ord.side,
+          requestedQty: ord.quantity,
+          livePrice: livePx,
+          orderIdForSeed: ord.id,
+          reasonLabel: 'STOP_LOSS',
+        });
+
+        ord.lastExitEvaluatedAt = evalTimestamp;
+        ord.lastEvaluatedPrice = livePx;
+
+        if (!exitRes.confirmed) {
+          ord.lastExitEvaluationResult = 'EXIT_VENUE_REJECTED';
+          const failMsg = `Stop-loss exit rejected/unconfirmed by venue on ${ord.symbol} at $${livePx.toFixed(2)}: ${exitRes.detail}`;
+          exitMonitorEvaluationLog.unshift({
+            id: `exit-eval-${Date.now()}-${ord.id}`,
+            timestamp: evalTimestamp,
+            targetType: 'OCO_ORDER',
+            targetId: ord.id,
+            symbol: ord.symbol,
+            venue: ord.venue,
+            livePrice: livePx,
+            stopLossPrice: ord.stopLossPrice,
+            takeProfitPrice: ord.takeProfitPrice,
+            status: 'REJECTED',
+            result: 'EXIT_VENUE_REJECTED',
+            actionSummary: failMsg,
+          });
+          if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+          riskEvents.unshift({
+            id: `risk-exit-rej-${Date.now()}-${ord.id}`,
+            timestamp: evalTimestamp,
+            eventType: 'SPREAD_LIQUIDITY_GUARD',
+            severity: 'CRITICAL',
+            agentId: ord.agentId,
+            agentName: ord.agentName,
+            archetype: 'SHORT_AND_FAST',
+            symbol: ord.symbol,
+            venue: ord.venue,
+            triggerMetric: 'exitVenueConfirmation',
+            thresholdValue: 'VENUE_CONFIRMED_FILL',
+            observedValue: 'EXIT_VENUE_REJECTED',
+            actionTaken: failMsg,
+            cancelledOrderIds: [],
+            acknowledged: false,
+          });
+          console.warn(`[EXIT MONITOR · EXIT_VENUE_REJECTED] ${failMsg}`);
+          continue;
+        }
+
         ord.status = 'FILLED';
         ord.orderType = 'STOP_LOSS_EXIT';
-        ord.lastExitEvaluatedAt = evalTimestamp;
         ord.lastExitEvaluationResult = 'TRIGGERED_STOP_LOSS';
-        ord.lastEvaluatedPrice = livePx;
         const realizedLossUsd = Number(((livePx - ord.fillPrice) * ord.quantity).toFixed(2));
-        ord.rationale = `[STOP_LOSS_EXIT @ $${livePx.toFixed(2)} <= SL $${ord.stopLossPrice.toFixed(2)} · Realized ${realizedLossUsd >= 0 ? '+' : ''}$${realizedLossUsd.toFixed(2)}] ${ord.rationale}`;
+        ord.rationale = `[STOP_LOSS_EXIT @ $${livePx.toFixed(2)} <= SL $${ord.stopLossPrice.toFixed(2)} · Realized ${realizedLossUsd >= 0 ? '+' : ''}$${realizedLossUsd.toFixed(2)} · VenueOrder=${exitRes.venueOrderId || 'confirmed'}] ${ord.rationale}`;
         roiSellsTriggered += 1;
 
         exitMonitorEvaluationLog.unshift({
@@ -9231,7 +9803,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
           takeProfitPrice: ord.takeProfitPrice,
           status: 'TRIGGERED',
           result: 'TRIGGERED_STOP_LOSS',
-          actionSummary: `Stop-loss triggered on ${ord.symbol} at $${livePx.toFixed(2)} (SL $${ord.stopLossPrice.toFixed(2)}); position exited.`,
+          actionSummary: `Stop-loss confirmed at venue (${exitRes.venueOrderId || 'confirmed'}) on ${ord.symbol} at $${livePx.toFixed(2)} (SL $${ord.stopLossPrice.toFixed(2)}). ${exitRes.detail}`,
         });
         if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
         continue;
@@ -9247,14 +9819,65 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       const isExpirationCliff = is15m && minsRemaining <= 2.5;
 
       if (shouldHarvestQuickGain || isExpirationCliff) {
-        ord.status = 'FILLED';
         const exitPx = livePx;
-        const realizedGainUsd = Number(((exitPx - ord.fillPrice) * ord.quantity).toFixed(2));
+        const exitReasonLabel = isExpirationCliff ? 'EXPIRATION_CLIFF' : 'TAKE_PROFIT';
+        const exitRes = await executeExitOrderWithPreSweepAndConfirmation({
+          venue: ord.venue === 'PREDICTION_MARKET' ? 'PREDICTION_MARKET' : 'PUBLIC_BROKERAGE',
+          symbol: ord.symbol,
+          entrySide: ord.side,
+          requestedQty: ord.quantity,
+          livePrice: exitPx,
+          orderIdForSeed: ord.id,
+          reasonLabel: exitReasonLabel,
+        });
+
         ord.lastExitEvaluatedAt = evalTimestamp;
+        ord.lastEvaluatedPrice = exitPx;
+
+        if (!exitRes.confirmed) {
+          ord.lastExitEvaluationResult = 'EXIT_VENUE_REJECTED';
+          const failMsg = `${exitReasonLabel} exit rejected/unconfirmed by venue on ${ord.symbol} at $${exitPx.toFixed(2)}: ${exitRes.detail}`;
+          exitMonitorEvaluationLog.unshift({
+            id: `exit-eval-${Date.now()}-${ord.id}`,
+            timestamp: evalTimestamp,
+            targetType: 'OCO_ORDER',
+            targetId: ord.id,
+            symbol: ord.symbol,
+            venue: ord.venue,
+            livePrice: exitPx,
+            stopLossPrice: ord.stopLossPrice,
+            takeProfitPrice: ord.takeProfitPrice,
+            status: 'REJECTED',
+            result: 'EXIT_VENUE_REJECTED',
+            actionSummary: failMsg,
+          });
+          if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+          riskEvents.unshift({
+            id: `risk-exit-rej-${Date.now()}-${ord.id}`,
+            timestamp: evalTimestamp,
+            eventType: 'SPREAD_LIQUIDITY_GUARD',
+            severity: 'CRITICAL',
+            agentId: ord.agentId,
+            agentName: ord.agentName,
+            archetype: 'SHORT_AND_FAST',
+            symbol: ord.symbol,
+            venue: ord.venue,
+            triggerMetric: 'exitVenueConfirmation',
+            thresholdValue: 'VENUE_CONFIRMED_FILL',
+            observedValue: 'EXIT_VENUE_REJECTED',
+            actionTaken: failMsg,
+            cancelledOrderIds: [],
+            acknowledged: false,
+          });
+          console.warn(`[EXIT MONITOR · EXIT_VENUE_REJECTED] ${failMsg}`);
+          continue;
+        }
+
+        ord.status = 'FILLED';
+        const realizedGainUsd = Number(((exitPx - ord.fillPrice) * ord.quantity).toFixed(2));
         ord.lastExitEvaluationResult = isExpirationCliff
           ? 'TRIGGERED_EXPIRATION_CLIFF'
           : 'TRIGGERED_TAKE_PROFIT';
-        ord.lastEvaluatedPrice = exitPx;
 
         if (realizedGainUsd > 0) {
           const vaultedShareUsd = Number(
@@ -9275,7 +9898,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
           ? `EXPIRATION_CLIFF_FLATTEN (T-${minsRemaining.toFixed(1)}m remaining)`
           : `QUICK_GAIN_MARKET_HARVEST (+${roiPct.toFixed(1)}% ROI / +${profitCents}¢ @ $${exitPx.toFixed(2)})`;
 
-        ord.rationale = `[${triggerLabel} · Realized ${realizedGainUsd >= 0 ? '+' : ''}$${realizedGainUsd.toFixed(2)} · 75% VAULTED (+$${Math.max(0, realizedGainUsd * 0.75).toFixed(2)})] ${ord.rationale}`;
+        ord.rationale = `[${triggerLabel} · Realized ${realizedGainUsd >= 0 ? '+' : ''}$${realizedGainUsd.toFixed(2)} · 75% VAULTED (+$${Math.max(0, realizedGainUsd * 0.75).toFixed(2)}) · VenueOrder=${exitRes.venueOrderId || 'confirmed'}] ${ord.rationale}`;
         roiSellsTriggered += 1;
 
         exitMonitorEvaluationLog.unshift({
@@ -9290,7 +9913,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
           takeProfitPrice: ord.takeProfitPrice,
           status: 'TRIGGERED',
           result: ord.lastExitEvaluationResult,
-          actionSummary: `${triggerLabel} executed on ${ord.symbol} at $${exitPx.toFixed(2)} (TP $${ord.takeProfitPrice.toFixed(2)}).`,
+          actionSummary: `${triggerLabel} venue-confirmed (${exitRes.venueOrderId || 'confirmed'}) on ${ord.symbol} at $${exitPx.toFixed(2)} (TP $${ord.takeProfitPrice.toFixed(2)}). ${exitRes.detail}`,
         });
         if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
 
@@ -9309,7 +9932,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
           adjustedTakeProfitPrice: exitPx,
           stepDownPctApplied: 0,
           lockedProfitVaultDeltaUsd: Math.max(0, Number((realizedGainUsd * 0.75).toFixed(2))),
-          rationale: `${triggerLabel} executed on ${ord.symbol}; locked 75% profit into Vault ($${globalProfitLockState.lockedProfitVaultUsd.toFixed(2)} total vaulted) and recycled 25% float.`,
+          rationale: `${triggerLabel} executed on ${ord.symbol} (venueOrderId=${exitRes.venueOrderId || 'confirmed'}); locked 75% profit into Vault ($${globalProfitLockState.lockedProfitVaultUsd.toFixed(2)} total vaulted) and recycled 25% float.`,
         };
         triggeredEvents.push(evt);
         globalProfitLockState.recentEvents.unshift(evt);
@@ -9417,7 +10040,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       }
     }
 
-    // 3. Evaluate Open Positions in liveKalshiPositions and livePublicPositions on every pass
+    // 3. Evaluate Open Positions in liveKalshiPositions and livePublicPositions on every pass (with real venue exit execution)
     for (const kPos of liveKalshiPositions) {
       if (kPos.contracts <= 0) continue;
       const baseEntryPx = kPos.yesPrice > 0 ? kPos.yesPrice : kPos.currentPrice;
@@ -9429,40 +10052,70 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       kPos.lastExitEvaluatedAt = evalTimestamp;
       kPos.lastEvaluatedPrice = livePx;
 
-      if (livePx <= slPx) {
-        kPos.lastExitEvaluationResult = 'TRIGGERED_STOP_LOSS';
-        roiSellsTriggered += 1;
-        exitMonitorEvaluationLog.unshift({
-          id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
-          timestamp: evalTimestamp,
-          targetType: 'KALSHI_POSITION',
-          targetId: kPos.ticker,
-          symbol: kPos.ticker,
+      if (livePx <= slPx || livePx >= tpPx) {
+        const triggeredResult = livePx <= slPx ? 'TRIGGERED_STOP_LOSS' : 'TRIGGERED_TAKE_PROFIT';
+        const exitRes = await executeExitOrderWithPreSweepAndConfirmation({
           venue: 'PREDICTION_MARKET',
-          livePrice: livePx,
-          stopLossPrice: slPx,
-          takeProfitPrice: tpPx,
-          status: 'TRIGGERED',
-          result: 'TRIGGERED_STOP_LOSS',
-          actionSummary: `Kalshi position ${kPos.ticker} crossed stop-loss ($${livePx.toFixed(2)} <= $${slPx.toFixed(2)}); exit action triggered.`,
-        });
-      } else if (livePx >= tpPx) {
-        kPos.lastExitEvaluationResult = 'TRIGGERED_TAKE_PROFIT';
-        roiSellsTriggered += 1;
-        exitMonitorEvaluationLog.unshift({
-          id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
-          timestamp: evalTimestamp,
-          targetType: 'KALSHI_POSITION',
-          targetId: kPos.ticker,
           symbol: kPos.ticker,
-          venue: 'PREDICTION_MARKET',
+          entrySide: kPos.side === 'NO' ? 'BUY_NO' : 'BUY_YES',
+          requestedQty: kPos.contracts,
           livePrice: livePx,
-          stopLossPrice: slPx,
-          takeProfitPrice: tpPx,
-          status: 'TRIGGERED',
-          result: 'TRIGGERED_TAKE_PROFIT',
-          actionSummary: `Kalshi position ${kPos.ticker} crossed take-profit ($${livePx.toFixed(2)} >= $${tpPx.toFixed(2)}); exit action triggered.`,
+          orderIdForSeed: `kpos-${kPos.ticker}`,
+          reasonLabel: livePx <= slPx ? 'POS_STOP_LOSS' : 'POS_TAKE_PROFIT',
         });
+
+        if (exitRes.confirmed) {
+          kPos.lastExitEvaluationResult = triggeredResult;
+          roiSellsTriggered += 1;
+          exitMonitorEvaluationLog.unshift({
+            id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
+            timestamp: evalTimestamp,
+            targetType: 'KALSHI_POSITION',
+            targetId: kPos.ticker,
+            symbol: kPos.ticker,
+            venue: 'PREDICTION_MARKET',
+            livePrice: livePx,
+            stopLossPrice: slPx,
+            takeProfitPrice: tpPx,
+            status: 'TRIGGERED',
+            result: triggeredResult,
+            actionSummary: `Kalshi position ${kPos.ticker} exited at venue (${exitRes.venueOrderId || 'confirmed'}) at $${livePx.toFixed(2)} (SL $${slPx.toFixed(2)} / TP $${tpPx.toFixed(2)}). ${exitRes.detail}`,
+          });
+        } else {
+          kPos.lastExitEvaluationResult = 'EXIT_VENUE_REJECTED';
+          const failMsg = `Kalshi position ${kPos.ticker} exit rejected/unconfirmed by venue: ${exitRes.detail}`;
+          exitMonitorEvaluationLog.unshift({
+            id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
+            timestamp: evalTimestamp,
+            targetType: 'KALSHI_POSITION',
+            targetId: kPos.ticker,
+            symbol: kPos.ticker,
+            venue: 'PREDICTION_MARKET',
+            livePrice: livePx,
+            stopLossPrice: slPx,
+            takeProfitPrice: tpPx,
+            status: 'REJECTED',
+            result: 'EXIT_VENUE_REJECTED',
+            actionSummary: failMsg,
+          });
+          riskEvents.unshift({
+            id: `risk-kexit-rej-${Date.now()}-${kPos.ticker}`,
+            timestamp: evalTimestamp,
+            eventType: 'SPREAD_LIQUIDITY_GUARD',
+            severity: 'CRITICAL',
+            agentId: 'kalshi-exit-monitor',
+            agentName: 'Kalshi Position Exit Monitor',
+            archetype: 'SHORT_AND_FAST',
+            symbol: kPos.ticker,
+            venue: 'PREDICTION_MARKET',
+            triggerMetric: 'exitVenueConfirmation',
+            thresholdValue: 'VENUE_CONFIRMED_FILL',
+            observedValue: 'EXIT_VENUE_REJECTED',
+            actionTaken: failMsg,
+            cancelledOrderIds: [],
+            acknowledged: false,
+          });
+        }
       } else {
         kPos.lastExitEvaluationResult = 'EVALUATED_NO_ACTION';
         exitMonitorEvaluationLog.unshift({
@@ -9484,7 +10137,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
     }
 
     for (const pPos of livePublicPositions) {
-      if (Number(pPos.quantity) <= 0) continue;
+      if (Number(pPos.quantity) <= 0 || pPos.marketValue < 0.25 || pPos.currentPrice <= 0) continue;
       const baseCost = pPos.averagePrice > 0 ? pPos.averagePrice : pPos.currentPrice;
       const slPx = pPos.stopLossPrice ?? Number((baseCost * 0.96).toFixed(2));
       const tpPx = pPos.takeProfitPrice ?? Number((baseCost * 1.05).toFixed(2));
@@ -9494,40 +10147,70 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       pPos.lastExitEvaluatedAt = evalTimestamp;
       pPos.lastEvaluatedPrice = livePx;
 
-      if (livePx <= slPx) {
-        pPos.lastExitEvaluationResult = 'TRIGGERED_STOP_LOSS';
-        roiSellsTriggered += 1;
-        exitMonitorEvaluationLog.unshift({
-          id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
-          timestamp: evalTimestamp,
-          targetType: 'PUBLIC_POSITION',
-          targetId: pPos.symbol,
-          symbol: pPos.symbol,
+      if (livePx <= slPx || livePx >= tpPx) {
+        const triggeredResult = livePx <= slPx ? 'TRIGGERED_STOP_LOSS' : 'TRIGGERED_TAKE_PROFIT';
+        const exitRes = await executeExitOrderWithPreSweepAndConfirmation({
           venue: 'PUBLIC_BROKERAGE',
-          livePrice: livePx,
-          stopLossPrice: slPx,
-          takeProfitPrice: tpPx,
-          status: 'TRIGGERED',
-          result: 'TRIGGERED_STOP_LOSS',
-          actionSummary: `Public.com position ${pPos.symbol} crossed stop-loss ($${livePx.toFixed(2)} <= $${slPx.toFixed(2)}); exit action triggered.`,
-        });
-      } else if (livePx >= tpPx) {
-        pPos.lastExitEvaluationResult = 'TRIGGERED_TAKE_PROFIT';
-        roiSellsTriggered += 1;
-        exitMonitorEvaluationLog.unshift({
-          id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
-          timestamp: evalTimestamp,
-          targetType: 'PUBLIC_POSITION',
-          targetId: pPos.symbol,
           symbol: pPos.symbol,
-          venue: 'PUBLIC_BROKERAGE',
+          entrySide: 'BUY',
+          requestedQty: Number(pPos.quantity),
           livePrice: livePx,
-          stopLossPrice: slPx,
-          takeProfitPrice: tpPx,
-          status: 'TRIGGERED',
-          result: 'TRIGGERED_TAKE_PROFIT',
-          actionSummary: `Public.com position ${pPos.symbol} crossed take-profit ($${livePx.toFixed(2)} >= $${tpPx.toFixed(2)}); exit action triggered.`,
+          orderIdForSeed: `ppos-${pPos.symbol}`,
+          reasonLabel: livePx <= slPx ? 'POS_STOP_LOSS' : 'POS_TAKE_PROFIT',
         });
+
+        if (exitRes.confirmed) {
+          pPos.lastExitEvaluationResult = triggeredResult;
+          roiSellsTriggered += 1;
+          exitMonitorEvaluationLog.unshift({
+            id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
+            timestamp: evalTimestamp,
+            targetType: 'PUBLIC_POSITION',
+            targetId: pPos.symbol,
+            symbol: pPos.symbol,
+            venue: 'PUBLIC_BROKERAGE',
+            livePrice: livePx,
+            stopLossPrice: slPx,
+            takeProfitPrice: tpPx,
+            status: 'TRIGGERED',
+            result: triggeredResult,
+            actionSummary: `Public.com position ${pPos.symbol} exited at venue (${exitRes.venueOrderId || 'confirmed'}) at $${livePx.toFixed(2)} (SL $${slPx.toFixed(2)} / TP $${tpPx.toFixed(2)}). ${exitRes.detail}`,
+          });
+        } else {
+          pPos.lastExitEvaluationResult = 'EXIT_VENUE_REJECTED';
+          const failMsg = `Public.com position ${pPos.symbol} exit rejected/unconfirmed by venue: ${exitRes.detail}`;
+          exitMonitorEvaluationLog.unshift({
+            id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
+            timestamp: evalTimestamp,
+            targetType: 'PUBLIC_POSITION',
+            targetId: pPos.symbol,
+            symbol: pPos.symbol,
+            venue: 'PUBLIC_BROKERAGE',
+            livePrice: livePx,
+            stopLossPrice: slPx,
+            takeProfitPrice: tpPx,
+            status: 'REJECTED',
+            result: 'EXIT_VENUE_REJECTED',
+            actionSummary: failMsg,
+          });
+          riskEvents.unshift({
+            id: `risk-pexit-rej-${Date.now()}-${pPos.symbol}`,
+            timestamp: evalTimestamp,
+            eventType: 'SPREAD_LIQUIDITY_GUARD',
+            severity: 'CRITICAL',
+            agentId: 'public-exit-monitor',
+            agentName: 'Public.com Position Exit Monitor',
+            archetype: 'SHORT_AND_FAST',
+            symbol: pPos.symbol,
+            venue: 'PUBLIC_BROKERAGE',
+            triggerMetric: 'exitVenueConfirmation',
+            thresholdValue: 'VENUE_CONFIRMED_FILL',
+            observedValue: 'EXIT_VENUE_REJECTED',
+            actionTaken: failMsg,
+            cancelledOrderIds: [],
+            acknowledged: false,
+          });
+        }
       } else {
         pPos.lastExitEvaluationResult = 'EVALUATED_NO_ACTION';
         exitMonitorEvaluationLog.unshift({
@@ -10344,6 +11027,45 @@ async function submitPublicOrderWithExponentialRetry(params: {
       lastErrorMessage: `Blocked by Global Kill Switch: ${killState.reason}`,
       failureClassification: 'BLOCKED_BY_GLOBAL_KILL_SWITCH',
       attemptHistory: [],
+    };
+  }
+
+  // Test-mode venue exit simulator hook (ONLY when QUANTPULSE_TEST_MODE === 'true')
+  if (
+    process.env.QUANTPULSE_TEST_MODE === 'true' &&
+    testVenueExitHooks?.submitPublicExit &&
+    params.orderSide === 'SELL'
+  ) {
+    const simPub = await testVenueExitHooks.submitPublicExit({
+      symbol: cleanSymbol,
+      orderSide: params.orderSide,
+      orderType: params.orderType,
+      quantity: params.quantity,
+      limitPrice: params.limitPrice,
+      idempotencyKey: params.idempotencyKey,
+    });
+    return {
+      ok: simPub.ok,
+      liveSubmitted: simPub.liveSubmitted,
+      orderId: simPub.orderId,
+      attemptsUsed: 1,
+      maxRetries,
+      totalBackoffMs: 0,
+      recoveredAfterRetry: false,
+      preflightHydrated: simPub.ok,
+      lastErrorMessage: simPub.lastErrorMessage,
+      failureClassification: simPub.ok ? 'TEST_VENUE_CONFIRMED' : 'TEST_VENUE_REJECTED',
+      attemptHistory: [
+        {
+          attempt: 1,
+          httpStatus: simPub.ok ? 200 : 400,
+          errorCode: null,
+          classification: simPub.ok ? 'TEST_VENUE_CONFIRMED' : 'TEST_VENUE_REJECTED',
+          errorMessage: simPub.lastErrorMessage || '',
+          backoffDelayMs: 0,
+          retrying: false,
+        },
+      ],
     };
   }
 
@@ -13020,14 +13742,12 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     idempotency_key: snakeIdempotencyKey,
     notionalUsd: explicitNotionalUsd,
     quantity: explicitQuantity,
-    skipLiveCashSync,
   } = (req.body || {}) as {
     agentId?: string;
     idempotencyKey?: string;
     idempotency_key?: string;
     notionalUsd?: number;
     quantity?: number;
-    skipLiveCashSync?: boolean;
   };
 
   const headerIdempotencyKey =
@@ -13038,8 +13758,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     bodyIdempotencyKey || snakeIdempotencyKey || headerIdempotencyKey || ''
   ).trim();
 
-  // Fix 5 — Order idempotency check BEFORE any sizing or venue call:
-  // If this idempotencyKey has already produced an order, return the existing order without placing a new one.
+  // Fix D — Fast-path client-supplied idempotency check BEFORE any sizing or venue call
   if (clientSuppliedIdempotencyKey.length > 0) {
     const cachedExecution = executeTradeIdempotencyStore.get(clientSuppliedIdempotencyKey);
     const existingOrder = executedOrders.find(
@@ -13159,30 +13878,143 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     });
   }
 
-  // Fix 3(b) — Fetch live cash/buying power and reject the order if it exceeds available cash OR 3% settled-cash cap BEFORE any venue call
-  if (!skipLiveCashSync && process.env.QUANTPULSE_TEST_MODE !== 'true') {
+  const resolvedSide =
+    feature.venue === 'PREDICTION_MARKET'
+      ? assessment.bias_probability_distribution.bullish >=
+        assessment.bias_probability_distribution.bearish
+        ? 'BUY_YES'
+        : 'BUY_NO'
+      : assessment.bias_probability_distribution.bullish >=
+        assessment.bias_probability_distribution.bearish
+      ? 'BUY'
+      : 'SELL';
+
+  const resolvedOrderSymbol =
+    feature.is15MinPrediction && feature.activeContractTicker
+      ? feature.activeContractTicker
+      : feature.symbol;
+  const rawTf = String(agent.timeframe || '15m').toLowerCase();
+  const tf: '5m' | '15m' | '1h' =
+    rawTf === '5m' ? '5m' : rawTf === '1h' ? '1h' : '15m';
+  const strategyIdForBucket =
+    agent.indicatorStrategyId || CHAMPION_CONFIG.active_strategy.id;
+
+  // Fix D — Deterministic SHA-256 fallback key over symbol:side:strategy_id:time_bucket
+  // Checked BEFORE live balance sync or any venue call so duplicates deduplicate even with no client key
+  const deterministicFallback = executionVault.deriveDeterministicIdempotencyKey({
+    symbol: resolvedOrderSymbol,
+    side: resolvedSide,
+    strategyId: strategyIdForBucket,
+    timeframe: tf,
+  });
+  const effectiveIdempotencyKey =
+    clientSuppliedIdempotencyKey || deterministicFallback.idempotencyHash;
+
+  const cachedDeterministicExecution = executeTradeIdempotencyStore.get(effectiveIdempotencyKey);
+  const existingDeterministicOrder = executedOrders.find(
+    (o) =>
+      o.idempotencyKey === effectiveIdempotencyKey &&
+      !o.agentName.includes('Public.com Event Contract Leg')
+  );
+  if (cachedDeterministicExecution || existingDeterministicOrder) {
+    return res.status(200).json({
+      ...(cachedDeterministicExecution || {}),
+      order: existingDeterministicOrder || cachedDeterministicExecution?.order,
+      idempotencyKey: effectiveIdempotencyKey,
+      idempotentReplay: true,
+      agents: autonomousAgents,
+      orders: executedOrders,
+      portfolio: computePortfolioSummary(),
+    });
+  }
+
+  // Fix A — Fail-closed live cash check: never bypass live sync, never fall back to seeded constants
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
     if (feature.venue === 'PREDICTION_MARKET') {
-      await syncLiveKalshiPortfolio(0).catch(() => {});
+      await syncLiveKalshiPortfolio(0);
     } else {
-      await syncWithPublicApiGateway(false).catch(() => {});
+      await syncWithPublicApiGateway(false);
     }
   }
 
-  const availableLiveCashUsd =
-    feature.venue === 'PREDICTION_MARKET'
-      ? Number(liveKalshiCashBalanceUsd ?? 0)
-      : Math.min(
-          Number(livePublicCashBalance ?? 0),
-          Number(livePublicBuyingPower ?? livePublicCashBalance ?? 0)
-        );
+  const isPredictionVenue = feature.venue === 'PREDICTION_MARKET';
+  const rawSettledCash = isPredictionVenue
+    ? liveKalshiCashBalanceUsd
+    : livePublicCashOnlyBuyingPower ?? livePublicCashBalance;
+  const venueSyncOk = isPredictionVenue ? kalshiCashLastSyncOk : publicCashLastSyncOk;
+  const venueSyncAtMs = isPredictionVenue ? kalshiCashLastSyncAtMs : publicCashLastSyncAtMs;
+  const syncAgeMs = venueSyncAtMs !== null ? Date.now() - venueSyncAtMs : Infinity;
+  const isSyncUnavailableOrStale =
+    rawSettledCash === null || !venueSyncOk || venueSyncAtMs === null || syncAgeMs > 60_000;
 
-  // Post-Mortem Rule 1: Enforce settled-cash 3% cap (settledCash * 0.03) when cash is positive
-  const settledCash3PctCapUsd = Number((availableLiveCashUsd * 0.03).toFixed(2));
+  if (isSyncUnavailableOrStale) {
+    const syncDetail = isPredictionVenue
+      ? kalshiCashLastSyncError || 'Kalshi live balance missing or stale (>60s)'
+      : publicCashLastSyncError || 'Public.com live balance missing or stale (>60s)';
+    const reason = `Order rejected: live balance sync unavailable for ${feature.venue} (${syncDetail}; ageMs=${Number.isFinite(syncAgeMs) ? syncAgeMs : 'UNSYNCED'}).`;
+    const rejection: ExecuteTradeRejectionRecord = {
+      id: `rej-sync-${orderRejectionLog.length + 1}`,
+      timestamp: new Date().toISOString(),
+      agentId: agent.id,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      code: 'BALANCE_SYNC_UNAVAILABLE',
+      reason,
+      requestedNotionalUsd: orderNotionalUsd,
+      maxPositionNotionalUsd,
+      availableCashUsd: rawSettledCash,
+    };
+    orderRejectionLog.unshift(rejection);
+    riskEvents.unshift({
+      id: rejection.id,
+      timestamp: rejection.timestamp,
+      eventType: 'SPREAD_LIQUIDITY_GUARD',
+      severity: 'CRITICAL',
+      agentId: agent.id,
+      agentName: agent.name,
+      archetype: agent.archetype,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      triggerMetric: 'liveBalanceSyncFreshness',
+      thresholdValue: '<= 60000ms synced',
+      observedValue: Number.isFinite(syncAgeMs) ? `${syncAgeMs}ms` : 'UNSYNCED',
+      actionTaken: reason,
+      cancelledOrderIds: [],
+      acknowledged: false,
+    });
+    console.warn(`[EXECUTE-TRADE REJECTED · BALANCE_SYNC_UNAVAILABLE] ${reason}`);
+    return res.status(400).json({
+      error: reason,
+      rejected: true,
+      code: 'BALANCE_SYNC_UNAVAILABLE',
+      reason,
+      requestedNotionalUsd: orderNotionalUsd,
+      availableCashUsd: rawSettledCash,
+    });
+  }
+
+  // Fix B — Mandatory default 3% settled-cash cap via ExecutionVault (no opt-in/opt-out flag)
+  const availableLiveCashUsd = Number(rawSettledCash);
+  const vaultSizing = executionVault.computeSettledCashTargetSize({
+    riskAmountUsd: orderNotionalUsd,
+    stopLossDistanceUsd: 1,
+    settledCashUsd: availableLiveCashUsd,
+    unitPriceUsd: 1,
+  });
+  const settledCash3PctCapUsd = Number(vaultSizing.settledCashCapUsd.toFixed(2));
   if (
     availableLiveCashUsd <= 0 ||
     orderNotionalUsd > availableLiveCashUsd ||
-    (Boolean(req.body?.enforceSettledCash3PctCap) && orderNotionalUsd > settledCash3PctCapUsd)
+    !vaultSizing.approved ||
+    orderNotionalUsd > vaultSizing.settledCashCapUsd + 0.01
   ) {
+    const exceedsCapOnly =
+      availableLiveCashUsd > 0 &&
+      orderNotionalUsd <= availableLiveCashUsd &&
+      orderNotionalUsd > vaultSizing.settledCashCapUsd + 0.01;
+    const rejectionCode: ExecuteTradeRejectionRecord['code'] = exceedsCapOnly
+      ? 'SETTLED_CASH_CAP_EXCEEDED'
+      : 'INSUFFICIENT_LIVE_CASH';
     const reason = `Order rejected: requested notional $${orderNotionalUsd.toFixed(2)} on ${feature.symbol} exceeds live settled cash limit (available=$${availableLiveCashUsd.toFixed(2)}, 3% vault cap=$${settledCash3PctCapUsd.toFixed(2)}).`;
     const rejection: ExecuteTradeRejectionRecord = {
       id: `rej-cash-${orderRejectionLog.length + 1}`,
@@ -13190,7 +14022,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
       agentId: agent.id,
       symbol: feature.symbol,
       venue: feature.venue,
-      code: 'INSUFFICIENT_LIVE_CASH',
+      code: rejectionCode,
       reason,
       requestedNotionalUsd: orderNotionalUsd,
       maxPositionNotionalUsd,
@@ -13207,34 +14039,33 @@ app.post('/api/agents/execute-trade', async (req, res) => {
       archetype: agent.archetype,
       symbol: feature.symbol,
       venue: feature.venue,
-      triggerMetric: 'availableLiveCashUsd',
-      thresholdValue: `$${availableLiveCashUsd.toFixed(2)}`,
+      triggerMetric: 'settledCash3PctCapUsd',
+      thresholdValue: `$${settledCash3PctCapUsd.toFixed(2)}`,
       observedValue: `$${orderNotionalUsd.toFixed(2)}`,
       actionTaken: reason,
       cancelledOrderIds: [],
       acknowledged: false,
     });
-    console.warn(`[EXECUTE-TRADE REJECTED · INSUFFICIENT_LIVE_CASH] ${reason}`);
+    console.warn(`[EXECUTE-TRADE REJECTED · ${rejectionCode}] ${reason}`);
     return res.status(400).json({
       error: reason,
       rejected: true,
-      code: 'INSUFFICIENT_LIVE_CASH',
+      code: rejectionCode,
       reason,
       requestedNotionalUsd: orderNotionalUsd,
       availableCashUsd: availableLiveCashUsd,
+      settledCashCapUsd: settledCash3PctCapUsd,
     });
   }
 
   // Post-Mortem Rule 2: Deterministic idempotency bucket lock when enforceVaultCooldown is active
   if (req.body?.enforceVaultCooldown) {
-    const rawTf = String(agent.timeframe || '15m').toLowerCase();
-    const tf: '5m' | '15m' | '1h' =
-      rawTf === '5m' ? '5m' : rawTf === '1h' ? '1h' : '15m';
     const vaultLock = executionVault.acquireIdempotencyLock({
-      symbol: feature.symbol,
-      side: feature.venue === 'PREDICTION_MARKET' ? 'BUY_YES' : 'BUY',
-      strategyId: agent.indicatorStrategyId || CHAMPION_CONFIG.active_strategy.id,
+      symbol: resolvedOrderSymbol,
+      side: resolvedSide,
+      strategyId: strategyIdForBucket,
       timeframe: tf,
+      explicitClientKey: clientSuppliedIdempotencyKey || undefined,
     });
     if (!vaultLock.allowed) {
       return res.status(409).json({
@@ -13246,21 +14077,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     }
   }
 
-  const resolvedSide =
-    feature.venue === 'PREDICTION_MARKET'
-      ? assessment.bias_probability_distribution.bullish >=
-        assessment.bias_probability_distribution.bearish
-        ? 'BUY_YES'
-        : 'BUY_NO'
-      : assessment.bias_probability_distribution.bullish >=
-        assessment.bias_probability_distribution.bearish
-      ? 'BUY'
-      : 'SELL';
-
-  // Fix 5 — Deterministic order ID and venue seeds derived from idempotencyKey (never Date.now() or Math.random())
-  const effectiveIdempotencyKey =
-    clientSuppliedIdempotencyKey ||
-    `idem-${agent.id}-${feature.symbol}-${executedOrders.length + 1}`;
+  // Fix D — Deterministic order ID and venue seeds derived from effectiveIdempotencyKey
   const idempotencyDigest = crypto
     .createHash('sha256')
     .update(effectiveIdempotencyKey)
@@ -13397,10 +14214,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     timestamp: new Date().toISOString(),
     agentId: agent.id,
     agentName: agent.name,
-    symbol:
-      feature.is15MinPrediction && feature.activeContractTicker
-        ? feature.activeContractTicker
-        : feature.symbol,
+    symbol: resolvedOrderSymbol,
     venue: feature.venue,
     side: resolvedSide,
     orderType: 'LIMIT_OCO',
@@ -13430,6 +14244,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     order,
     idempotencyKey: effectiveIdempotencyKey,
     idempotentReplay: false,
+    settledCashCapUsd: settledCash3PctCapUsd,
     publicEventContractOrderId,
     kalshiExchangeStatus,
     publicExchangeStatus,
@@ -13443,9 +14258,9 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     portfolio: computePortfolioSummary(),
   };
 
-  if (clientSuppliedIdempotencyKey.length > 0) {
-    executeTradeIdempotencyStore.set(clientSuppliedIdempotencyKey, responsePayload);
-  }
+  // Fix D — Persist idempotency store entry (client key OR deterministic fallback) to disk
+  executeTradeIdempotencyStore.set(effectiveIdempotencyKey, responsePayload);
+  persistExecuteTradeIdempotencyStoreToDisk();
 
   res.json(responsePayload);
 });

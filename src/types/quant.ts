@@ -283,7 +283,8 @@ export type ExitEvaluationResultStatus =
   | 'TRIGGERED_STOP_LOSS'
   | 'TRIGGERED_PROFIT_LOCK'
   | 'TRIGGERED_EXPIRATION_FLATTEN'
-  | 'TRIGGERED_EXPIRATION_CLIFF';
+  | 'TRIGGERED_EXPIRATION_CLIFF'
+  | 'EXIT_VENUE_REJECTED';
 
 export interface ExecutedOrder {
   id: string;

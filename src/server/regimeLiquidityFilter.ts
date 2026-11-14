@@ -1,4 +1,5 @@
 import rawChampionConfig from '../../champion_config.json';
+import { LEAD_LAG_PARAMS } from '../config/strategyParams';
 import type { OHLCVBar } from '../types/quant';
 
 export interface UnifiedChampionConfig {
@@ -75,8 +76,19 @@ export interface UnifiedChampionConfig {
   };
 }
 
-export const CHAMPION_CONFIG: UnifiedChampionConfig =
-  rawChampionConfig as unknown as UnifiedChampionConfig;
+const baseChampion = rawChampionConfig as unknown as UnifiedChampionConfig;
+export const CHAMPION_CONFIG: UnifiedChampionConfig = {
+  ...baseChampion,
+  active_strategy: {
+    ...baseChampion.active_strategy,
+    entry: {
+      ...baseChampion.active_strategy.entry,
+      min_edge_floor_usd: LEAD_LAG_PARAMS.minNetEdgeDollars,
+      ask_gate: [LEAD_LAG_PARAMS.askGateMin, LEAD_LAG_PARAMS.askGateMax],
+      window_minutes: [...LEAD_LAG_PARAMS.timeWindowMinutes] as [number, number],
+    },
+  },
+};
 
 export interface ObiSample {
   tsMs: number;

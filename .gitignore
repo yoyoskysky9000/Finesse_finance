@@ -16,6 +16,7 @@ quant_ledger.duckdb.sqlite
 quant_ledger.duckdb.sqlite-shm
 quant_ledger.duckdb.sqlite-wal
 ml_telemetry_ledger_mirror.json
+.quantpulse_*.json
 kalshi_brier_calibration.sqlite
 kalshi_brier_calibration.sqlite-shm
 kalshi_brier_calibration.sqlite-wal

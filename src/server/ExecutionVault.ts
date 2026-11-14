@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   CHAMPION_CONFIG,
   computeLiquidityHealthScore,
@@ -130,6 +132,60 @@ export interface VaultAuditEntry {
 export class ExecutionVault {
   private readonly idempotencyLockLedger = new Map<string, IdempotencyLockRecord>();
   private readonly auditLog: VaultAuditEntry[] = [];
+  private readonly customPersistencePath?: string;
+
+  constructor(persistencePath?: string) {
+    this.customPersistencePath = persistencePath;
+    this.reloadFromDisk();
+  }
+
+  public getPersistencePath(): string {
+    return (
+      this.customPersistencePath ||
+      process.env.QUANTPULSE_VAULT_LEDGER_PATH ||
+      path.resolve(process.cwd(), '.quantpulse_vault_idempotency.json')
+    );
+  }
+
+  public reloadFromDisk(nowMs = Date.now()): void {
+    this.idempotencyLockLedger.clear();
+    const filePath = this.getPersistencePath();
+    try {
+      if (!fs.existsSync(filePath)) return;
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (!raw.trim()) return;
+      const parsed = JSON.parse(raw) as { records?: IdempotencyLockRecord[] };
+      for (const rec of parsed.records || []) {
+        if (rec && typeof rec.idempotencyHash === 'string' && rec.expiresAtMs > nowMs) {
+          this.idempotencyLockLedger.set(rec.idempotencyHash, rec);
+        }
+      }
+    } catch {
+      // Fail safe without crashing if ledger file is malformed/uninitialized
+    }
+  }
+
+  private persistLedgerToDisk(nowMs = Date.now()): void {
+    const filePath = this.getPersistencePath();
+    try {
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const activeRecords = Array.from(this.idempotencyLockLedger.values()).filter(
+        (rec) => rec.expiresAtMs > nowMs
+      );
+      const tmpPath = `${filePath}.${process.pid}.tmp`;
+      fs.writeFileSync(
+        tmpPath,
+        JSON.stringify({ updatedAt: new Date(nowMs).toISOString(), records: activeRecords }, null, 2),
+        'utf8'
+      );
+      fs.renameSync(tmpPath, filePath);
+    } catch {
+      // Ignore write failures on read-only containers
+    }
+  }
 
   private pushAudit(entry: VaultAuditEntry): void {
     this.auditLog.unshift(entry);
@@ -144,6 +200,40 @@ export class ExecutionVault {
 
   public clearLocksForTests(): void {
     this.idempotencyLockLedger.clear();
+    this.persistLedgerToDisk();
+  }
+
+  public deriveDeterministicIdempotencyKey(
+    input: Omit<IdempotencyLockInput, 'explicitClientKey'>
+  ): {
+    idempotencyHash: string;
+    rawTuple: string;
+    timeBucket: number;
+    cooldownSec: number;
+    normSymbol: string;
+    normSide: string;
+    normStrategy: string;
+  } {
+    const nowMs = input.timestampMs ?? Date.now();
+    const cooldownSec = VAULT_COOLDOWN_SECONDS[input.timeframe] ?? 2700;
+    const timeBucket = Math.floor(nowMs / (cooldownSec * 1000));
+    const normSymbol = input.symbol.trim().toUpperCase();
+    const normSide = input.side.trim().toUpperCase();
+    const normStrategy = input.strategyId.trim().toUpperCase();
+    const rawTuple = `${normSymbol}:${normSide}:${normStrategy}:${timeBucket}`;
+    const idempotencyHash = crypto
+      .createHash('sha256')
+      .update(rawTuple)
+      .digest('hex');
+    return {
+      idempotencyHash,
+      rawTuple,
+      timeBucket,
+      cooldownSec,
+      normSymbol,
+      normSide,
+      normStrategy,
+    };
   }
 
   /**
@@ -282,6 +372,7 @@ export class ExecutionVault {
       expiresAtMs: nowMs + cooldownSec * 1000,
     };
     this.idempotencyLockLedger.set(idempotencyHash, record);
+    this.persistLedgerToDisk(nowMs);
     this.pushAudit({
       ts: new Date(nowMs).toISOString(),
       rule: 'RULE_2_IDEMPOTENCY_LOCK',
@@ -306,6 +397,7 @@ export class ExecutionVault {
     const rec = this.idempotencyLockLedger.get(idempotencyHash);
     if (rec) {
       rec.orderId = orderId;
+      this.persistLedgerToDisk();
     }
   }
 
