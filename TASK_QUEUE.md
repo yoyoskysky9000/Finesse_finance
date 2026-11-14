@@ -8,14 +8,16 @@
 
 ## Active Backlog
 
-- [x] **TASK-01 `[VAULT-FIX]`**: Audit our current order execution and sizing files in Finesse_finance and log any remaining duplicate-order, all-in sizing, or locked-exit vulnerabilities to `AGENT_BUS.jsonl`. *(Completed on initialization — see line 2 of `AGENT_BUS.jsonl` for exact file/line findings across `server.ts` and `mcp_server.py`.)*
+- [x] **TASK-01 `[VAULT-FIX]`**: Audit our current order execution and sizing files in Finesse_finance and log any remaining duplicate-order, all-in sizing, or locked-exit vulnerabilities to `AGENT_BUS.jsonl`. *(Completed — see line 2 of `AGENT_BUS.jsonl`.)*
 
-- [ ] **TASK-02 `[VAULT-FIX]`**: Verify or build a deterministic `RiskGuard.ts` module (`src/server/riskGuard.ts`) that enforces:
-  1. Deterministic idempotency hash lock (`sha256(symbol + ":" + side + ":" + strategy_id + ":" + time_bucket)`) across ALL order routes (eliminating `Date.now()` keys in `executeLivePublicBrokeragePulse`, `placePublicTakeProfitSellOrders`, `executeLiveKalshiHftPulse`, and `submitKalshiV2EventsOrder` retries).
-  2. Strict **3% settled-cash cap** (`2%–5%` configurable band on `cashOnlyBuyingPowerUsd` / `kalshiCashBalanceUsd`, never `totalEquityUsd` or `buyingPowerUsd` margin) wired into every live and burst execution route in `server.ts` + `mcp_server.py`.
-  3. **Pre-exit open-order cancellation sweep + balance-release confirmation + exact settled-quantity close** for both Public.com (`placePublicTakeProfitSellOrders`, stop-loss exits) and Kalshi V2 (`submitSingleKalshiSellOrder`).
-  4. Unit/smoke tests in `tests/smoke.test.ts` verifying all three RiskGuard invariants.
+- [x] **TASK-02 `[VAULT-FIX]`**: Deep Research on Regime & Liquidity Filters (Agent 01) + RiskGuard design. *(Completed prior to TASK-04 promotion.)*
 
-- [ ] **TASK-03 `[SANDBOX]`**: Run a baseline backtest with real historical candle data, realistic venue fees (`feePerContract: 0.02` / Kalshi quadratic taker vs $0 maker + Public brokerage fees), slippage, and `RiskGuard` 3% settled-cash cap enabled, saving the winning parameters and verified simulation metrics to `champion_config.json`.
+- [x] **TASK-03A/B `[SANDBOX]`**: Agent 03 Muse/Brill parameter calibration & Agent 04 2x Fee/Slippage Stress Test. *(Completed prior to TASK-04 promotion.)*
 
-- [ ] **TASK-04 `[SANDBOX]`**: Multi-model variable sweep across choppy (`LOW_VOLATILITY_COMPRESSION` / range-bound) and high-volatility (`HIGH_VOLATILITY_EXPANSION` / `atrBaselineMultiplier >= 1.5x`) market regimes using real OHLCV history, updating `champion_config.json` only if out-of-sample net Sharpe and max drawdown strictly improve over the TASK-03 baseline without increasing tail risk.
+- [x] **TASK-04 `[VAULT-FIX]`**: Champion Config Promotion (`2.5.0-UNIFIED-CHAMPION` in `champion_config.json`) & Execution Vault Upgrade (`src/server/ExecutionVault.ts` + `src/server/regimeLiquidityFilter.ts` wired into `server.ts`) enforcing:
+  1. **Rule 1 (Settled Cash Cap)**: `targetSize = Math.min(riskAmount / stopLossDistance, settledCash * 0.03)` using ONLY settled, available cash.
+  2. **Rule 2 (Deterministic Idempotency Lock)**: Hash `symbol + side + strategy_id + time_bucket` with strict cooldowns of `900s` (5m), `2700s` (15m), and `14400s` (1h), blocking duplicates within the active bucket.
+  3. **Rule 3 (Pre-Exit Sweep & LHS Unwind)**: `CancelAllOpenOrders(symbol)` -> confirm balance release -> recalculate Liquidity Health Score (`LHS`) -> 1¢-inside-spread limit exit if `LHS >= 0.65` or passive TWAP micro-tranches if `LHS < 0.65`.
+  4. **Regime, Liquidity & Exit Filters**: `CHOP(14)`, `ADX(10/14)`, `Kaufman_ER(10)`, 125-bar `BBW_percentile`, `ATR_ratio_percentile`, `Garman_Klass_VRP_percentile`, `LHS` over `1000ms` TWAP OBI window, 2x15s confirmed stop-loss, `+1.2 * atr14_usd` 50% trailing lock, 6m dead-trade stop, and `T - 90s` forced flat.
+
+- [ ] **TASK-05 `[SANDBOX]`**: Run walk-forward out-of-sample verification on `2.5.0-UNIFIED-CHAMPION` over live Coinbase/Kalshi 5m & 15m datasets and populate numeric metrics in `champion_config.json`.

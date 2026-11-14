@@ -31,7 +31,8 @@ These files touch real brokerage/exchange credentials, live cash balances, order
   - Mutating `/api/*` endpoints (`/api/agents/*`, `/api/kalshi/*`, `/api/public/*`, `/api/lead-lag/*`, `/api/risk/*`)
 - `mcp_server.py` — Python FastMCP server exposing Kalshi/Public/Coinbase/DuckDB tools (`execute_kalshi_or_public_order`, `execute_risk_mitigation`, `run_portfolio_cleaner`, `trigger_risk_circuit_breaker`, `route_to_dlq`, `idempotency_ledger`).
 - `src/server/phase1Security.ts` — Fail-closed Firebase ID token auth middleware (`firebaseIdTokenAuthMiddleware`, `STRICT_API_AUTH_REQUIRED` defaulting to `true`), rate limiting, and audit security controls.
-- `src/server/riskGuard.ts` *(planned in `TASK-02` `[VAULT-FIX]`)* — Centralized deterministic RiskGuard module enforcing idempotency hash locks, 2%–5% settled-cash caps, and pre-exit open-order cancellation sweeps.
+- `src/server/ExecutionVault.ts` — Locked Execution Vault enforcing Rule 1 (3% settled-cash cap `Math.min(riskAmount / stopLossDistance, settledCash * 0.03)`), Rule 2 (deterministic `symbol:side:strategy_id:time_bucket` idempotency lock with `900s`/`2700s`/`14400s` cooldowns), and Rule 3 (pre-exit `CancelAllOpenOrders(symbol)` sweep, balance-release confirmation, `LHS` recalculation, and 1¢-inside-spread vs passive TWAP micro-tranches).
+- `src/server/regimeLiquidityFilter.ts` — `2.5.0-UNIFIED-CHAMPION` `evaluateRegimeAndLiquidity` (`CHOP(14)`, `ADX`, `Kaufman_ER(10)`, `BBW_percentile`, `ATR_ratio_percentile`, `Garman_Klass_VRP_percentile`, `LHS`) and `evaluateChampionExitSignal` exit engine.
 - `security_spec.md` — Security & authentication architecture specification.
 - `firestore.rules`, `firebase-blueprint.json`, `firebase-applet-config.json` — Database access control and schema config.
 - `scripts/set-admin-claim.ts`, `scripts/git-hygiene-untrack.sh` — Admin claim and repository security scripts.

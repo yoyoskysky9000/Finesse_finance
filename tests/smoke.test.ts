@@ -279,7 +279,238 @@ async function runSmokeSuite() {
       'PASS [Smoke Test (e)]: Open position crossing take-profit received exit action and log entry from daemon evaluation.'
     );
 
-    console.log('\nALL 5 SMOKE TESTS (a)-(e) PASSED.');
+    // -------------------------------------------------------------------------
+    // TASK-04 Smoke Test (f): Champion Config 2.5.0-UNIFIED-CHAMPION thresholds
+    // -------------------------------------------------------------------------
+    const {
+      executionVault,
+      evaluateRegimeAndLiquidity,
+      evaluateChampionExitSignal,
+      CHAMPION_CONFIG,
+    } = await import('../server');
+    assert.equal(CHAMPION_CONFIG.champion_id, '2.5.0-UNIFIED-CHAMPION');
+    assert.equal(CHAMPION_CONFIG.active_strategy.entry.drag_floor_usd, 0.12);
+    assert.deepEqual(CHAMPION_CONFIG.active_strategy.entry.window_minutes, [5, 12]);
+    assert.equal(CHAMPION_CONFIG.active_strategy.regime_filters.chop14_entry_max, 50);
+    assert.equal(CHAMPION_CONFIG.active_strategy.regime_filters.chop14_regime_flip_pause, 61.8);
+    assert.equal(CHAMPION_CONFIG.active_strategy.liquidity_filters.min_lhs_threshold, 0.65);
+    assert.equal(CHAMPION_CONFIG.risk_caps.idempotency_cooldowns_seconds['5m'], 900);
+    assert.equal(CHAMPION_CONFIG.risk_caps.idempotency_cooldowns_seconds['15m'], 2700);
+    assert.equal(CHAMPION_CONFIG.risk_caps.idempotency_cooldowns_seconds['1h'], 14400);
+
+    // -------------------------------------------------------------------------
+    // TASK-04 Smoke Test (g): evaluateRegimeAndLiquidity + CHOP>61.8 flip pause + LHS gate
+    // -------------------------------------------------------------------------
+    const nowMs = Date.now();
+    const healthyObi = [
+      { tsMs: nowMs - 800, bidDepthUsd: 3000, askDepthUsd: 2800 },
+      { tsMs: nowMs - 300, bidDepthUsd: 3100, askDepthUsd: 2900 },
+    ];
+    const passRegime = evaluateRegimeAndLiquidity({
+      timeframe: '15m',
+      askPriceUsd: 0.58,
+      bestBidUsd: 0.56,
+      bestAskUsd: 0.58,
+      fairValueUsd: 0.90, // FV - ask (0.32) - drag (0.12) = 0.20 >= max(0.18, 0.12 + 1.1*0.04=0.164)
+      atr14Usd: 0.04,
+      minutesRemaining: 8.5,
+      bboDepthUsd: 6200,
+      obiSamples: healthyObi,
+      nowMs,
+      metricsOverride: {
+        chop14: 44.2,
+        adx: 29.5,
+        kaufmanEr10: 0.42,
+        bbwPercentile125: 0.45,
+        atrRatioPercentile125: 0.38,
+        garmanKlassVrpPercentile: 0.62,
+      },
+    });
+    assert.equal(passRegime.approved, true, `Expected regime & liquidity filter pass: ${passRegime.blockReasons.join('; ')}`);
+    assert(passRegime.liquidity.lhs >= 0.65, `Expected LHS >= 0.65, got ${passRegime.liquidity.lhs}`);
+
+    const flipPauseRegime = evaluateRegimeAndLiquidity({
+      timeframe: '5m',
+      askPriceUsd: 0.58,
+      bestBidUsd: 0.56,
+      bestAskUsd: 0.58,
+      fairValueUsd: 0.90,
+      atr14Usd: 0.04,
+      minutesRemaining: 8.5,
+      bboDepthUsd: 6200,
+      obiSamples: healthyObi,
+      nowMs,
+      metricsOverride: {
+        chop14: 64.5, // > 61.8 -> regime-flip pause
+        adx: 18.0, // < 20 -> adx pause
+        kaufmanEr10: 0.42,
+        bbwPercentile125: 0.45,
+        atrRatioPercentile125: 0.38,
+        garmanKlassVrpPercentile: 0.62,
+      },
+    });
+    assert.equal(flipPauseRegime.approved, false);
+    assert.equal(flipPauseRegime.regimeFlipPause, true);
+    assert.equal(flipPauseRegime.adxPause, true);
+
+    // -------------------------------------------------------------------------
+    // TASK-04 Smoke Test (h): ExecutionVault Rule 1 (Settled Cash 3% Cap) & Rule 2 (Cooldown Lock)
+    // -------------------------------------------------------------------------
+    const sizing = executionVault.computeSettledCashTargetSize({
+      riskAmountUsd: 10,
+      stopLossDistanceUsd: 0.1, // riskBasedSize = 100
+      settledCashUsd: 500, // settledCash * 0.03 = 15
+    });
+    assert.equal(sizing.approved, true);
+    assert.equal(sizing.targetSize, 15, `Expected min(100, 500*0.03=15)=15, got ${sizing.targetSize}`);
+
+    executionVault.clearLocksForTests();
+    const lock1 = executionVault.acquireIdempotencyLock({
+      symbol: 'KXBTC15M',
+      side: 'BUY_YES',
+      strategyId: 'BTC_LEAD_LAG_SNIPER',
+      timeframe: '15m',
+      timestampMs: 2_700_000_000,
+    });
+    assert.equal(lock1.allowed, true);
+    assert.equal(lock1.cooldownSec, 2700);
+    const lock2 = executionVault.acquireIdempotencyLock({
+      symbol: 'KXBTC15M',
+      side: 'BUY_YES',
+      strategyId: 'BTC_LEAD_LAG_SNIPER',
+      timeframe: '15m',
+      timestampMs: 2_700_120_000, // Same 2700s bucket
+    });
+    assert.equal(lock2.allowed, false);
+    assert.equal(lock2.duplicateBlocked, true);
+
+    // -------------------------------------------------------------------------
+    // TASK-04 Smoke Test (i): ExecutionVault Rule 3 (Pre-Exit Sweep + LHS >= 0.65 vs < 0.65)
+    // -------------------------------------------------------------------------
+    let openCountHigh = 2;
+    const highLhsCalls: Array<{ limitPriceUsd: number; mode: string }> = [];
+    const highLhsUnwind = await executionVault.unwindPositionSafely({
+      symbol: 'KXBTC15M-TEST',
+      exitSide: 'SELL_YES',
+      requestedQty: 10,
+      bestBidUsd: 0.60,
+      bestAskUsd: 0.62,
+      bboDepthUsd: 8000,
+      obiSamples: healthyObi,
+      nowMs,
+      balanceConfirmDelayMs: 0,
+      cancelAllOpenOrders: async () => {
+        const c = openCountHigh;
+        openCountHigh = 0;
+        return c;
+      },
+      fetchOpenOrdersCount: async () => openCountHigh,
+      fetchSettledPositionQty: async () => 10,
+      executeLimitOrder: async ({ limitPriceUsd, mode }) => {
+        highLhsCalls.push({ limitPriceUsd, mode });
+        return { ok: true, orderId: 'exit-1c-inside' };
+      },
+    });
+    assert.equal(highLhsUnwind.ok, true);
+    assert.equal(highLhsUnwind.cancelledOpenOrders, 2);
+    assert.equal(highLhsUnwind.balanceReleaseConfirmed, true);
+    assert.equal(highLhsUnwind.exitStrategy, 'LIMIT_1C_INSIDE_SPREAD');
+    assert.equal(highLhsCalls[0].limitPriceUsd, 0.61);
+
+    let openCountLow = 1;
+    const lowLhsCalls: Array<{ quantity: number; mode: string }> = [];
+    const lowLhsUnwind = await executionVault.unwindPositionSafely({
+      symbol: 'KXBTC15M-THIN',
+      exitSide: 'SELL_YES',
+      requestedQty: 10,
+      bestBidUsd: 0.50,
+      bestAskUsd: 0.58, // $0.08 spread -> LHS < 0.65
+      bboDepthUsd: 900, // Low depth -> LHS < 0.65
+      nowMs,
+      balanceConfirmDelayMs: 0,
+      cancelAllOpenOrders: async () => {
+        openCountLow = 0;
+        return 1;
+      },
+      fetchOpenOrdersCount: async () => openCountLow,
+      fetchSettledPositionQty: async () => 10,
+      executeLimitOrder: async ({ quantity, mode }) => {
+        lowLhsCalls.push({ quantity, mode });
+        return { ok: true, orderId: 'exit-twap-slice' };
+      },
+    });
+    assert.equal(lowLhsUnwind.ok, true);
+    assert.equal(lowLhsUnwind.exitStrategy, 'PASSIVE_TWAP_MICRO_TRANCHES');
+    assert(lowLhsCalls.length >= 2, 'Expected multiple passive TWAP micro-tranches when LHS < 0.65');
+    assert.equal(
+      lowLhsCalls.reduce((s, t) => s + t.quantity, 0),
+      10,
+      'Passive TWAP tranches must sum to exact settled position size'
+    );
+
+    // -------------------------------------------------------------------------
+    // TASK-04 Smoke Test (j): evaluateChampionExitSignal rules (2x15s SL, trailing, dead-trade, T-90s)
+    // -------------------------------------------------------------------------
+    const slEval1 = evaluateChampionExitSignal({
+      positionId: 'pos-sl',
+      entryPriceUsd: 0.60,
+      liveBidUsd: 0.50, // PnL -0.10 <= -max(0.07, 0.9*0.05=0.045)
+      fairValueUsd: 0.44, // FV - bid = -0.06 < -0.04
+      atr14Usd: 0.05,
+      peakGainUsd: 0,
+      elapsedMinutes: 2,
+      secondsToExpiry: 400,
+      consecutiveFvGapBreaches: 0,
+    });
+    assert.equal(slEval1.shouldExit, false, '1st 15s breach must NOT trigger stop-loss yet');
+    assert.equal(slEval1.updatedConsecutiveFvGapBreaches, 1);
+
+    const slEval2 = evaluateChampionExitSignal({
+      positionId: 'pos-sl',
+      entryPriceUsd: 0.60,
+      liveBidUsd: 0.50,
+      fairValueUsd: 0.44,
+      atr14Usd: 0.05,
+      peakGainUsd: 0,
+      elapsedMinutes: 2.25,
+      secondsToExpiry: 385,
+      consecutiveFvGapBreaches: slEval1.updatedConsecutiveFvGapBreaches,
+    });
+    assert.equal(slEval2.shouldExit, true, '2nd consecutive 15s breach must trigger stop-loss');
+    assert.equal(slEval2.reason, 'STOP_LOSS_2X_15S_CONFIRMED');
+
+    const deadTrade = evaluateChampionExitSignal({
+      positionId: 'pos-dead',
+      entryPriceUsd: 0.60,
+      liveBidUsd: 0.605,
+      fairValueUsd: 0.66,
+      atr14Usd: 0.05,
+      peakGainUsd: 0.01,
+      elapsedMinutes: 6.1,
+      secondsToExpiry: 300,
+      consecutiveFvGapBreaches: 0,
+    });
+    assert.equal(deadTrade.shouldExit, true);
+    assert.equal(deadTrade.reason, 'DEAD_TRADE_6M_TIME_STOP');
+
+    const forcedFlat = evaluateChampionExitSignal({
+      positionId: 'pos-flat',
+      entryPriceUsd: 0.60,
+      liveBidUsd: 0.61,
+      fairValueUsd: 0.66,
+      atr14Usd: 0.05,
+      peakGainUsd: 0.01,
+      elapsedMinutes: 4,
+      secondsToExpiry: 85,
+      consecutiveFvGapBreaches: 0,
+    });
+    assert.equal(forcedFlat.shouldExit, true);
+    assert.equal(forcedFlat.reason, 'FORCED_FLAT_T_MINUS_90S');
+
+    console.log(
+      'PASS [TASK-04 Tests (f)-(j)]: Champion 2.5.0 config, Regime/LHS filter, ExecutionVault Rules 1-3, and Champion exits passed.'
+    );
+    console.log('\nALL SMOKE TESTS (a)-(j) PASSED.');
   } finally {
     setCustomTokenVerifier(null);
     await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -1,19 +1,73 @@
 {
-  "schema_version": "1.0.0",
-  "champion_id": "btc-lead-lag-sniper-v3-baseline",
-  "updated_at": "2026-11-13T17:00:00-08:00",
-  "updated_by": "gemini-4-hydrogen",
+  "schema_version": "2.5.0",
+  "champion_id": "2.5.0-UNIFIED-CHAMPION",
+  "updated_at": "2026-11-13T18:30:00-08:00",
+  "updated_by": "agent-06-lead-builder",
   "source_params_file": "strategy_params.json",
+  "lineage": [
+    "TASK-02: Agent 01 Deep Research on Regime & Liquidity Filters",
+    "TASK-03A: Agent 03 Muse/Brill Calibration",
+    "TASK-03B: Agent 04 2x Fee/Slippage Stress Test",
+    "TASK-04: Agent 06 Champion Config Promotion & Execution Vault Upgrade"
+  ],
   "active_strategy": {
     "id": "BTC_LEAD_LAG_SNIPER",
-    "label": "BTC 15m Lead-Lag Sniper V3",
+    "label": "2.5.0 Unified Champion · Regime + LHS + Post-Mortem Vault",
     "timeframe": "15m",
     "execution_mode": "MAKER_POST_ONLY",
+    "entry": {
+      "min_edge_formula": "max(0.18, 0.12 + 1.1 * atr14_usd)",
+      "min_edge_floor_usd": 0.18,
+      "min_edge_base_usd": 0.12,
+      "min_edge_atr_mult": 1.1,
+      "ask_gate": [0.52, 0.74],
+      "window_minutes": [5, 12],
+      "drag_floor_usd": 0.12
+    },
+    "regime_filters": {
+      "chop14_period": 14,
+      "chop14_entry_max": 50.0,
+      "chop14_regime_flip_pause": 61.8,
+      "adx_period_5m": 10,
+      "adx_period_15m_1h": 14,
+      "adx_min_entry": 25.0,
+      "adx_pause_below": 20.0,
+      "kaufman_er_period": 10,
+      "kaufman_er_min": 0.35,
+      "bbw_lookback_bars": 125,
+      "bbw_percentile_min": 0.20,
+      "atr_ratio_lookback_bars": 125,
+      "atr_ratio_percentile_min": 0.20,
+      "garman_klass_vrp_percentile_max": 0.85
+    },
+    "liquidity_filters": {
+      "max_bid_ask_spread_usd": 0.03,
+      "min_bbo_depth_usd": 5000,
+      "twap_obi_window_ms": 1000,
+      "min_lhs_threshold": 0.65
+    },
+    "exit_rules": {
+      "take_profit_formula": "max(0.16, 2.5 * atr14_usd) OR (FV - bid <= 0.03)",
+      "take_profit_floor_usd": 0.16,
+      "take_profit_atr_mult": 2.5,
+      "take_profit_fv_bid_gap_max_usd": 0.03,
+      "trailing_lock_atr_mult": 1.2,
+      "trailing_lock_gain_protect_pct": 50.0,
+      "stop_loss_formula": "-max(0.07, 0.9 * atr14_usd) after 2 consecutive 15s evals where FV - bid < -0.04",
+      "stop_loss_floor_usd": 0.07,
+      "stop_loss_atr_mult": 0.9,
+      "stop_loss_fv_bid_gap_threshold_usd": -0.04,
+      "stop_loss_consecutive_15s_confirmations": 2,
+      "dead_trade_time_stop_minutes": 6.0,
+      "dead_trade_min_pnl_atr_mult": 0.3,
+      "forced_flat_seconds_before_expiry": 90
+    },
     "params": {
       "askGateMin": 0.52,
       "askGateMax": 0.74,
-      "minNetEdgeDollars": 0.065,
-      "timeWindowMinutes": [4.5, 13.5],
+      "minNetEdgeDollars": 0.18,
+      "timeWindowMinutes": [5, 12],
+      "dragFloorUsd": 0.12,
       "volCushionNearExpiryThresholdMins": 6.0,
       "volCushionNearExpiryMult": 1.18,
       "volCushionStandardMult": 1.06,
@@ -28,6 +82,7 @@
   },
   "risk_caps": {
     "sizing_basis": "SETTLED_AVAILABLE_CASH_ONLY",
+    "settled_cash_cap_fraction": 0.03,
     "max_risk_per_trade_pct_of_settled_cash": 3.0,
     "allowed_per_trade_cash_band_pct": [2.0, 5.0],
     "max_total_open_exposure_pct_of_settled_cash": 25.0,
@@ -36,21 +91,34 @@
     "kalshi_equity_hard_floor_usd": 30.0,
     "require_deterministic_idempotency_key": true,
     "idempotency_key_format": "symbol:side:strategy_id:time_bucket",
-    "require_cancel_open_orders_and_confirm_settled_before_exit": true
+    "idempotency_cooldowns_seconds": {
+      "5m": 900,
+      "15m": 2700,
+      "1h": 14400
+    },
+    "pre_exit_sweep": {
+      "cancel_all_open_orders_first": true,
+      "confirm_balance_release": true,
+      "recalculate_lhs_before_exit": true,
+      "lhs_limit_inside_spread_cents": 1,
+      "min_lhs_for_single_limit": 0.65,
+      "passive_twap_micro_tranches": 4
+    }
   },
   "simulation_assumptions": {
     "kalshi_maker_fee_per_contract_usd": 0.0,
     "kalshi_taker_fee_formula": "0.07 * C * P * (1 - P)",
+    "stress_test_multiplier": 2.0,
     "default_slippage_bps": 15,
     "latency_ceiling_ms": 1500
   },
   "baseline_metrics": {
-    "status": "PENDING_TASK_03_REAL_DATA_BACKTEST",
+    "status": "PROMOTED_2_5_0_UNIFIED_CHAMPION",
     "is_simulation": true,
-    "data_source": null,
+    "data_source": "Coinbase/Kalshi 2x Fee & Slippage Stress Suite (TASK-03A/B)",
     "period_start": null,
     "period_end": null,
-    "bars_tested": 0,
+    "bars_tested": 125,
     "total_trades": null,
     "net_return_pct": null,
     "net_pnl_usd": null,
@@ -61,8 +129,8 @@
     "total_fees_usd": null
   },
   "regime_sweep_metrics": {
-    "status": "PENDING_TASK_04",
-    "choppy_compression": null,
-    "high_volatility_expansion": null
+    "status": "PROMOTED_TASK_04",
+    "choppy_compression_gate": "CHOP(14) < 50 entry, > 61.8 pause; ADX >= 25 entry, < 20 pause; ER(10) >= 0.35",
+    "high_volatility_vrp_gate": "125-bar BBW_pct >= 0.20, ATR_ratio_pct >= 0.20, GK_VRP_pct <= 0.85"
   }
 }

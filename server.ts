@@ -116,6 +116,13 @@ import {
   LEAD_LAG_PARAMS,
   LEAD_LAG_WINDOW_TEXT,
 } from './src/config/strategyParams.ts';
+import {
+  CHAMPION_CONFIG,
+  computeLiquidityHealthScore,
+  evaluateChampionExitSignal,
+  evaluateRegimeAndLiquidity,
+} from './src/server/regimeLiquidityFilter.ts';
+import { executionVault } from './src/server/ExecutionVault.ts';
 
 dotenv.config();
 
@@ -3835,7 +3842,7 @@ async function submitKalshiV2EventsOrder(params: {
             : Math.min(0.99, Number(priceDollars) + 0.01);
         priceDollars = stepped.toFixed(4);
         const retryClientId = generateDeterministicUuidV4FromSeed(
-          `kalshi-v2:${params.idempotencySeed}:${cleanTicker}:${params.side}:step:${Date.now()}`
+          `kalshi-v2:${params.idempotencySeed}:${cleanTicker}:${params.side}:step:1`
         );
         res = await kalshiSignedFetch(orderPath, {
           method: 'POST',
@@ -3849,7 +3856,7 @@ async function submitKalshiV2EventsOrder(params: {
         errLower.includes('already exists')
       ) {
         const retryClientId = generateDeterministicUuidV4FromSeed(
-          `kalshi-v2:${params.idempotencySeed}:${cleanTicker}:${params.side}:dup:${Date.now()}`
+          `kalshi-v2:${params.idempotencySeed}:${cleanTicker}:${params.side}:dup:1`
         );
         res = await kalshiSignedFetch(orderPath, {
           method: 'POST',
@@ -7635,6 +7642,8 @@ app.get('/api/state', async (_req, res) => {
     autoRebalanceState: buildAgentFleetAutoRebalanceState(),
     orderRejectionLog,
     exitMonitorEvaluationLog,
+    championConfig: CHAMPION_CONFIG,
+    executionVaultAudit: executionVault.getAuditLog(),
     mcp: {
       servers: mcpServerConnections,
       tools: mcpToolDefinitions,
@@ -7644,6 +7653,15 @@ app.get('/api/state', async (_req, res) => {
       resources: mcpResourceDefinitions,
       logs: mcpCallLogs,
     },
+  });
+});
+
+app.get('/api/vault/champion-status', (_req, res) => {
+  res.json({
+    championConfig: CHAMPION_CONFIG,
+    auditLog: executionVault.getAuditLog(),
+    orderRejectionLog,
+    exitMonitorEvaluationLog,
   });
 });
 
@@ -8574,7 +8592,7 @@ async function submitSingleKalshiSellOrder(params: {
   let exchangeStatus = params.immediateExit
     ? 'LIVE_KALSHI_IMMEDIATE_PROFIT_HARVEST_SELL'
     : 'ZERO_FEE_MAKER_TAKE_PROFIT_RESTING';
-  let actualOrderStatus: 'FILLED' | 'WORKING_OCO' = 'WORKING_OCO';
+  let actualOrderStatus = 'WORKING_OCO' as 'FILLED' | 'WORKING_OCO';
 
   if (kalshiCreds) {
     const eventsSide: 'bid' | 'ask' = params.sideToSell === 'YES' ? 'ask' : 'bid';
@@ -8590,37 +8608,59 @@ async function submitSingleKalshiSellOrder(params: {
       if (Date.now() - lastAttemptMs >= 25000) {
         kalshiExitCooldownByTicker.set(params.ticker, Date.now());
         try {
-          // 1. Cancel any resting Maker TP order on this ticker first and wait 350ms so shares are unlocked
-          await cancelRestingKalshiOrdersForTicker(params.ticker);
-          kalshiRestingTpPlacedByTicker.delete(params.ticker);
-          await new Promise((r) => setTimeout(r, 350));
-
-          // 2. Fire ONLY a reduce_only=true IoC order to flatten safely (never flips position)
-          const aggressiveYesPx =
-            eventsSide === 'ask'
-              ? Number(Math.max(0.02, yesBid - 0.02).toFixed(2))
-              : Number(Math.min(0.98, yesAsk + 0.02).toFixed(2));
-          const iocSell = await submitKalshiV2EventsOrder({
-            ticker: params.ticker,
-            idempotencySeed: `ioc-harvest-${params.ticker}-${Math.floor(Date.now() / 25000)}`,
-            side: eventsSide,
-            contracts: cleanContracts,
-            desiredYesPrice: aggressiveYesPx,
-            yesBidDollars: yesBid,
-            yesAskDollars: yesAsk,
-            postOnly: false,
-            reduceOnly: true,
-            timeInForce: 'immediate_or_cancel',
-            cancelOrderOnPause: true,
+          const bboDepthUsd = Math.max(
+            5000,
+            cleanContracts * Math.max(0.05, yesBid) * 100
+          );
+          const unwindResult = await executionVault.unwindPositionSafely({
+            symbol: params.ticker,
+            exitSide: eventsSide,
+            requestedQty: cleanContracts,
+            bestBidUsd: yesBid,
+            bestAskUsd: yesAsk,
+            bboDepthUsd,
+            cancelAllOpenOrders: async (sym) => cancelRestingKalshiOrdersForTicker(sym),
+            fetchOpenOrdersCount: async (sym) => {
+              const resting = await getRestingOrdersForTicker(sym);
+              return resting.length;
+            },
+            fetchSettledPositionQty: async (sym) => {
+              const pos = liveKalshiPositions.find(
+                (p) => p.ticker.toUpperCase() === sym.trim().toUpperCase()
+              );
+              return pos ? Math.max(0, pos.contracts) : cleanContracts;
+            },
+            executeLimitOrder: async ({ symbol, side, quantity, limitPriceUsd, idempotencyHash }) => {
+              const iocSell = await submitKalshiV2EventsOrder({
+                ticker: symbol,
+                idempotencySeed: idempotencyHash,
+                side: side === 'bid' ? 'bid' : 'ask',
+                contracts: Math.max(1, Math.round(quantity)),
+                desiredYesPrice: limitPriceUsd,
+                yesBidDollars: yesBid,
+                yesAskDollars: yesAsk,
+                postOnly: false,
+                reduceOnly: true,
+                timeInForce: 'immediate_or_cancel',
+                cancelOrderOnPause: true,
+              });
+              const filledIoc = iocSell.fillCount ?? 0;
+              if (iocSell.ok && (filledIoc > 0 || iocSell.statusLabel.includes('FILLED'))) {
+                sellOrderId = `kalshi-ioc-${iocSell.exchangeOrderId}-${suffix}`;
+                exchangeStatus = `${iocSell.statusLabel}_REDUCE_ONLY_IOC_${filledIoc || cleanContracts}`;
+                actualOrderStatus = 'FILLED';
+                traded15mContractTickersSet.add(params.ticker.trim().toUpperCase());
+              }
+              return {
+                ok: iocSell.ok,
+                orderId: iocSell.exchangeOrderId,
+                status: iocSell.statusLabel,
+              };
+            },
           });
-
-          const filledIoc = iocSell.fillCount ?? 0;
-          if (iocSell.ok && (filledIoc > 0 || iocSell.statusLabel.includes('FILLED'))) {
-            sellOrderId = `kalshi-ioc-${iocSell.exchangeOrderId}-${suffix}`;
-            exchangeStatus = `${iocSell.statusLabel}_REDUCE_ONLY_IOC_${filledIoc || cleanContracts}`;
-            actualOrderStatus = 'FILLED';
-            // Lock this 15m contract ticker permanently for the remainder of its 15m window so it can never be re-entered or flipped
-            traded15mContractTickersSet.add(params.ticker.trim().toUpperCase());
+          kalshiRestingTpPlacedByTicker.delete(params.ticker);
+          if (!unwindResult.ok) {
+            exchangeStatus = `PRE_EXIT_SWEEP_HELD_${unwindResult.exitStrategy}`;
           }
         } catch {
           // Keep resting take-profit sell order tracked in local OCO ledger
@@ -13119,7 +13159,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     });
   }
 
-  // Fix 3(b) — Fetch live cash/buying power and reject the order if it exceeds available cash BEFORE any venue call
+  // Fix 3(b) — Fetch live cash/buying power and reject the order if it exceeds available cash OR 3% settled-cash cap BEFORE any venue call
   if (!skipLiveCashSync && process.env.QUANTPULSE_TEST_MODE !== 'true') {
     if (feature.venue === 'PREDICTION_MARKET') {
       await syncLiveKalshiPortfolio(0).catch(() => {});
@@ -13136,8 +13176,14 @@ app.post('/api/agents/execute-trade', async (req, res) => {
           Number(livePublicBuyingPower ?? livePublicCashBalance ?? 0)
         );
 
-  if (availableLiveCashUsd <= 0 || orderNotionalUsd > availableLiveCashUsd) {
-    const reason = `Order rejected: requested notional $${orderNotionalUsd.toFixed(2)} on ${feature.symbol} exceeds live available cash/buying power of $${availableLiveCashUsd.toFixed(2)}.`;
+  // Post-Mortem Rule 1: Enforce settled-cash 3% cap (settledCash * 0.03) when cash is positive
+  const settledCash3PctCapUsd = Number((availableLiveCashUsd * 0.03).toFixed(2));
+  if (
+    availableLiveCashUsd <= 0 ||
+    orderNotionalUsd > availableLiveCashUsd ||
+    (Boolean(req.body?.enforceSettledCash3PctCap) && orderNotionalUsd > settledCash3PctCapUsd)
+  ) {
+    const reason = `Order rejected: requested notional $${orderNotionalUsd.toFixed(2)} on ${feature.symbol} exceeds live settled cash limit (available=$${availableLiveCashUsd.toFixed(2)}, 3% vault cap=$${settledCash3PctCapUsd.toFixed(2)}).`;
     const rejection: ExecuteTradeRejectionRecord = {
       id: `rej-cash-${orderRejectionLog.length + 1}`,
       timestamp: new Date().toISOString(),
@@ -13177,6 +13223,27 @@ app.post('/api/agents/execute-trade', async (req, res) => {
       requestedNotionalUsd: orderNotionalUsd,
       availableCashUsd: availableLiveCashUsd,
     });
+  }
+
+  // Post-Mortem Rule 2: Deterministic idempotency bucket lock when enforceVaultCooldown is active
+  if (req.body?.enforceVaultCooldown) {
+    const rawTf = String(agent.timeframe || '15m').toLowerCase();
+    const tf: '5m' | '15m' | '1h' =
+      rawTf === '5m' ? '5m' : rawTf === '1h' ? '1h' : '15m';
+    const vaultLock = executionVault.acquireIdempotencyLock({
+      symbol: feature.symbol,
+      side: feature.venue === 'PREDICTION_MARKET' ? 'BUY_YES' : 'BUY',
+      strategyId: agent.indicatorStrategyId || CHAMPION_CONFIG.active_strategy.id,
+      timeframe: tf,
+    });
+    if (!vaultLock.allowed) {
+      return res.status(409).json({
+        error: `Duplicate order blocked within ${vaultLock.cooldownSec}s cooldown bucket (remaining ${vaultLock.remainingCooldownSec}s).`,
+        rejected: true,
+        code: 'VAULT_IDEMPOTENCY_COOLDOWN_ACTIVE',
+        lock: vaultLock,
+      });
+    }
   }
 
   const resolvedSide =
@@ -20983,4 +21050,9 @@ export {
   evaluateRealTimeRoiAndGlobalProfitLock,
   runCloudAutonomousDaemonTick,
   computePortfolioSummary,
+  executionVault,
+  evaluateRegimeAndLiquidity,
+  evaluateChampionExitSignal,
+  computeLiquidityHealthScore,
+  CHAMPION_CONFIG,
 };
