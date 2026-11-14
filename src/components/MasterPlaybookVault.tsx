@@ -26,6 +26,14 @@ import type {
   StrategyTournamentEntry,
   ZeroHoldLeadLagSystemState,
 } from '../types/quant';
+import {
+  LEAD_LAG_ASK_BAND_TEXT,
+  LEAD_LAG_ASK_RANGE_TEXT,
+  LEAD_LAG_BLEND_PCT_TEXT,
+  LEAD_LAG_MIN_EDGE_TEXT,
+  LEAD_LAG_PARAMS,
+  LEAD_LAG_WINDOW_TEXT,
+} from '../config/strategyParams';
 
 interface MasterPlaybookVaultProps {
   features: MarketFeatureVector[];
@@ -51,13 +59,13 @@ const UPGRADED_PROMPTS = [
     agentName: '1. BTC Lead-Lag Sniper Agent [TWEAKED V3 · PAPER SHADOW CALIBRATION]',
     targetMarket: 'KXBTC15M · BTC Up or Down - 15 minutes? (Paper Mode while #1 CLOB Micro-Scalper Runs Live)',
     leakDiagnosis:
-      'V1 Lead-Lag lost on live fills because it allowed top-heavy asks up to $0.82 (risking 4.5:1 for $0.18 max), entered during final <4.5m terminal gamma whipsaws, and weighted uncalibrated Black-Scholes N(d2) at 70% with only +$0.04 min edge.',
+      'V1 Lead-Lag lost on live fills because it allowed top-heavy asks (risking 4.5:1 for $0.18 max), entered during final <4.5m terminal gamma whipsaws, and weighted uncalibrated Black-Scholes N(d2) at 70% with low min edge.',
     promptText: `TWEAKED V3 LEAD-LAG PAPER CALIBRATION & LIVE #1 PROMOTION RULES:
 1. Push Lead-Lag to Paper Shadow Mode ($0 Live Risk): Route all BTC_LEAD_LAG_SNIPER signals strictly to leadLagPaperLedger while #1 HFT_15M_CLOB_MICRO_SCALPER executes live Kalshi v2 BUY + paired +10¢ Take-Profit SELL orders.
-2. Tightened Asymmetry Sweet-Spot [$0.52, $0.74]: Narrowed from [$0.45, $0.82] to eliminate top-heavy $0.79–$0.82 negative-skew entries and <$0.50 theta bleed.
-3. Raised Minimum Net Edge >= +$0.065 (650 bps): Increased from +$0.04 (400 bps) to absorb spread & jump-diffusion variance.
-4. Time-to-Expiry Theta/Gamma Window [4.5m, 13.5m]: Blocks entries inside the final 4.5 minutes (terminal strike pin whip) and first 90 seconds.
-5. Re-Weighted 40/60 Jump-Damped Ensemble + Post-Only Maker Bid: Shifts blend to 40% Jump-Damped N(d2) (1.18x vol cushion) + 60% DuckDB Ridge Logistic Meta-Model and quotes Post-Only Maker bids (BestAsk - $0.01, $0.00 maker fee).`,
+2. Tightened Asymmetry Sweet-Spot ${LEAD_LAG_ASK_BAND_TEXT}: Narrowed from legacy V1 band to eliminate top-heavy negative-skew entries and <$0.50 theta bleed.
+3. Raised Minimum Net Edge >= ${LEAD_LAG_MIN_EDGE_TEXT} (${Math.round(LEAD_LAG_PARAMS.minNetEdgeDollars * 10000)} bps): Increased to absorb spread & jump-diffusion variance.
+4. Time-to-Expiry Theta/Gamma Window ${LEAD_LAG_WINDOW_TEXT}: Blocks entries inside the final ${LEAD_LAG_PARAMS.timeWindowMinutes[0]} minutes (terminal strike pin whip) and first 90 seconds.
+5. Re-Weighted ${LEAD_LAG_BLEND_PCT_TEXT} Jump-Damped Ensemble + Post-Only Maker Bid: Shifts blend to ${Math.round(LEAD_LAG_PARAMS.nd2Weight * 100)}% Jump-Damped N(d2) (${LEAD_LAG_PARAMS.volCushionNearExpiryMult}x vol cushion) + ${Math.round(LEAD_LAG_PARAMS.mlWeight * 100)}% DuckDB Ridge Logistic Meta-Model and quotes Post-Only Maker bids (BestAsk - $0.01, $0.00 maker fee).`,
   },
   {
     id: 'prompt-risk-trim',
@@ -88,7 +96,7 @@ const UPGRADED_PROMPTS = [
       'Trading spot ETH & 15m ETH contracts using 15m RSI(14) and Volume Ratio with trailing stop protection (stopped out cleanly at $2,342.50 on Oct 18).',
     promptText: `UPGRADED ETH 15M MOMENTUM & EXIT RULES:
 1. Require Volume Ratio (RVOL) >= 1.25x and 9/21 Micro-EMA bullish alignment before entering 15m ETH momentum breakouts.
-2. For 15-minute Kalshi ETH binary contracts (KXETH15M), enforce the identical [$0.52, $0.74] Contract Price Band and +$0.065 net-of-fee edge gate.`,
+2. For 15-minute Kalshi ETH binary contracts (KXETH15M), enforce the identical ${LEAD_LAG_ASK_BAND_TEXT} Contract Price Band and ${LEAD_LAG_MIN_EDGE_TEXT} net-of-fee edge gate.`,
   },
 ];
 
@@ -111,7 +119,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
   const [annualVolInput, setAnnualVolInput] = useState<number>(0.55);
   const [feeInput, setFeeInput] = useState<number>(0.02);
   const [activePresetLabel, setActivePresetLabel] = useState<string>(
-    'Tweaked V3 Paper Shadow Preset: $0.62 Ask in [$0.52, $0.74] · T=9.5m · 40/60 Ensemble -> PAPER APPROVED'
+    `Tweaked V3 Paper Shadow Preset: $0.62 Ask in ${LEAD_LAG_ASK_BAND_TEXT} · T=9.5m · ${LEAD_LAG_BLEND_PCT_TEXT} Ensemble -> PAPER APPROVED`
   );
 
   const [leadLagResult, setLeadLagResult] = useState<LeadLagSignalEvaluation | null>(null);
@@ -333,7 +341,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
       setYesAskInput(p.yesAsk);
       setNoAskInput(p.noAsk);
       setActivePresetLabel(
-        'Old V1 Losing Trade ($0.79 Ask @ T=3.2m -> BLOCKED by V3 [$0.52, $0.74] Ask & [4.5m, 13.5m] Gamma Guard)'
+        `Old V1 Losing Trade ($0.79 Ask @ T=3.2m -> BLOCKED by V3 ${LEAD_LAG_ASK_BAND_TEXT} Ask & ${LEAD_LAG_WINDOW_TEXT} Gamma Guard)`
       );
       evaluateSniper(p, false);
     } else if (preset === 'TEST_2_APPROVED') {
@@ -350,7 +358,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
       setYesAskInput(p.yesAsk);
       setNoAskInput(p.noAsk);
       setActivePresetLabel(
-        'Tweaked V3 Paper Shadow Surge ($0.62 Ask in [$0.52, $0.74] · T=9.5m -> PAPER APPROVED)'
+        `Tweaked V3 Paper Shadow Surge ($0.62 Ask in ${LEAD_LAG_ASK_BAND_TEXT} · T=9.5m -> PAPER APPROVED)`
       );
       evaluateSniper(p, false);
     } else if (preset === 'LIVE_KXBTC15M' && btc15mFeature) {
@@ -1188,14 +1196,14 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-5 gap-2.5 bg-slate-950/90 border border-amber-500/25 rounded-xl p-3.5 text-xs font-mono">
             <div className="bg-slate-900/90 border border-slate-800 rounded-lg p-2.5">
               <div className="text-[10px] text-slate-400 uppercase">Tweak 1 · Ask Band</div>
-              <div className="text-rose-400 line-through text-[11px] mt-0.5">Old V1: [$0.45, $0.82]</div>
-              <div className="text-emerald-300 font-bold mt-0.5">V3 Paper: [$0.52, $0.74]</div>
+              <div className="text-rose-400 line-through text-[11px] mt-0.5">Old V1: Wide Legacy Band</div>
+              <div className="text-emerald-300 font-bold mt-0.5">V3 Paper: {LEAD_LAG_ASK_BAND_TEXT}</div>
               <div className="text-[10px] text-slate-500 mt-0.5">Eliminates 4.5:1 top-heavy skew</div>
             </div>
             <div className="bg-slate-900/90 border border-slate-800 rounded-lg p-2.5">
               <div className="text-[10px] text-slate-400 uppercase">Tweak 2 · Min Net Edge</div>
-              <div className="text-rose-400 line-through text-[11px] mt-0.5">Old V1: +$0.040 (400 bps)</div>
-              <div className="text-emerald-300 font-bold mt-0.5">V3 Paper: +$0.065 (650 bps)</div>
+              <div className="text-rose-400 line-through text-[11px] mt-0.5">Old V1: Legacy Edge</div>
+              <div className="text-emerald-300 font-bold mt-0.5">V3 Paper: {LEAD_LAG_MIN_EDGE_TEXT} ({Math.round(LEAD_LAG_PARAMS.minNetEdgeDollars * 10000)} bps)</div>
               <div className="text-[10px] text-slate-500 mt-0.5">+62.5% stricter EV threshold</div>
             </div>
             <div className="bg-slate-900/90 border border-slate-800 rounded-lg p-2.5">
@@ -1292,7 +1300,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
                 </div>
                 <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-2.5">
                   <label className="block text-[10px] font-mono uppercase text-slate-400">
-                    Kalshi YES Ask [$0.52–$0.74]
+                    Kalshi YES Ask [{LEAD_LAG_ASK_RANGE_TEXT}]
                   </label>
                   <input
                     type="number"
@@ -1306,7 +1314,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
                 </div>
                 <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-2.5">
                   <label className="block text-[10px] font-mono uppercase text-slate-400">
-                    Kalshi NO Ask [$0.52–$0.74]
+                    Kalshi NO Ask [{LEAD_LAG_ASK_RANGE_TEXT}]
                   </label>
                   <input
                     type="number"
@@ -1429,10 +1437,10 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
                         </div>
                       </div>
                       <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5">
-                        <div className="text-[10px] text-slate-400">NET EDGE (MIN +$0.065)</div>
+                        <div className="text-[10px] text-slate-400">NET EDGE (MIN {LEAD_LAG_MIN_EDGE_TEXT})</div>
                         <div
                           className={`text-base font-bold mt-0.5 ${
-                            (leadLagResult.netEdgePerContract ?? 0) >= 0.065
+                            (leadLagResult.netEdgePerContract ?? 0) >= LEAD_LAG_PARAMS.minNetEdgeDollars
                               ? 'text-emerald-400'
                               : 'text-rose-400'
                           }`}
@@ -1442,7 +1450,7 @@ export const MasterPlaybookVault: React.FC<MasterPlaybookVaultProps> = ({
                         </div>
                       </div>
                       <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5">
-                        <div className="text-[10px] text-slate-400">SWEET-SPOT GATE [$0.52, $0.74]</div>
+                        <div className="text-[10px] text-slate-400">SWEET-SPOT GATE {LEAD_LAG_ASK_BAND_TEXT}</div>
                         <div
                           className={`text-xs font-bold mt-1 ${
                             leadLagResult.feeGatePassed ? 'text-emerald-400' : 'text-rose-400'

@@ -1,0 +1,19 @@
+{
+  "btcLeadLagSniper": {
+    "id": "BTC_LEAD_LAG_SNIPER",
+    "askGateMin": 0.52,
+    "askGateMax": 0.74,
+    "minNetEdgeDollars": 0.065,
+    "timeWindowMinutes": [4.5, 13.5],
+    "volCushionNearExpiryThresholdMins": 6.0,
+    "volCushionNearExpiryMult": 1.18,
+    "volCushionStandardMult": 1.06,
+    "nd2Weight": 0.4,
+    "mlWeight": 0.6,
+    "maxContracts": 22,
+    "maxRiskUsd": 15.0,
+    "feePerContract": 0.02,
+    "stopAtr": 0.9,
+    "tpAtr": 2.5
+  }
+}

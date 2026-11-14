@@ -28,6 +28,7 @@ import type {
   OrchestratorCycleTelemetry,
   PortfolioSummary,
 } from '../types/quant.ts';
+import { LEAD_LAG_ASK_BAND_TEXT, LEAD_LAG_ASK_RANGE_TEXT } from '../config/strategyParams.ts';
 
 interface KalshiMcpHubProps {
   portfolio: PortfolioSummary | null;
@@ -73,7 +74,7 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
   );
   const [dlqFailedToolArg, setDlqFailedToolArg] = useState<string>('execute_kalshi_or_public_order');
   const [dlqErrorReasonArg, setDlqErrorReasonArg] = useState<string>(
-    'Blocked by Fee Gate: Ask $0.27 outside [$0.45, $0.82]'
+    `Blocked by Fee Gate: Ask $0.27 outside ${LEAD_LAG_ASK_BAND_TEXT}`
   );
   const [isInvoking, setIsInvoking] = useState<boolean>(false);
   const [lastToolOutput, setLastToolOutput] = useState<Record<string, any> | null>(null);
@@ -1818,7 +1819,7 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
                     </div>
                     <div>
                       <label className="block text-[10px] font-mono uppercase text-slate-400 mb-1">
-                        Ask Price ($0.45–$0.82)
+                        Ask Price ({LEAD_LAG_ASK_RANGE_TEXT})
                       </label>
                       <input
                         type="number"
@@ -2051,7 +2052,7 @@ export const KalshiMcpHub: React.FC<KalshiMcpHubProps> = ({
                           },
                           {
                             name: 'btc_lead_lag_sniper_gate',
-                            description: 'Black-Scholes N(d2) & [$0.45, $0.82] fee-gate prompt',
+                            description: `Black-Scholes N(d2) & ${LEAD_LAG_ASK_BAND_TEXT} fee-gate prompt`,
                             decoratorSignature: '@mcp.prompt() async def btc_lead_lag_sniper_gate(...)',
                             arguments: [],
                             templatePreview: '',

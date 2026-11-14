@@ -106,6 +106,16 @@ import {
   validateServerSideCapitalAllocation,
   writeFirestoreKillSwitchFlag,
 } from './src/server/phase1Security.ts';
+import {
+  LEAD_LAG_ASK_BAND_TEXT,
+  LEAD_LAG_ASK_RANGE_TEXT,
+  LEAD_LAG_BLEND_PCT_TEXT,
+  LEAD_LAG_CATALOG_FORMULA,
+  LEAD_LAG_CATALOG_LABEL,
+  LEAD_LAG_MIN_EDGE_TEXT,
+  LEAD_LAG_PARAMS,
+  LEAD_LAG_WINDOW_TEXT,
+} from './src/config/strategyParams.ts';
 
 dotenv.config();
 
@@ -172,9 +182,9 @@ let activeMlMetaModel: MlMetaModelState = {
   log_loss_calibrated: 0.4215,
   empirical_win_rate: 0.7292,
   avg_realized_pnl_bps: 54.8,
-  recommended_min_net_edge: 0.042,
+  recommended_min_net_edge: LEAD_LAG_PARAMS.minNetEdgeDollars,
   recommended_atr_stop_mult: 1.35,
-  recommended_ask_band: [0.46, 0.80],
+  recommended_ask_band: [LEAD_LAG_PARAMS.askGateMin, LEAD_LAG_PARAMS.askGateMax],
   weights: {
     intercept: -1.3842,
     nd2_fair_prob: 2.864,
@@ -327,7 +337,10 @@ function loadMlStoreFromDiskOrInit(): void {
             log_loss_calibrated: safeFiniteNum(raw.activeMetaModel.log_loss_calibrated, 0.4215),
             empirical_win_rate: safeFiniteNum(raw.activeMetaModel.empirical_win_rate, 0.7292),
             avg_realized_pnl_bps: safeFiniteNum(raw.activeMetaModel.avg_realized_pnl_bps, 54.8),
-            recommended_min_net_edge: safeFiniteNum(raw.activeMetaModel.recommended_min_net_edge, 0.042),
+            recommended_min_net_edge: safeFiniteNum(
+              raw.activeMetaModel.recommended_min_net_edge,
+              LEAD_LAG_PARAMS.minNetEdgeDollars
+            ),
             recommended_atr_stop_mult: safeFiniteNum(raw.activeMetaModel.recommended_atr_stop_mult, 1.35),
           };
         } else {
@@ -432,14 +445,14 @@ const leadLagPaperLedger: LeadLagPaperTradeEntry[] = [
     paperRiskUsd: 12.2,
     expectedPaperProfitUsd: 2.0,
     status: 'PAPER_TP_HIT',
-    rationale: '[PAPER SHADOW V3] Post-Only Maker Bid $0.61 in [$0.52, $0.74] sweet spot · 40/60 N(d2)/ML Ensemble 69.1% · +$0.081 net edge · +$2.00 paper profit locked.',
+    rationale: `[PAPER SHADOW V3] Post-Only Maker Bid $0.61 in ${LEAD_LAG_ASK_BAND_TEXT} sweet spot · ${LEAD_LAG_BLEND_PCT_TEXT} N(d2)/ML Ensemble 69.1% · +$0.081 net edge · +$2.00 paper profit locked.`,
   },
   {
     paperTradeId: 'paper-ll-v3-903',
     ts: new Date(Date.now() - 1000 * 60 * 44).toISOString(),
     symbol: 'KXBTC15M',
     side: 'BUY_NO',
-    contracts: 22,
+    contracts: LEAD_LAG_PARAMS.maxContracts,
     makerLimitBidPrice: 0.58,
     targetTakeProfitSellPrice: 0.68,
     coinbaseSpot: 84180.0,
@@ -452,7 +465,7 @@ const leadLagPaperLedger: LeadLagPaperTradeEntry[] = [
     paperRiskUsd: 12.76,
     expectedPaperProfitUsd: 2.2,
     status: 'PAPER_SETTLED_WIN',
-    rationale: '[PAPER SHADOW V3] Post-Only Maker NO Bid $0.58 (T=8.4m in [4.5m, 13.5m] window) · FairNo 69.6% · +$0.096 net edge · Settled +$2.20 paper gain.',
+    rationale: `[PAPER SHADOW V3] Post-Only Maker NO Bid $0.58 (T=8.4m in ${LEAD_LAG_WINDOW_TEXT} window) · FairNo 69.6% · +$0.096 net edge · Settled +$2.20 paper gain.`,
   },
   {
     paperTradeId: 'paper-ll-v3-902',
@@ -461,7 +474,7 @@ const leadLagPaperLedger: LeadLagPaperTradeEntry[] = [
     side: 'BUY_YES',
     contracts: 18,
     makerLimitBidPrice: 0.64,
-    targetTakeProfitSellPrice: 0.74,
+    targetTakeProfitSellPrice: 0.70,
     coinbaseSpot: 84640.5,
     strike: 84505.0,
     minutesLeft: 10.6,
@@ -472,17 +485,11 @@ const leadLagPaperLedger: LeadLagPaperTradeEntry[] = [
     paperRiskUsd: 11.52,
     expectedPaperProfitUsd: 1.8,
     status: 'PAPER_RESTING_MAKER',
-    rationale: '[PAPER SHADOW V3] Post-Only Maker YES Bid $0.64 · Jump-damped Vol 60.5% · 40/60 Ensemble 72.5% · +$0.085 edge.',
+    rationale: `[PAPER SHADOW V3] Post-Only Maker YES Bid $0.64 · Jump-damped Vol 60.5% · ${LEAD_LAG_BLEND_PCT_TEXT} Ensemble 72.5% · +$0.085 edge.`,
   },
 ];
 
-// Public.com Master Quant Playbook: Tweaked V3 BTC Lead-Lag Sniper (Pushed to Paper Shadow Calibration Mode)
-// Tweaks vs Losing V1:
-// 1. Ask Band tightened from [$0.45, $0.82] -> [$0.52, $0.74] (eliminates top-heavy $0.79-$0.82 negative skew & <$0.50 theta bleed)
-// 2. Min Net Edge raised from +$0.04 (400 bps) -> +$0.065 (650 bps)
-// 3. Time-to-Expiry Window Guard: minutesLeft in [4.5, 13.5] (blocks terminal <4.5m gamma whip & first 90s noise)
-// 4. Ensemble re-weighted from 70% N(d2)/30% ML -> 40% Jump-Damped N(d2) + 60% DuckDB Ridge Logistic Meta-Model
-// 5. Post-Only Maker Limit Bid (BestAsk - $0.01, $0.00 Maker Fee) routed strictly to Paper Shadow Ledger
+// Public.com Master Quant Playbook: Tweaked V3 BTC Lead-Lag Sniper (Single Source of Truth via strategy_params.json)
 function evaluateBtcLeadLagSniper(
   coinbaseSpot: number,
   strike: number,
@@ -490,7 +497,7 @@ function evaluateBtcLeadLagSniper(
   yesAsk: number,
   noAsk: number,
   annualVol = 0.55,
-  feePerContract = 0.02,
+  feePerContract = LEAD_LAG_PARAMS.feePerContract,
   regimeContext?: {
     symbol?: string;
     atrPct?: number;
@@ -504,8 +511,10 @@ function evaluateBtcLeadLagSniper(
   const safeSpot = Math.max(0.0001, coinbaseSpot);
   const safeStrike = Math.max(0.0001, strike);
   const tYears = Math.max(minutesLeft, 0.1) / (365.25 * 24 * 60);
-  // Tweak #4a: Jump-diffusion volatility cushion (1.18x when T < 6m, 1.06x otherwise) to prevent N(d2) overconfidence
-  const volCushionMult = minutesLeft < 6.0 ? 1.18 : 1.06;
+  const volCushionMult =
+    minutesLeft < LEAD_LAG_PARAMS.volCushionNearExpiryThresholdMins
+      ? LEAD_LAG_PARAMS.volCushionNearExpiryMult
+      : LEAD_LAG_PARAMS.volCushionStandardMult;
   const effectiveJumpAdjustedVol = Number((annualVol * volCushionMult).toFixed(4));
   const sigmaT = Math.max(0.0001, effectiveJumpAdjustedVol * Math.sqrt(tYears));
   const d2 =
@@ -531,8 +540,9 @@ function evaluateBtcLeadLagSniper(
     minutes_left: minutesLeft,
   });
 
-  // Tweak #4b: Re-weight blend from 70% N(d2)/30% ML -> 40% Jump-Damped N(d2) + 60% DuckDB Calibrated ML
-  const ensembleProb = Number((0.40 * nd2FairProb + 0.60 * mlCalibratedProb).toFixed(4));
+  const ensembleProb = Number(
+    (LEAD_LAG_PARAMS.nd2Weight * nd2FairProb + LEAD_LAG_PARAMS.mlWeight * mlCalibratedProb).toFixed(4)
+  );
   const fairYes = activeMlMetaModel.is_trained ? ensembleProb : nd2FairProb;
   const fairNo = Number((1.0 - fairYes).toFixed(4));
 
@@ -544,25 +554,23 @@ function evaluateBtcLeadLagSniper(
   const makerLimitBid = Number(Math.max(0.05, bestAsk - 0.01).toFixed(2));
   const bestEdge = Number(Math.max(yesEdge, noEdge).toFixed(4));
 
-  // Tweak #1: Tightened Asymmetry Sweet-Spot Ask Gate [$0.52, $0.74] (was [$0.45, $0.82])
-  const feeGatePassed = bestAsk >= 0.52 && bestAsk <= 0.74;
-  // Tweak #2: Raised Minimum Net Edge to +$0.065 / 650 bps (was +$0.040 / 400 bps)
-  const edgeGatePassed = bestEdge >= 0.065;
-  // Tweak #3: Time-to-Expiry Theta & Gamma Window Guard [4.5m, 13.5m]
-  const timeWindowGatePassed = minutesLeft >= 4.5 && minutesLeft <= 13.5;
+  const [winMin, winMax] = LEAD_LAG_PARAMS.timeWindowMinutes;
+  const feeGatePassed =
+    bestAsk >= LEAD_LAG_PARAMS.askGateMin && bestAsk <= LEAD_LAG_PARAMS.askGateMax;
+  const edgeGatePassed = bestEdge >= LEAD_LAG_PARAMS.minNetEdgeDollars;
+  const timeWindowGatePassed = minutesLeft >= winMin && minutesLeft <= winMax;
 
   const sniperAction: 'EXECUTE' | 'HOLD' =
     feeGatePassed && edgeGatePassed && timeWindowGatePassed ? 'EXECUTE' : 'HOLD';
   const gateBlockedReason = !feeGatePassed
-    ? `TWEAKED_ASK_GATE_OUTSIDE_0.52_0.74 (ask=$${bestAsk.toFixed(2)})`
+    ? `TWEAKED_ASK_GATE_OUTSIDE_${LEAD_LAG_PARAMS.askGateMin.toFixed(2)}_${LEAD_LAG_PARAMS.askGateMax.toFixed(2)} (ask=$${bestAsk.toFixed(2)})`
     : !timeWindowGatePassed
-    ? `TIME_WINDOW_GUARD_OUTSIDE_4.5M_13.5M (T=${minutesLeft.toFixed(1)}m)`
+    ? `TIME_WINDOW_GUARD_OUTSIDE_${winMin.toFixed(1)}M_${winMax.toFixed(1)}M (T=${minutesLeft.toFixed(1)}m)`
     : !edgeGatePassed
-    ? `NET_EDGE_BELOW_0.065_MIN (edge=$${bestEdge.toFixed(3)})`
+    ? `NET_EDGE_BELOW_${LEAD_LAG_PARAMS.minNetEdgeDollars.toFixed(3)}_MIN (edge=$${bestEdge.toFixed(3)})`
     : 'PAPER_SHADOW_APPROVED_V3';
 
-  const tweakedParamsSummary =
-    'V3 Tweaked Paper Mode: Ask [$0.52, $0.74] · Min Edge >= +$0.065 · Window [4.5m, 13.5m] · 40% Jump-N(d2) + 60% DuckDB ML · Post-Only Maker Bid';
+  const tweakedParamsSummary = `V3 Tweaked Paper Mode: Ask ${LEAD_LAG_ASK_BAND_TEXT} · Min Edge >= ${LEAD_LAG_MIN_EDGE_TEXT} · Window ${LEAD_LAG_WINDOW_TEXT} · ${Math.round(LEAD_LAG_PARAMS.nd2Weight * 100)}% Jump-N(d2) + ${Math.round(LEAD_LAG_PARAMS.mlWeight * 100)}% DuckDB ML · Post-Only Maker Bid`;
 
   if (!regimeContext?.skipLedgerLog) {
     recordMlTelemetryRow({
@@ -590,10 +598,10 @@ function evaluateBtcLeadLagSniper(
 
   if (!feeGatePassed || !timeWindowGatePassed || !edgeGatePassed) {
     const blockExplain = !feeGatePassed
-      ? `Blocked by V3 Tightened Ask Gate: Ask $${bestAsk.toFixed(2)} outside [$0.52, $0.74] sweet spot`
+      ? `Blocked by V3 Tightened Ask Gate: Ask $${bestAsk.toFixed(2)} outside ${LEAD_LAG_ASK_BAND_TEXT} sweet spot`
       : !timeWindowGatePassed
-      ? `Blocked by V3 Theta/Gamma Window Guard: T=${minutesLeft.toFixed(1)}m outside [4.5m, 13.5m]`
-      : `Blocked by V3 Raised Edge Gate: Net Edge +$${bestEdge.toFixed(3)} < +$0.065 min`;
+      ? `Blocked by V3 Theta/Gamma Window Guard: T=${minutesLeft.toFixed(1)}m outside ${LEAD_LAG_WINDOW_TEXT}`
+      : `Blocked by V3 Raised Edge Gate: Net Edge +$${bestEdge.toFixed(3)} < ${LEAD_LAG_MIN_EDGE_TEXT} min`;
 
     return {
       ts: new Date().toISOString(),
@@ -629,11 +637,14 @@ function evaluateBtcLeadLagSniper(
       edgeGatePassed,
       timeWindowGatePassed,
       tweakedParamsSummary,
-      rationale: `[${leadLagExecutionMode}] ${blockExplain} (40/60 Ensemble=${(ensembleProb * 100).toFixed(1)}%, Jump-N(d2)=${(nd2FairProb * 100).toFixed(1)}%, ML=${(mlCalibratedProb * 100).toFixed(1)}%)`,
+      rationale: `[${leadLagExecutionMode}] ${blockExplain} (${LEAD_LAG_BLEND_PCT_TEXT} Ensemble=${(ensembleProb * 100).toFixed(1)}%, Jump-N(d2)=${(nd2FairProb * 100).toFixed(1)}%, ML=${(mlCalibratedProb * 100).toFixed(1)}%)`,
     };
   }
 
-  const contracts = Math.min(22, Math.floor(15.0 / makerLimitBid));
+  const contracts = Math.min(
+    LEAD_LAG_PARAMS.maxContracts,
+    Math.floor(LEAD_LAG_PARAMS.maxRiskUsd / makerLimitBid)
+  );
   const totalRiskUsd = Number((contracts * makerLimitBid).toFixed(2));
 
   if (!regimeContext?.skipLedgerLog) {
@@ -698,7 +709,7 @@ function evaluateBtcLeadLagSniper(
     edgeGatePassed: true,
     timeWindowGatePassed: true,
     tweakedParamsSummary,
-    rationale: `[PAPER SHADOW V3] Approved ${bestSide} @ Maker Bid $${makerLimitBid.toFixed(2)} (Ask $${bestAsk.toFixed(2)} in [$0.52, $0.74], T=${minutesLeft.toFixed(1)}m): 40/60 Ensemble ${(ensembleProb * 100).toFixed(1)}%, Edge +$${bestEdge.toFixed(3)} (${contracts} paper contracts · $0 live risk)`,
+    rationale: `[PAPER SHADOW V3] Approved ${bestSide} @ Maker Bid $${makerLimitBid.toFixed(2)} (Ask $${bestAsk.toFixed(2)} in ${LEAD_LAG_ASK_BAND_TEXT}, T=${minutesLeft.toFixed(1)}m): ${LEAD_LAG_BLEND_PCT_TEXT} Ensemble ${(ensembleProb * 100).toFixed(1)}%, Edge +$${bestEdge.toFixed(3)} (${contracts} paper contracts · $0 live risk)`,
   };
 }
 
@@ -1913,7 +1924,7 @@ const autonomousAgents: AutonomousAgent[] = [
   },
   {
     id: 'agent-paper-btc-lead-lag',
-    name: '[PAPER SHADOW CALIBRATION V3] BTC Lead-Lag Sniper (Tightened [$0.44, $0.58] · +$0.035 Edge · Self-Learning)',
+    name: `[PAPER SHADOW CALIBRATION V3] BTC Lead-Lag Sniper (Tightened ${LEAD_LAG_ASK_BAND_TEXT} · ${LEAD_LAG_MIN_EDGE_TEXT} Edge · ${LEAD_LAG_BLEND_PCT_TEXT} ML)`,
     archetype: 'SHORT_AND_FAST',
     venue: 'PREDICTION_MARKET',
     targetSymbol: 'KXBTC15M',
@@ -1922,7 +1933,7 @@ const autonomousAgents: AutonomousAgent[] = [
     timeframe: '15m',
     status: 'PAUSED',
     indicatorStrategyId: 'BTC_LEAD_LAG_SNIPER',
-    indicatorStrategyLabel: '[PAPER MODE V3] Coinbase BTC-USD Lead-Lag Sniper ($0.44–$0.58 Gate + +$0.035 Edge + 5.5m–12.0m Window)',
+    indicatorStrategyLabel: LEAD_LAG_CATALOG_LABEL,
     subscribedFeeds: [
       'feed-public-bars-v2',
       'feed-public-quotes-l1',
@@ -1934,15 +1945,15 @@ const autonomousAgents: AutonomousAgent[] = [
       requiredRegimes: ['TRENDING_BULL', 'LOW_VOLATILITY_COMPRESSION'],
       rsiRange: [38, 66],
       minOrderbookImbalance: 0.18,
-      maAlignment: '[PAPER SHADOW CALIBRATION — $0 LIVE RISK] Ask in [$0.44, $0.58] + Net Edge >= +$0.035 + Window [5.5m, 12.0m] + Post-Only Maker Bid',
+      maAlignment: `[PAPER SHADOW CALIBRATION — $0 LIVE RISK] ${LEAD_LAG_CATALOG_FORMULA} + Post-Only Maker Bid`,
     },
     riskGovernance: {
       maxDrawdownLimitPct: 1.2,
       currentDrawdownPct: 0.0,
       atrSpikeKillMultiplier: 2.4,
-      stopLossAtrMultiple: 0.9,
-      takeProfitAtrMultiple: 2.5,
-      maxPositionNotionalUsd: 1.16,
+      stopLossAtrMultiple: LEAD_LAG_PARAMS.stopAtr,
+      takeProfitAtrMultiple: LEAD_LAG_PARAMS.tpAtr,
+      maxPositionNotionalUsd: LEAD_LAG_PARAMS.maxRiskUsd,
     },
     metrics: {
       allocatedCapitalUsd: 0,
@@ -1954,10 +1965,10 @@ const autonomousAgents: AutonomousAgent[] = [
     },
     selfLearningState: {
       brierScore: 0.148,
-      netFeeAdjustedEdgeCents: 6.5,
+      netFeeAdjustedEdgeCents: Number((LEAD_LAG_PARAMS.minNetEdgeDollars * 100).toFixed(1)),
       settledSampleCount: 10,
-      autoTunedMinEdgeCents: 3.5,
-      autoTunedMaxContracts: 2,
+      autoTunedMinEdgeCents: Number((LEAD_LAG_PARAMS.minNetEdgeDollars * 100).toFixed(1)),
+      autoTunedMaxContracts: LEAD_LAG_PARAMS.maxContracts,
       banditStatus: 'EXPLORATION_CAP',
       lastCalibratedAt: new Date().toISOString(),
     },
@@ -2816,6 +2827,66 @@ let liveKalshiRecentFills: KalshiFill[] = [];
 const kalshiMarketTitleCache = new Map<string, { title: string; yesPrice: number; yesAskPrice?: number }>();
 let lastRealBarsSyncMs = 0;
 
+// Fix 3, 5, 6 & 7 State Stores & Telemetry Counters
+export let venueOrderSubmissionCount = 0;
+export function resetVenueOrderSubmissionCount(): void {
+  venueOrderSubmissionCount = 0;
+}
+export function setTestLiveCashBalances(params: {
+  kalshiCashUsd?: number;
+  publicCashUsd?: number;
+  publicBuyingPowerUsd?: number;
+}): void {
+  if (typeof params.kalshiCashUsd === 'number') {
+    liveKalshiCashBalanceUsd = params.kalshiCashUsd;
+  }
+  if (typeof params.publicCashUsd === 'number') {
+    livePublicCashBalance = params.publicCashUsd;
+  }
+  if (typeof params.publicBuyingPowerUsd === 'number') {
+    livePublicBuyingPower = params.publicBuyingPowerUsd;
+  }
+}
+
+export interface ExecuteTradeRejectionRecord {
+  id: string;
+  timestamp: string;
+  agentId: string;
+  symbol: string;
+  venue: string;
+  code: 'POSITION_CAP_EXCEEDED' | 'INSUFFICIENT_LIVE_CASH';
+  reason: string;
+  requestedNotionalUsd: number;
+  maxPositionNotionalUsd: number;
+  availableCashUsd: number | null;
+}
+
+export const orderRejectionLog: ExecuteTradeRejectionRecord[] = [];
+export const executeTradeIdempotencyStore = new Map<string, Record<string, any>>();
+
+export interface ExitMonitorEvaluationRecord {
+  id: string;
+  timestamp: string;
+  targetType: 'OCO_ORDER' | 'KALSHI_POSITION' | 'PUBLIC_POSITION';
+  targetId: string;
+  symbol: string;
+  venue: string;
+  livePrice: number;
+  stopLossPrice: number;
+  takeProfitPrice: number;
+  status: 'EVALUATED' | 'TRIGGERED' | 'NOT_TRIGGERED';
+  result:
+    | 'EVALUATED_NO_ACTION'
+    | 'TRIGGERED_STOP_LOSS'
+    | 'TRIGGERED_TAKE_PROFIT'
+    | 'TRIGGERED_PROFIT_LOCK'
+    | 'TRIGGERED_EXPIRATION_CLIFF';
+  actionSummary: string;
+}
+
+export const exitMonitorEvaluationLog: ExitMonitorEvaluationRecord[] = [];
+
+
 // Persistent Deterministic UUIDv4 `client_order_id` Ledger (Persisted BEFORE every order submission)
 interface KalshiPersistedClientOrderRecord {
   clientOrderId: string;
@@ -3511,6 +3582,7 @@ async function submitKalshiV2EventsOrder(params: {
   fillCount?: number;
   remainingCount?: number;
 }> {
+  venueOrderSubmissionCount += 1;
   const cleanTicker = params.ticker.trim().toUpperCase();
   const clientOrderId = generateDeterministicUuidV4FromSeed(
     `kalshi-v2:${params.idempotencySeed}:${cleanTicker}:${params.side}`
@@ -5779,9 +5851,9 @@ async function syncRealMarketBarsAndKalshi(force = false): Promise<void> {
             );
             // Spot leads Kalshi contract when momentum + orderbook imbalance align
             const leadDeltaPct =
-              feature.price >= 0.45 && feature.price <= 0.82
+              feature.price >= LEAD_LAG_PARAMS.askGateMin && feature.price <= LEAD_LAG_PARAMS.askGateMax
                 ? 0.0014 + Math.max(0, feature.orderbookImbalance * 0.0008)
-                : feature.price < 0.45
+                : feature.price < LEAD_LAG_PARAMS.askGateMin
                 ? -0.0016
                 : 0.0018;
             const liveSpot =
@@ -5797,7 +5869,7 @@ async function syncRealMarketBarsAndKalshi(force = false): Promise<void> {
               askYes,
               askNo,
               0.55,
-              0.02
+              LEAD_LAG_PARAMS.feePerContract
             );
 
             feature.latestCatalystHeadline = `Active 15m Contract ${feature.activeContractTicker} (${
@@ -6570,11 +6642,11 @@ const INDICATOR_STRATEGY_CATALOG: Array<{
 }> = [
   {
     id: 'BTC_LEAD_LAG_SNIPER',
-    label: '[LIVE META-LEARNING V4] Coinbase-to-Kalshi 15m Lead-Lag Sniper ($0.46–$0.76 Gate + 40/60 N(d2)/ML)',
-    formula: '[LIVE V4] Ask in [$0.46, $0.76] + Net Edge >= +$0.055 + T in [4.0m, 14.5m] + 40% Jump-N(d2)/60% ML + Post-Only Maker Bid',
+    label: LEAD_LAG_CATALOG_LABEL,
+    formula: LEAD_LAG_CATALOG_FORMULA,
     defaultArchetype: 'SHORT_AND_FAST',
-    stopAtr: 0.9,
-    tpAtr: 2.5,
+    stopAtr: LEAD_LAG_PARAMS.stopAtr,
+    tpAtr: LEAD_LAG_PARAMS.tpAtr,
   },
   {
     id: 'HFT_15M_CLOB_MICRO_SCALPER',
@@ -6880,18 +6952,19 @@ function executeRealDataBacktest(
 
       switch (strategySpec.id) {
         case 'BTC_LEAD_LAG_SNIPER': {
-          // Enforce High-Heat V2 [$0.48, $0.78] Asymmetry Sweet-Spot & Maker Post-Only Gate on binary contracts
           const isBinary = feature.venue === 'PREDICTION_MARKET';
           const askEst = isBinary ? Math.min(0.99, price) : price;
           const noAskEst = isBinary ? Math.max(0.01, 1.0 - askEst) : price;
+          const minGate = LEAD_LAG_PARAMS.askGateMin;
+          const maxGate = LEAD_LAG_PARAMS.askGateMax;
           if (isBinary) {
-            if (askEst >= 0.48 && askEst <= 0.78 && price >= prevPrice) {
+            if (askEst >= minGate && askEst <= maxGate && price >= prevPrice) {
               signalTriggered = true;
               side = 'LONG';
-            } else if (noAskEst >= 0.48 && noAskEst <= 0.78 && price < prevPrice) {
+            } else if (noAskEst >= minGate && noAskEst <= maxGate && price < prevPrice) {
               signalTriggered = true;
               side = 'SHORT';
-            } else if (price >= 0.45 && price <= 0.82 && ema9 >= ema21 * 0.992) {
+            } else if (price >= minGate && price <= maxGate && ema9 >= ema21 * 0.992) {
               signalTriggered = true;
               side = 'LONG';
             }
@@ -7560,6 +7633,8 @@ app.get('/api/state', async (_req, res) => {
     orchestratorState: buildOrchestratorCycleTelemetry(),
     zeroHoldLeadLagState: buildZeroHoldLeadLagSystemState(),
     autoRebalanceState: buildAgentFleetAutoRebalanceState(),
+    orderRejectionLog,
+    exitMonitorEvaluationLog,
     mcp: {
       servers: mcpServerConnections,
       tools: mcpToolDefinitions,
@@ -7631,56 +7706,19 @@ app.post('/api/playbook/tweak-lead-lag-paper', async (req, res) => {
   }
 
   // 2. Ensure BTC_LEAD_LAG_SNIPER is isolated in Paper Shadow Calibration Mode ($0 live capital risked)
-  let paperLeadLagAgent = autonomousAgents.find(
+  const paperLeadLagAgent = autonomousAgents.find(
     (a) => a.id === 'agent-paper-btc-lead-lag' || a.indicatorStrategyId === 'BTC_LEAD_LAG_SNIPER'
   );
-  if (!paperLeadLagAgent) {
-    paperLeadLagAgent = {
-      id: 'agent-paper-btc-lead-lag',
-      name: '[PAPER SHADOW CALIBRATION V3] BTC Lead-Lag Sniper (Tightened [$0.52, $0.74] · +$0.065 Edge · 40/60 ML)',
-      archetype: 'SHORT_AND_FAST',
-      venue: 'PREDICTION_MARKET',
-      targetSymbol: 'KXBTC15M',
-      timeframe: '15m',
-      status: 'PAUSED',
-      indicatorStrategyId: 'BTC_LEAD_LAG_SNIPER',
-      indicatorStrategyLabel:
-        '[PAPER MODE V3] Coinbase-to-Kalshi Lead-Lag Sniper ($0.52–$0.74 Gate + +$0.065 Edge + 4.5m–13.5m Window)',
-      subscribedFeeds: ['feed-prediction-clob', 'feed-public-quotes-l1', 'feed-derived-atr-vol'],
-      entryRules: {
-        requiredRegimes: ['TRENDING_BULL', 'LOW_VOLATILITY_COMPRESSION'],
-        rsiRange: [44, 72],
-        minOrderbookImbalance: 0.22,
-        maAlignment:
-          '[PAPER SHADOW CALIBRATION — $0 LIVE RISK] Ask in [$0.52, $0.74] + Net Edge >= +$0.065 + Window [4.5m, 13.5m] + 40% Jump-N(d2) / 60% DuckDB ML + Post-Only Maker Bid',
-      },
-      riskGovernance: {
-        maxDrawdownLimitPct: 1.2,
-        currentDrawdownPct: 0.0,
-        atrSpikeKillMultiplier: 2.4,
-        stopLossAtrMultiple: 0.9,
-        takeProfitAtrMultiple: 2.5,
-        maxPositionNotionalUsd: 15,
-      },
-      metrics: {
-        allocatedCapitalUsd: 0,
-        unrealizedPnlUsd: 1.8,
-        realizedPnlUsd: 4.2,
-        winRatePct: 78.5,
-        tradesExecuted: 14,
-        sharpeRatio: 2.84,
-      },
-      lastEvaluatedAt: new Date().toISOString(),
-    };
-    autonomousAgents.splice(1, 0, paperLeadLagAgent);
-  } else {
-    paperLeadLagAgent.name =
-      '[PAPER SHADOW CALIBRATION V3] BTC Lead-Lag Sniper (Tightened [$0.52, $0.74] · +$0.065 Edge · 40/60 ML)';
+  if (paperLeadLagAgent) {
+    paperLeadLagAgent.name = `[PAPER SHADOW CALIBRATION V3] BTC Lead-Lag Sniper (Tightened ${LEAD_LAG_ASK_BAND_TEXT} · ${LEAD_LAG_MIN_EDGE_TEXT} Edge · ${LEAD_LAG_BLEND_PCT_TEXT} ML)`;
+    paperLeadLagAgent.indicatorStrategyLabel = LEAD_LAG_CATALOG_LABEL;
     paperLeadLagAgent.status = executionMode === 'PAPER_SHADOW_CALIBRATION' ? 'PAUSED' : 'ACTIVE';
     paperLeadLagAgent.metrics.allocatedCapitalUsd =
-      executionMode === 'PAPER_SHADOW_CALIBRATION' ? 0 : 18;
-    paperLeadLagAgent.entryRules.maAlignment =
-      '[PAPER SHADOW CALIBRATION — $0 LIVE RISK] Ask in [$0.52, $0.74] + Net Edge >= +$0.065 + Window [4.5m, 13.5m] + 40% Jump-N(d2) / 60% DuckDB ML + Post-Only Maker Bid';
+      executionMode === 'PAPER_SHADOW_CALIBRATION' ? 0 : LEAD_LAG_PARAMS.maxRiskUsd;
+    paperLeadLagAgent.entryRules.maAlignment = `[PAPER SHADOW CALIBRATION — $0 LIVE RISK] ${LEAD_LAG_CATALOG_FORMULA} + Post-Only Maker Bid`;
+    paperLeadLagAgent.riskGovernance.stopLossAtrMultiple = LEAD_LAG_PARAMS.stopAtr;
+    paperLeadLagAgent.riskGovernance.takeProfitAtrMultiple = LEAD_LAG_PARAMS.tpAtr;
+    paperLeadLagAgent.riskGovernance.maxPositionNotionalUsd = LEAD_LAG_PARAMS.maxRiskUsd;
     paperLeadLagAgent.lastEvaluatedAt = new Date().toISOString();
   }
 
@@ -7688,7 +7726,7 @@ app.post('/api/playbook/tweak-lead-lag-paper', async (req, res) => {
   const liveTick = await fetchLiveCoinbaseSpotTick('BTC-USD');
   const spotPrice = liveTick.ok && liveTick.price ? liveTick.price : 84620.0;
   const strikePrice = Number((spotPrice * 0.9982).toFixed(2));
-  const paperEval = evaluateBtcLeadLagSniper(spotPrice, strikePrice, 9.2, 0.62, 0.4, 0.55, 0.02, {
+  const paperEval = evaluateBtcLeadLagSniper(spotPrice, strikePrice, 9.2, 0.62, 0.4, 0.55, LEAD_LAG_PARAMS.feePerContract, {
     symbol: 'KXBTC15M',
   });
 
@@ -7719,7 +7757,7 @@ app.post('/api/playbook/tweak-lead-lag-paper', async (req, res) => {
     agents: autonomousAgents,
     orders: executedOrders,
     portfolio,
-    rationale: `Demoted BTC_LEAD_LAG_SNIPER to PAPER_SHADOW_CALIBRATION ($0 live risk; V3 tweaks: [$0.52, $0.74] ask gate, +$0.065 min edge, [4.5m, 13.5m] window, 40/60 Jump-N(d2)/ML) and promoted #1 ${topWinner.indicatorStrategyId} (Sharpe ${topWinner.sharpeRatio}, ${topWinner.winRatePct}% win rate) to live Kalshi v2 + paired auto-sell execution.`,
+    rationale: `Demoted BTC_LEAD_LAG_SNIPER to PAPER_SHADOW_CALIBRATION ($0 live risk; V3 tweaks: ${LEAD_LAG_ASK_BAND_TEXT} ask gate, ${LEAD_LAG_MIN_EDGE_TEXT} min edge, ${LEAD_LAG_WINDOW_TEXT} window, ${LEAD_LAG_BLEND_PCT_TEXT} Jump-N(d2)/ML) and promoted #1 ${topWinner.indicatorStrategyId} (Sharpe ${topWinner.sharpeRatio}, ${topWinner.winRatePct}% win rate) to live Kalshi v2 + paired auto-sell execution.`,
   });
 });
 
@@ -9004,6 +9042,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
   ocoStepDownsApplied: number;
   events: ProfitLockAdjustmentEvent[];
   state: GlobalProfitLockState;
+  evaluationLog?: ExitMonitorEvaluationRecord[];
 }> {
   // Purge duplicate stacked working orders and expired contracts first
   purgeDuplicateAndExpiredWorkingOrders();
@@ -9070,13 +9109,14 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
     roiSellsTriggered += kalshiSweep.placedCount;
   }
 
-  // 2. Real-Time Monitor Across All Working Orders: Quick-Gain Market Sell Harvest & 15m Expiration Cliff Flatten
-  if (globalProfitLockState.globalProfitLockEnabled && !globalKillSwitchActive) {
+  // 2. Real-Time Monitor Across All Working Orders & Open Positions: Evaluate stopLoss, takeProfit, and profit-lock on EVERY pass
+  if (!globalKillSwitchActive) {
     const stepDownFraction = globalProfitLockState.ocoTakeProfitStepDownPct / 100;
+    const evalTimestamp = new Date().toISOString();
 
     for (const ord of executedOrders) {
       if (ord.status !== 'WORKING_OCO') continue;
-      // Never evaluate resting SELL orders as BUY entries (fixes fake +16296% ROI on Public.com working SELL orders)
+      // Never evaluate resting SELL orders as BUY entries
       if (ord.side === 'SELL' || ord.side === 'SELL_YES' || ord.side === 'SELL_NO' || ord.fillPrice <= 0.05) {
         continue;
       }
@@ -9096,17 +9136,21 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       const wsBook = kalshiWsState.books.get(cleanSym) || kalshiWsState.books.get(ord.symbol) || kalshiWsState.books.get(baseSym);
       const isYes = ord.side === 'BUY_YES' || ord.side === 'BUY';
 
+      const matchingKalshiPos = liveKalshiPositions.find((p) => p.ticker === cleanSym || p.ticker === ord.symbol);
+      const matchingPublicPos = livePublicPositions.find((p) => p.symbol === ord.symbol);
+
       const rawLivePx =
         ord.venue === 'PREDICTION_MARKET'
-          ? (isYes ? wsBook?.yesBidDollars : wsBook?.yesAskDollars ? Number((1.0 - wsBook.yesAskDollars).toFixed(2)) : null) ??
-            liveKalshiPositions.find((p) => p.ticker === cleanSym || p.ticker === ord.symbol)?.currentPrice ??
-            (feature.assetClass === 'PREDICTION_CONTRACT'
+          ? matchingKalshiPos?.currentPrice ??
+            (feature && (feature.symbol === ord.symbol || feature.symbol === baseSym)
               ? isYes
                 ? feature.price
                 : Number(Math.max(0.02, 1.0 - feature.price).toFixed(2))
-              : ord.fillPrice)
-          : livePublicPositions.find((p) => p.symbol === ord.symbol)?.currentPrice ??
-            (feature.price > 0 ? feature.price : ord.fillPrice);
+              : undefined) ??
+            (isYes ? wsBook?.yesBidDollars : wsBook?.yesAskDollars ? Number((1.0 - wsBook.yesAskDollars).toFixed(2)) : null) ??
+            ord.fillPrice
+          : matchingPublicPos?.currentPrice ??
+            (feature && feature.price > 0 ? feature.price : ord.fillPrice);
 
       const isBinaryPrice = ord.fillPrice <= 1.05 && ord.takeProfitPrice <= 1.05;
       const livePx = Number(rawLivePx.toFixed(2));
@@ -9123,10 +9167,40 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       highWaterMarkPriceMap.set(hwmKey, peakPx);
       const pullbackFromPeakPct = peakPx > 0 ? ((peakPx - livePx) / peakPx) * 100 : 0;
 
-      // TRIGGER A: QUICK-GAIN INSTANT PROFIT HARVEST (Take the gain immediately, never wait for passive fills!)
+      // TRIGGER 0: STOP-LOSS EVALUATION & EXIT ACTION
+      const stopLossHit = ord.stopLossPrice > 0 && livePx <= ord.stopLossPrice;
+      if (stopLossHit) {
+        ord.status = 'FILLED';
+        ord.orderType = 'STOP_LOSS_EXIT';
+        ord.lastExitEvaluatedAt = evalTimestamp;
+        ord.lastExitEvaluationResult = 'TRIGGERED_STOP_LOSS';
+        ord.lastEvaluatedPrice = livePx;
+        const realizedLossUsd = Number(((livePx - ord.fillPrice) * ord.quantity).toFixed(2));
+        ord.rationale = `[STOP_LOSS_EXIT @ $${livePx.toFixed(2)} <= SL $${ord.stopLossPrice.toFixed(2)} · Realized ${realizedLossUsd >= 0 ? '+' : ''}$${realizedLossUsd.toFixed(2)}] ${ord.rationale}`;
+        roiSellsTriggered += 1;
+
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-${Date.now()}-${ord.id}`,
+          timestamp: evalTimestamp,
+          targetType: 'OCO_ORDER',
+          targetId: ord.id,
+          symbol: ord.symbol,
+          venue: ord.venue,
+          livePrice: livePx,
+          stopLossPrice: ord.stopLossPrice,
+          takeProfitPrice: ord.takeProfitPrice,
+          status: 'TRIGGERED',
+          result: 'TRIGGERED_STOP_LOSS',
+          actionSummary: `Stop-loss triggered on ${ord.symbol} at $${livePx.toFixed(2)} (SL $${ord.stopLossPrice.toFixed(2)}); position exited.`,
+        });
+        if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+        continue;
+      }
+
+      // TRIGGER A: QUICK-GAIN INSTANT PROFIT HARVEST / TAKE-PROFIT HIT
       const targetRoiHit = roiPct >= globalProfitLockState.realTimeRoiTriggerPct;
       const targetCentsHit = isBinaryPrice && profitCents >= 4;
-      const tpTargetReached = livePx >= ord.takeProfitPrice;
+      const tpTargetReached = ord.takeProfitPrice > 0 && livePx >= ord.takeProfitPrice;
       const shouldHarvestQuickGain = targetRoiHit || targetCentsHit || tpTargetReached;
 
       // TRIGGER B: 15-MINUTE EXPIRATION CLIFF REAPER (Within 2.5m of settlement: flatten to prevent 0.00 collapse)
@@ -9136,6 +9210,11 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
         ord.status = 'FILLED';
         const exitPx = livePx;
         const realizedGainUsd = Number(((exitPx - ord.fillPrice) * ord.quantity).toFixed(2));
+        ord.lastExitEvaluatedAt = evalTimestamp;
+        ord.lastExitEvaluationResult = isExpirationCliff
+          ? 'TRIGGERED_EXPIRATION_CLIFF'
+          : 'TRIGGERED_TAKE_PROFIT';
+        ord.lastEvaluatedPrice = exitPx;
 
         if (realizedGainUsd > 0) {
           const vaultedShareUsd = Number(
@@ -9152,9 +9231,6 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
           globalProfitLockState.multiScalpInOutTurnovers += 1;
         }
 
-        // Note: Live Kalshi positions are already exited via reduce_only IoC in Step 1 (placeKalshiTakeProfitSellOrders)
-        // so we do NOT fire a duplicate submitSingleKalshiSellOrder here on the local OCO mirror.
-
         const triggerLabel = isExpirationCliff
           ? `EXPIRATION_CLIFF_FLATTEN (T-${minsRemaining.toFixed(1)}m remaining)`
           : `QUICK_GAIN_MARKET_HARVEST (+${roiPct.toFixed(1)}% ROI / +${profitCents}¢ @ $${exitPx.toFixed(2)})`;
@@ -9162,9 +9238,25 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
         ord.rationale = `[${triggerLabel} · Realized ${realizedGainUsd >= 0 ? '+' : ''}$${realizedGainUsd.toFixed(2)} · 75% VAULTED (+$${Math.max(0, realizedGainUsd * 0.75).toFixed(2)})] ${ord.rationale}`;
         roiSellsTriggered += 1;
 
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-${Date.now()}-${ord.id}`,
+          timestamp: evalTimestamp,
+          targetType: 'OCO_ORDER',
+          targetId: ord.id,
+          symbol: ord.symbol,
+          venue: ord.venue,
+          livePrice: exitPx,
+          stopLossPrice: ord.stopLossPrice,
+          takeProfitPrice: ord.takeProfitPrice,
+          status: 'TRIGGERED',
+          result: ord.lastExitEvaluationResult,
+          actionSummary: `${triggerLabel} executed on ${ord.symbol} at $${exitPx.toFixed(2)} (TP $${ord.takeProfitPrice.toFixed(2)}).`,
+        });
+        if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+
         const evt: ProfitLockAdjustmentEvent = {
           id: `pl-harvest-${Date.now().toString().slice(-5)}-${Math.floor(100 + Math.random() * 899)}`,
-          timestamp: new Date().toISOString(),
+          timestamp: evalTimestamp,
           triggerType: isExpirationCliff ? 'EXPIRATION_CLIFF_FLATTEN' : 'MARKET_IOC_PROFIT_HARVEST',
           symbol: ord.symbol,
           venue: ord.venue,
@@ -9194,8 +9286,6 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
         pullbackFromPeakPct >= globalProfitLockState.trailingStopThresholdPct ||
         (isHighVol && pullbackFromPeakPct >= globalProfitLockState.trailingStopThresholdPct * 0.6);
 
-      if (!trailingBreached) continue;
-
       const prevTp = ord.takeProfitPrice;
       const rawAdjustedTp = prevTp * (1 - stepDownFraction);
       const minProfitableFloor = isBinaryPrice
@@ -9205,15 +9295,54 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
         ? Number(Math.max(minProfitableFloor, Math.min(prevTp - 0.01, rawAdjustedTp)).toFixed(2))
         : Number(Math.max(minProfitableFloor, rawAdjustedTp).toFixed(2));
 
-      if (adjustedTp >= prevTp) continue;
+      if (!trailingBreached || adjustedTp >= prevTp) {
+        ord.lastExitEvaluatedAt = evalTimestamp;
+        ord.lastExitEvaluationResult = 'EVALUATED_NO_ACTION';
+        ord.lastEvaluatedPrice = livePx;
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-${Date.now()}-${ord.id}`,
+          timestamp: evalTimestamp,
+          targetType: 'OCO_ORDER',
+          targetId: ord.id,
+          symbol: ord.symbol,
+          venue: ord.venue,
+          livePrice: livePx,
+          stopLossPrice: ord.stopLossPrice,
+          takeProfitPrice: ord.takeProfitPrice,
+          status: 'NOT_TRIGGERED',
+          result: 'EVALUATED_NO_ACTION',
+          actionSummary: `Evaluated ${ord.symbol} at $${livePx.toFixed(2)} against SL $${ord.stopLossPrice.toFixed(2)} / TP $${ord.takeProfitPrice.toFixed(2)}: not triggered.`,
+        });
+        if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+        continue;
+      }
 
       ord.takeProfitPrice = adjustedTp;
       ord.stopLossPrice = isBinaryPrice
         ? Number(Math.min(ord.fillPrice, ord.stopLossPrice + 0.01).toFixed(2))
         : Number(Math.min(ord.fillPrice, ord.stopLossPrice * 1.003).toFixed(2));
+      ord.lastExitEvaluatedAt = evalTimestamp;
+      ord.lastExitEvaluationResult = 'TRIGGERED_PROFIT_LOCK';
+      ord.lastEvaluatedPrice = livePx;
       ord.rationale = `[GLOBAL PROFIT-LOCK -${globalProfitLockState.ocoTakeProfitStepDownPct.toFixed(1)}% STEP-DOWN · TP $${prevTp.toFixed(2)} → $${adjustedTp.toFixed(2)}] ${ord.rationale}`;
       profitLockAdjustedOrderIds.add(ord.id);
       ocoStepDownsApplied += 1;
+
+      exitMonitorEvaluationLog.unshift({
+        id: `exit-eval-${Date.now()}-${ord.id}`,
+        timestamp: evalTimestamp,
+        targetType: 'OCO_ORDER',
+        targetId: ord.id,
+        symbol: ord.symbol,
+        venue: ord.venue,
+        livePrice: livePx,
+        stopLossPrice: ord.stopLossPrice,
+        takeProfitPrice: ord.takeProfitPrice,
+        status: 'TRIGGERED',
+        result: 'TRIGGERED_PROFIT_LOCK',
+        actionSummary: `Profit-lock step-down triggered on ${ord.symbol}: TP $${prevTp.toFixed(2)} -> $${adjustedTp.toFixed(2)}.`,
+      });
+      if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
 
       // Also adjust matching resting Kalshi sell order if present
       const restingKalshi = kalshiActiveSellOrdersMap.get(ord.symbol);
@@ -9227,7 +9356,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
 
       const evt: ProfitLockAdjustmentEvent = {
         id: `pl-lock-${Date.now().toString().slice(-5)}-${Math.floor(100 + Math.random() * 899)}`,
-        timestamp: new Date().toISOString(),
+        timestamp: evalTimestamp,
         triggerType: 'GLOBAL_PROFIT_LOCK_OCO_STEPDOWN',
         symbol: ord.symbol,
         venue: ord.venue,
@@ -9248,6 +9377,137 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
       }
     }
 
+    // 3. Evaluate Open Positions in liveKalshiPositions and livePublicPositions on every pass
+    for (const kPos of liveKalshiPositions) {
+      if (kPos.contracts <= 0) continue;
+      const baseEntryPx = kPos.yesPrice > 0 ? kPos.yesPrice : kPos.currentPrice;
+      const slPx = kPos.stopLossPrice ?? Number(Math.max(0.02, baseEntryPx - 0.08).toFixed(2));
+      const tpPx = kPos.takeProfitPrice ?? Number(Math.min(0.98, baseEntryPx + defaultTakeProfitDeltaCents / 100).toFixed(2));
+      kPos.stopLossPrice = slPx;
+      kPos.takeProfitPrice = tpPx;
+      const livePx = Number(kPos.currentPrice.toFixed(2));
+      kPos.lastExitEvaluatedAt = evalTimestamp;
+      kPos.lastEvaluatedPrice = livePx;
+
+      if (livePx <= slPx) {
+        kPos.lastExitEvaluationResult = 'TRIGGERED_STOP_LOSS';
+        roiSellsTriggered += 1;
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
+          timestamp: evalTimestamp,
+          targetType: 'KALSHI_POSITION',
+          targetId: kPos.ticker,
+          symbol: kPos.ticker,
+          venue: 'PREDICTION_MARKET',
+          livePrice: livePx,
+          stopLossPrice: slPx,
+          takeProfitPrice: tpPx,
+          status: 'TRIGGERED',
+          result: 'TRIGGERED_STOP_LOSS',
+          actionSummary: `Kalshi position ${kPos.ticker} crossed stop-loss ($${livePx.toFixed(2)} <= $${slPx.toFixed(2)}); exit action triggered.`,
+        });
+      } else if (livePx >= tpPx) {
+        kPos.lastExitEvaluationResult = 'TRIGGERED_TAKE_PROFIT';
+        roiSellsTriggered += 1;
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
+          timestamp: evalTimestamp,
+          targetType: 'KALSHI_POSITION',
+          targetId: kPos.ticker,
+          symbol: kPos.ticker,
+          venue: 'PREDICTION_MARKET',
+          livePrice: livePx,
+          stopLossPrice: slPx,
+          takeProfitPrice: tpPx,
+          status: 'TRIGGERED',
+          result: 'TRIGGERED_TAKE_PROFIT',
+          actionSummary: `Kalshi position ${kPos.ticker} crossed take-profit ($${livePx.toFixed(2)} >= $${tpPx.toFixed(2)}); exit action triggered.`,
+        });
+      } else {
+        kPos.lastExitEvaluationResult = 'EVALUATED_NO_ACTION';
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-k-${Date.now()}-${kPos.ticker}`,
+          timestamp: evalTimestamp,
+          targetType: 'KALSHI_POSITION',
+          targetId: kPos.ticker,
+          symbol: kPos.ticker,
+          venue: 'PREDICTION_MARKET',
+          livePrice: livePx,
+          stopLossPrice: slPx,
+          takeProfitPrice: tpPx,
+          status: 'NOT_TRIGGERED',
+          result: 'EVALUATED_NO_ACTION',
+          actionSummary: `Evaluated Kalshi position ${kPos.ticker} at $${livePx.toFixed(2)} (SL $${slPx.toFixed(2)} / TP $${tpPx.toFixed(2)}): not triggered.`,
+        });
+      }
+      if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+    }
+
+    for (const pPos of livePublicPositions) {
+      if (Number(pPos.quantity) <= 0) continue;
+      const baseCost = pPos.averagePrice > 0 ? pPos.averagePrice : pPos.currentPrice;
+      const slPx = pPos.stopLossPrice ?? Number((baseCost * 0.96).toFixed(2));
+      const tpPx = pPos.takeProfitPrice ?? Number((baseCost * 1.05).toFixed(2));
+      pPos.stopLossPrice = slPx;
+      pPos.takeProfitPrice = tpPx;
+      const livePx = Number(pPos.currentPrice.toFixed(2));
+      pPos.lastExitEvaluatedAt = evalTimestamp;
+      pPos.lastEvaluatedPrice = livePx;
+
+      if (livePx <= slPx) {
+        pPos.lastExitEvaluationResult = 'TRIGGERED_STOP_LOSS';
+        roiSellsTriggered += 1;
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
+          timestamp: evalTimestamp,
+          targetType: 'PUBLIC_POSITION',
+          targetId: pPos.symbol,
+          symbol: pPos.symbol,
+          venue: 'PUBLIC_BROKERAGE',
+          livePrice: livePx,
+          stopLossPrice: slPx,
+          takeProfitPrice: tpPx,
+          status: 'TRIGGERED',
+          result: 'TRIGGERED_STOP_LOSS',
+          actionSummary: `Public.com position ${pPos.symbol} crossed stop-loss ($${livePx.toFixed(2)} <= $${slPx.toFixed(2)}); exit action triggered.`,
+        });
+      } else if (livePx >= tpPx) {
+        pPos.lastExitEvaluationResult = 'TRIGGERED_TAKE_PROFIT';
+        roiSellsTriggered += 1;
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
+          timestamp: evalTimestamp,
+          targetType: 'PUBLIC_POSITION',
+          targetId: pPos.symbol,
+          symbol: pPos.symbol,
+          venue: 'PUBLIC_BROKERAGE',
+          livePrice: livePx,
+          stopLossPrice: slPx,
+          takeProfitPrice: tpPx,
+          status: 'TRIGGERED',
+          result: 'TRIGGERED_TAKE_PROFIT',
+          actionSummary: `Public.com position ${pPos.symbol} crossed take-profit ($${livePx.toFixed(2)} >= $${tpPx.toFixed(2)}); exit action triggered.`,
+        });
+      } else {
+        pPos.lastExitEvaluationResult = 'EVALUATED_NO_ACTION';
+        exitMonitorEvaluationLog.unshift({
+          id: `exit-eval-p-${Date.now()}-${pPos.symbol}`,
+          timestamp: evalTimestamp,
+          targetType: 'PUBLIC_POSITION',
+          targetId: pPos.symbol,
+          symbol: pPos.symbol,
+          venue: 'PUBLIC_BROKERAGE',
+          livePrice: livePx,
+          stopLossPrice: slPx,
+          takeProfitPrice: tpPx,
+          status: 'NOT_TRIGGERED',
+          result: 'EVALUATED_NO_ACTION',
+          actionSummary: `Evaluated Public.com position ${pPos.symbol} at $${livePx.toFixed(2)} (SL $${slPx.toFixed(2)} / TP $${tpPx.toFixed(2)}): not triggered.`,
+        });
+      }
+      if (exitMonitorEvaluationLog.length > 100) exitMonitorEvaluationLog.pop();
+    }
+
     globalProfitLockState.totalProfitLockStepDowns += ocoStepDownsApplied;
   }
 
@@ -9257,6 +9517,7 @@ async function evaluateRealTimeRoiAndGlobalProfitLock(options?: {
     ocoStepDownsApplied,
     events: triggeredEvents,
     state: globalProfitLockState,
+    evaluationLog: exitMonitorEvaluationLog,
   };
 }
 
@@ -10017,6 +10278,7 @@ async function submitPublicOrderWithExponentialRetry(params: {
     retrying: boolean;
   }>;
 }> {
+  venueOrderSubmissionCount += 1;
   const maxRetries = Math.max(0, Math.min(5, params.maxRetries ?? 3));
   const baseDelaySec = Math.max(0.05, Math.min(2.0, params.baseDelaySec ?? 0.35));
   const simFailures = Math.max(0, Math.min(maxRetries + 1, params.simulatedTransientFailures ?? 0));
@@ -12710,9 +12972,54 @@ app.post('/api/agents/meta-optimize', async (_req, res) => {
   });
 });
 
-// API Endpoint: Execute an autonomous trade on a specific agent (Paper-Gated by Default + Global Kill Switch Checked)
+// API Endpoint: Execute an autonomous trade on a specific agent (Enforces Position Cap, Live Cash Pre-Check & Idempotency Key)
 app.post('/api/agents/execute-trade', async (req, res) => {
-  const { agentId } = req.body as { agentId?: string };
+  const {
+    agentId,
+    idempotencyKey: bodyIdempotencyKey,
+    idempotency_key: snakeIdempotencyKey,
+    notionalUsd: explicitNotionalUsd,
+    quantity: explicitQuantity,
+    skipLiveCashSync,
+  } = (req.body || {}) as {
+    agentId?: string;
+    idempotencyKey?: string;
+    idempotency_key?: string;
+    notionalUsd?: number;
+    quantity?: number;
+    skipLiveCashSync?: boolean;
+  };
+
+  const headerIdempotencyKey =
+    typeof req.headers['x-idempotency-key'] === 'string'
+      ? req.headers['x-idempotency-key']
+      : '';
+  const clientSuppliedIdempotencyKey = String(
+    bodyIdempotencyKey || snakeIdempotencyKey || headerIdempotencyKey || ''
+  ).trim();
+
+  // Fix 5 — Order idempotency check BEFORE any sizing or venue call:
+  // If this idempotencyKey has already produced an order, return the existing order without placing a new one.
+  if (clientSuppliedIdempotencyKey.length > 0) {
+    const cachedExecution = executeTradeIdempotencyStore.get(clientSuppliedIdempotencyKey);
+    const existingOrder = executedOrders.find(
+      (o) =>
+        o.idempotencyKey === clientSuppliedIdempotencyKey &&
+        !o.agentName.includes('Public.com Event Contract Leg')
+    );
+    if (cachedExecution || existingOrder) {
+      return res.status(200).json({
+        ...(cachedExecution || {}),
+        order: existingOrder || cachedExecution?.order,
+        idempotencyKey: clientSuppliedIdempotencyKey,
+        idempotentReplay: true,
+        agents: autonomousAgents,
+        orders: executedOrders,
+        portfolio: computePortfolioSummary(),
+      });
+    }
+  }
+
   const agent = autonomousAgents.find((a) => a.id === agentId);
   if (!agent) {
     return res.status(404).json({ error: 'Agent not found' });
@@ -12738,10 +13045,139 @@ app.post('/api/agents/execute-trade', async (req, res) => {
   feature.lastAssessment = assessment;
 
   const decimals = feature.price < 2 ? 4 : 2;
-  const qty =
+  const effectiveUnitPrice =
     feature.venue === 'PREDICTION_MARKET'
-      ? Math.max(5, Math.round((agent.metrics.allocatedCapitalUsd * 0.25) / feature.price))
-      : Math.max(0.05, Number(((agent.metrics.allocatedCapitalUsd * 0.35) / feature.price).toFixed(3)));
+      ? Math.max(0.44, Math.min(0.56, feature.price))
+      : feature.price;
+  const rawAllocationNotionalUsd = Number(
+    (
+      agent.metrics.allocatedCapitalUsd *
+      (feature.venue === 'PREDICTION_MARKET' ? 0.25 : 0.35)
+    ).toFixed(2)
+  );
+
+  const qty =
+    typeof explicitQuantity === 'number' && explicitQuantity > 0
+      ? explicitQuantity
+      : typeof explicitNotionalUsd === 'number' && explicitNotionalUsd > 0
+      ? feature.venue === 'PREDICTION_MARKET'
+        ? Math.max(1, Math.round(explicitNotionalUsd / effectiveUnitPrice))
+        : Math.max(0.001, Number((explicitNotionalUsd / effectiveUnitPrice).toFixed(3)))
+      : feature.venue === 'PREDICTION_MARKET'
+      ? Math.max(5, Math.round(rawAllocationNotionalUsd / feature.price))
+      : Math.max(0.05, Number((rawAllocationNotionalUsd / feature.price).toFixed(3)));
+
+  const orderNotionalUsd =
+    typeof explicitNotionalUsd === 'number' && explicitNotionalUsd > 0
+      ? Number(explicitNotionalUsd.toFixed(2))
+      : typeof explicitQuantity === 'number' && explicitQuantity > 0
+      ? Number((qty * effectiveUnitPrice).toFixed(2))
+      : Number(Math.max(rawAllocationNotionalUsd, qty * feature.price).toFixed(2));
+
+  // Fix 3(a) — Read maxPositionNotionalUsd and reject any order that would exceed it BEFORE any venue call
+  const maxPositionNotionalUsd = Number(agent.riskGovernance?.maxPositionNotionalUsd ?? 0);
+  if (maxPositionNotionalUsd <= 0 || orderNotionalUsd > maxPositionNotionalUsd) {
+    const reason = `Order rejected: requested notional $${orderNotionalUsd.toFixed(2)} on ${feature.symbol} exceeds agent maxPositionNotionalUsd cap of $${maxPositionNotionalUsd.toFixed(2)}.`;
+    const rejection: ExecuteTradeRejectionRecord = {
+      id: `rej-cap-${orderRejectionLog.length + 1}`,
+      timestamp: new Date().toISOString(),
+      agentId: agent.id,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      code: 'POSITION_CAP_EXCEEDED',
+      reason,
+      requestedNotionalUsd: orderNotionalUsd,
+      maxPositionNotionalUsd,
+      availableCashUsd: null,
+    };
+    orderRejectionLog.unshift(rejection);
+    riskEvents.unshift({
+      id: rejection.id,
+      timestamp: rejection.timestamp,
+      eventType: 'SPREAD_LIQUIDITY_GUARD',
+      severity: 'CRITICAL',
+      agentId: agent.id,
+      agentName: agent.name,
+      archetype: agent.archetype,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      triggerMetric: 'maxPositionNotionalUsd',
+      thresholdValue: `$${maxPositionNotionalUsd.toFixed(2)}`,
+      observedValue: `$${orderNotionalUsd.toFixed(2)}`,
+      actionTaken: reason,
+      cancelledOrderIds: [],
+      acknowledged: false,
+    });
+    console.warn(`[EXECUTE-TRADE REJECTED · POSITION_CAP_EXCEEDED] ${reason}`);
+    return res.status(400).json({
+      error: reason,
+      rejected: true,
+      code: 'POSITION_CAP_EXCEEDED',
+      reason,
+      requestedNotionalUsd: orderNotionalUsd,
+      maxPositionNotionalUsd,
+    });
+  }
+
+  // Fix 3(b) — Fetch live cash/buying power and reject the order if it exceeds available cash BEFORE any venue call
+  if (!skipLiveCashSync && process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    if (feature.venue === 'PREDICTION_MARKET') {
+      await syncLiveKalshiPortfolio(0).catch(() => {});
+    } else {
+      await syncWithPublicApiGateway(false).catch(() => {});
+    }
+  }
+
+  const availableLiveCashUsd =
+    feature.venue === 'PREDICTION_MARKET'
+      ? Number(liveKalshiCashBalanceUsd ?? 0)
+      : Math.min(
+          Number(livePublicCashBalance ?? 0),
+          Number(livePublicBuyingPower ?? livePublicCashBalance ?? 0)
+        );
+
+  if (availableLiveCashUsd <= 0 || orderNotionalUsd > availableLiveCashUsd) {
+    const reason = `Order rejected: requested notional $${orderNotionalUsd.toFixed(2)} on ${feature.symbol} exceeds live available cash/buying power of $${availableLiveCashUsd.toFixed(2)}.`;
+    const rejection: ExecuteTradeRejectionRecord = {
+      id: `rej-cash-${orderRejectionLog.length + 1}`,
+      timestamp: new Date().toISOString(),
+      agentId: agent.id,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      code: 'INSUFFICIENT_LIVE_CASH',
+      reason,
+      requestedNotionalUsd: orderNotionalUsd,
+      maxPositionNotionalUsd,
+      availableCashUsd: availableLiveCashUsd,
+    };
+    orderRejectionLog.unshift(rejection);
+    riskEvents.unshift({
+      id: rejection.id,
+      timestamp: rejection.timestamp,
+      eventType: 'SPREAD_LIQUIDITY_GUARD',
+      severity: 'CRITICAL',
+      agentId: agent.id,
+      agentName: agent.name,
+      archetype: agent.archetype,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      triggerMetric: 'availableLiveCashUsd',
+      thresholdValue: `$${availableLiveCashUsd.toFixed(2)}`,
+      observedValue: `$${orderNotionalUsd.toFixed(2)}`,
+      actionTaken: reason,
+      cancelledOrderIds: [],
+      acknowledged: false,
+    });
+    console.warn(`[EXECUTE-TRADE REJECTED · INSUFFICIENT_LIVE_CASH] ${reason}`);
+    return res.status(400).json({
+      error: reason,
+      rejected: true,
+      code: 'INSUFFICIENT_LIVE_CASH',
+      reason,
+      requestedNotionalUsd: orderNotionalUsd,
+      availableCashUsd: availableLiveCashUsd,
+    });
+  }
 
   const resolvedSide =
     feature.venue === 'PREDICTION_MARKET'
@@ -12754,9 +13190,17 @@ app.post('/api/agents/execute-trade', async (req, res) => {
       ? 'BUY'
       : 'SELL';
 
-  let externalOrderId = `${feature.venue === 'PREDICTION_MARKET' ? 'kalshi' : 'pub'}-${Math.floor(
-    1000 + Math.random() * 9000
-  )}`;
+  // Fix 5 — Deterministic order ID and venue seeds derived from idempotencyKey (never Date.now() or Math.random())
+  const effectiveIdempotencyKey =
+    clientSuppliedIdempotencyKey ||
+    `idem-${agent.id}-${feature.symbol}-${executedOrders.length + 1}`;
+  const idempotencyDigest = crypto
+    .createHash('sha256')
+    .update(effectiveIdempotencyKey)
+    .digest('hex')
+    .slice(0, 10);
+
+  let externalOrderId = `${feature.venue === 'PREDICTION_MARKET' ? 'kalshi' : 'pub'}-${idempotencyDigest}`;
 
   // 1. Route Public.com leg via submitPublicOrderWithExponentialRetry (enforces Global Kill Switch & Default PAPER Mode)
   let publicBrokerageStatus = isPaperModeEnabled() ? 'PAPER_MODE_SIMULATED_ORDER' : 'OCO_LEDGER_STAGED';
@@ -12765,12 +13209,12 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     const instType = feature.assetClass === 'CRYPTO' ? 'CRYPTO' : 'EQUITY';
     const safeQty =
       feature.price < 10
-        ? String(Math.max(1, Math.round(10 / feature.price)))
-        : String(Number(Math.min(qty, 12 / feature.price).toFixed(2)));
+        ? String(Math.max(1, Math.round(Math.min(orderNotionalUsd, 10) / feature.price)))
+        : String(Number(Math.min(qty, maxPositionNotionalUsd / feature.price).toFixed(2)));
 
     const pubExec = await submitPublicOrderWithExponentialRetry({
       symbol: cleanSym,
-      idempotencyKey: `agent-pub-${cleanSym}-${Date.now()}`,
+      idempotencyKey: `agent-pub-${cleanSym}-${idempotencyDigest}`,
       instrumentType: instType,
       orderSide: 'BUY',
       orderType: 'MARKET',
@@ -12798,11 +13242,9 @@ app.post('/api/agents/execute-trade', async (req, res) => {
         : feature.symbol;
     const clampedPriceNum = Math.max(0.44, Math.min(0.56, feature.price));
     const clampedPrice = clampedPriceNum.toFixed(4);
-    const priceCents = Math.max(1, Math.min(99, Math.round(clampedPriceNum * 100)));
     const maxAllowedByRatchet = getDynamicProfitScaledMaxContracts();
     const kalshiQty = Math.min(maxAllowedByRatchet, Math.max(1, Math.floor(qty / 2)));
     const publicEvQty = Math.min(maxAllowedByRatchet, Math.max(1, Math.ceil(qty / 2)));
-    const kalshiSide = resolvedSide === 'BUY_NO' ? 'no' : 'yes';
 
     if (kalshiCreds) {
       try {
@@ -12814,7 +13256,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
             : clampedPriceNum;
         const v2Order = await submitKalshiV2EventsOrder({
           ticker: targetKalshiTicker,
-          idempotencySeed: `agent-exec-${targetKalshiTicker}-${Date.now()}`,
+          idempotencySeed: `agent-exec-${targetKalshiTicker}-${idempotencyDigest}`,
           side: eventsSide,
           contracts: kalshiQty,
           desiredYesPrice: desiredYesPx,
@@ -12837,10 +13279,10 @@ app.post('/api/agents/execute-trade', async (req, res) => {
 
     // Route mirrored Kalshi-powered Event Contract leg via submitPublicOrderWithExponentialRetry (enforces Global Kill Switch & Default PAPER Mode)
     const publicEvSymbol = `KALSHI.${targetKalshiTicker}.${resolvedSide === 'BUY_NO' ? 'N' : 'Y'}`;
-    publicEventContractOrderId = `pub-kalshi-ev-${Math.floor(1000 + Math.random() * 9000)}`;
+    publicEventContractOrderId = `pub-kalshi-ev-${idempotencyDigest}`;
     const pubEvExec = await submitPublicOrderWithExponentialRetry({
       symbol: publicEvSymbol,
-      idempotencyKey: `agent-ev-${publicEvSymbol}-${Date.now()}`,
+      idempotencyKey: `agent-ev-${publicEvSymbol}-${idempotencyDigest}`,
       instrumentType: 'EVENTCONTRACT',
       orderSide: 'BUY',
       orderType: 'LIMIT',
@@ -12857,6 +13299,8 @@ app.post('/api/agents/execute-trade', async (req, res) => {
 
     const publicEvOrder: ExecutedOrder = {
       id: publicEventContractOrderId,
+      idempotencyKey: `${effectiveIdempotencyKey}:public-ev-leg`,
+      notionalUsd: Number((publicEvQty * Number(clampedPrice)).toFixed(2)),
       timestamp: new Date().toISOString(),
       agentId: agent.id,
       agentName: `${agent.name} · Public.com Event Contract Leg`,
@@ -12881,6 +13325,8 @@ app.post('/api/agents/execute-trade', async (req, res) => {
 
   const order: ExecutedOrder = {
     id: externalOrderId,
+    idempotencyKey: effectiveIdempotencyKey,
+    notionalUsd: orderNotionalUsd,
     timestamp: new Date().toISOString(),
     agentId: agent.id,
     agentName: agent.name,
@@ -12913,17 +13359,28 @@ app.post('/api/agents/execute-trade', async (req, res) => {
   agent.metrics.tradesExecuted += 1;
   agent.lastEvaluatedAt = new Date().toISOString();
 
-  res.json({
+  const responsePayload = {
     order,
+    idempotencyKey: effectiveIdempotencyKey,
+    idempotentReplay: false,
     publicEventContractOrderId,
     kalshiExchangeStatus,
     publicExchangeStatus,
     predictionMarketDataSource: 'KALSHI_CLOB_V2',
-    executionVenues: feature.venue === 'PREDICTION_MARKET' ? ['KALSHI_V2_DIRECT', 'PUBLIC_COM_EVENTCONTRACT'] : [feature.venue],
+    executionVenues:
+      feature.venue === 'PREDICTION_MARKET'
+        ? ['KALSHI_V2_DIRECT', 'PUBLIC_COM_EVENTCONTRACT']
+        : [feature.venue],
     agents: autonomousAgents,
     orders: executedOrders,
     portfolio: computePortfolioSummary(),
-  });
+  };
+
+  if (clientSuppliedIdempotencyKey.length > 0) {
+    executeTradeIdempotencyStore.set(clientSuppliedIdempotencyKey, responsePayload);
+  }
+
+  res.json(responsePayload);
 });
 
 // API Endpoint: Server-Validated Agent Capital Allocation Update (Phase 1.2)
@@ -13178,7 +13635,7 @@ app.post('/api/agents/fund-top-agent', async (req, res) => {
   topAgent.entryRules.maAlignment =
     heatMode === 'HIGH_HEAT'
       ? '[HIGH-HEAT V2] Maker Post-Only ($0.00 Fee T>5m) + [$0.48, $0.78] Asymmetry Band + +$0.10 Auto-Scale-Out + 90s Anti-Whipsaw Lock ($65 Primary + $65 KXETH15M Co-Sniper = $130 Sleeve)'
-      : 'Kalshi CLOB v2 Prediction Data -> Dual-Venue Execution (Kalshi v2 Direct $30 + Public.com EVENTCONTRACT $35 = $65 Cap) · Ask in [$0.45, $0.82]';
+      : `Kalshi CLOB v2 Prediction Data -> Dual-Venue Execution (Kalshi v2 Direct $30 + Public.com EVENTCONTRACT $35 = $65 Cap) · Ask in ${LEAD_LAG_ASK_BAND_TEXT}`;
 
   const desiredCap =
     requestedCapitalUsd !== undefined && Number(requestedCapitalUsd) > 0
@@ -14330,8 +14787,8 @@ const mcpToolDefinitions: McpToolDefinition[] = [
         },
         symbol: { type: 'string', description: 'Target ticker or Kalshi contract ticker' },
         side: { type: 'string', description: 'BUY, SELL, BUY_YES, or BUY_NO' },
-        notionalUsd: { type: 'number', description: 'Dollar notional allocation (capped at $18.00 for 15m BTC contracts)' },
-        ask_price: { type: 'number', description: 'Contract limit/ask price (must be in [$0.45, $0.82] for 15m contracts)' },
+        notionalUsd: { type: 'number', description: `Dollar notional allocation (capped at $${LEAD_LAG_PARAMS.maxRiskUsd.toFixed(2)} for 15m BTC contracts)` },
+        ask_price: { type: 'number', description: `Contract limit/ask price (must be in ${LEAD_LAG_ASK_BAND_TEXT} for 15m contracts)` },
         max_retries: { type: 'number', description: 'Max exponential backoff retries on 429/5xx/timeout/28000 (default: 3)' },
         base_delay_sec: { type: 'number', description: 'Base exponential backoff delay in seconds (default: 0.35)' },
         simulated_transient_failures: { type: 'number', description: 'Optional count of simulated transient 429/503 faults to test backoff recovery' },
@@ -14423,7 +14880,7 @@ const mcpToolDefinitions: McpToolDefinition[] = [
   {
     name: 'evaluate_btc_lead_lag',
     description:
-      'async def evaluate_btc_lead_lag(strike: float, minutes_left: float, yes_ask: float, no_ask: float, coinbase_spot: float = None) -> dict: Asynchronously fetches live Coinbase BTC-USD spot tick via WebSocket/REST, blends Black-Scholes N(d2) (70%) with the trained DuckDB ML Meta-Model ml_calibrated_prob (30%), enforces the [$0.45, $0.82] fee gate, and logs to ml_telemetry_ledger.',
+      `async def evaluate_btc_lead_lag(strike: float, minutes_left: float, yes_ask: float, no_ask: float, coinbase_spot: float = None) -> dict: Asynchronously fetches live Coinbase BTC-USD spot tick via WebSocket/REST, blends Black-Scholes N(d2) (${Math.round(LEAD_LAG_PARAMS.nd2Weight * 100)}%) with the trained DuckDB ML Meta-Model ml_calibrated_prob (${Math.round(LEAD_LAG_PARAMS.mlWeight * 100)}%), enforces the ${LEAD_LAG_ASK_BAND_TEXT} fee gate, and logs to ml_telemetry_ledger.`,
     category: 'QUANT_REGIME',
     isAsync: true,
     isMutating: false,
@@ -14637,7 +15094,7 @@ const mcpPromptDefinitions: McpPromptDefinition[] = [
   },
   {
     name: 'btc_lead_lag_sniper_gate',
-    description: 'Black-Scholes N(d2) binary probability and [$0.45, $0.82] fee-gate execution prompt.',
+    description: `Black-Scholes N(d2) binary probability and ${LEAD_LAG_ASK_BAND_TEXT} fee-gate execution prompt.`,
     decoratorSignature:
       '@mcp.prompt()\nasync def btc_lead_lag_sniper_gate(coinbase_spot: float = 82620.0, strike: float = 82510.73, minutes_left: float = 10.0, yes_ask: float = 0.62) -> str:',
     arguments: [
@@ -14647,7 +15104,7 @@ const mcpPromptDefinitions: McpPromptDefinition[] = [
       { name: 'yes_ask', description: 'Kalshi YES contract ask price ($0.01-$0.99)', required: true, defaultValue: 0.62 },
     ],
     templatePreview:
-      'Evaluate 15m BTC Lead-Lag Sniper execution for Coinbase Spot=${coinbase_spot} vs Strike=${strike} ({minutes_left}m remaining, YES Ask=${yes_ask}). Enforce hard rules: (1) Contract price must be inside [$0.45, $0.82], (2) Subtract $0.02 flat fee from Black-Scholes N(d2) fair probability and require Net EV >= +$0.04/contract, (3) Cap position size at 25 contracts or $18.00 risk, (4) Route rejected mutations to route_to_dlq with a required idempotency_key.',
+      `Evaluate 15m BTC Lead-Lag Sniper execution for Coinbase Spot={coinbase_spot} vs Strike={strike} ({minutes_left}m remaining, YES Ask={yes_ask}). Enforce hard rules: (1) Contract price must be inside ${LEAD_LAG_ASK_BAND_TEXT}, (2) Subtract $${LEAD_LAG_PARAMS.feePerContract.toFixed(2)} flat fee from ${LEAD_LAG_BLEND_PCT_TEXT} Ensemble fair probability and require Net EV >= ${LEAD_LAG_MIN_EDGE_TEXT}/contract, (3) Cap position size at ${LEAD_LAG_PARAMS.maxContracts} contracts or $${LEAD_LAG_PARAMS.maxRiskUsd.toFixed(2)} risk, (4) Route rejected mutations to route_to_dlq with a required idempotency_key.`,
   },
   {
     name: 'portfolio_dust_and_stale_trim_audit',
@@ -14667,10 +15124,10 @@ const mcpPromptDefinitions: McpPromptDefinition[] = [
     arguments: [
       { name: 'idempotency_key', description: 'Idempotency key of the quarantined mutation', required: true, defaultValue: 'idem-oct19-btc-027' },
       { name: 'failed_tool', description: 'Mutating tool that triggered DLQ fallback', required: true, defaultValue: 'execute_kalshi_or_public_order' },
-      { name: 'error_reason', description: 'Rejection reason recorded in DLQ', required: true, defaultValue: 'Blocked by Fee Gate: Ask $0.27 outside [$0.45, $0.82]' },
+      { name: 'error_reason', description: 'Rejection reason recorded in DLQ', required: true, defaultValue: `Blocked by Fee Gate: Ask $0.27 outside ${LEAD_LAG_ASK_BAND_TEXT}` },
     ],
     templatePreview:
-      "Triage Dead-Letter Queue entry for failed_tool='{failed_tool}' (idempotency_key='{idempotency_key}', reason='{error_reason}'). Verify whether failure was triggered by the [$0.45, $0.82] fee gate, insufficient net edge (<+$0.04), or malformed telemetry. Maintain neutral HOLD posture until downside risk parameters and idempotency state are verified.",
+      `Triage Dead-Letter Queue entry for failed_tool='{failed_tool}' (idempotency_key='{idempotency_key}', reason='{error_reason}'). Verify whether failure was triggered by the ${LEAD_LAG_ASK_BAND_TEXT} fee gate, insufficient net edge (<${LEAD_LAG_MIN_EDGE_TEXT}), or malformed telemetry. Maintain neutral HOLD posture until downside risk parameters and idempotency state are verified.`,
   },
 ];
 
@@ -14719,12 +15176,12 @@ const mcpDlqEntries: McpDlqEntry[] = [
       contracts: 111,
       notionalUsd: 19.98,
     }),
-    errorReason: 'Blocked by Fee Gate: Ask $0.27 outside [$0.45, $0.82] band ($2.25 flat fee = 11.2% instant drag)',
+    errorReason: `Blocked by Fee Gate: Ask $0.27 outside ${LEAD_LAG_ASK_BAND_TEXT} band ($2.25 flat fee = 11.2% instant drag)`,
     severity: 'WARNING',
     status: 'QUARANTINED_HOLD',
     createdAt: new Date(Date.now() - 1000 * 60 * 18).toISOString(),
     dataQualityWarning: false,
-    rationale: 'Quarantined execute_kalshi_or_public_order in DLQ: ask $0.27 violates [$0.45, $0.82] band; posture locked to HOLD.',
+    rationale: `Quarantined execute_kalshi_or_public_order in DLQ: ask $0.27 violates ${LEAD_LAG_ASK_BAND_TEXT} band; posture locked to HOLD.`,
   },
 ];
 
@@ -14757,7 +15214,7 @@ const mcpResourceDefinitions: McpResourceDefinition[] = [
   {
     uri: 'quantpulse://mcp/dlq',
     name: 'MCP Dead-Letter Queue (route_to_dlq) & Idempotency Ledger',
-    description: 'Quarantined mutating MCP calls rejected by the [$0.45, $0.82] fee gate or missing idempotency_key.',
+    description: `Quarantined mutating MCP calls rejected by the ${LEAD_LAG_ASK_BAND_TEXT} fee gate or missing idempotency_key.`,
     mimeType: 'application/json',
   },
 ];
@@ -14774,12 +15231,12 @@ const mcpCallLogs: McpCallLogEntry[] = [
     args: {
       idempotency_key: 'idem-oct19-1014-kxbtc15m-027',
       failed_tool: 'execute_kalshi_or_public_order',
-      error_reason: 'Blocked by Fee Gate: Ask $0.27 outside [$0.45, $0.82]',
+      error_reason: `Blocked by Fee Gate: Ask $0.27 outside ${LEAD_LAG_ASK_BAND_TEXT}`,
     },
     durationMs: 3,
     status: 'DLQ_FALLBACK',
     responsePreview:
-      'Quarantined execute_kalshi_or_public_order (Ask $0.27 outside [$0.45, $0.82]) into DLQ dlq-oct19-027 · Posture=HOLD',
+      `Quarantined execute_kalshi_or_public_order (Ask $0.27 outside ${LEAD_LAG_ASK_BAND_TEXT}) into DLQ dlq-oct19-027 · Posture=HOLD`,
   },
   {
     id: 'mcp-init-901',
@@ -15155,9 +15612,12 @@ async function mcpToolExecuteKalshiOrPublicOrder(args: Record<string, any>): Pro
     (args.side as ExecutedOrder['side']) ||
     (feature.venue === 'PREDICTION_MARKET' ? 'BUY_YES' : 'BUY');
 
-  // Risk-First Check: Enforce [$0.45, $0.82] Fee Gate on Kalshi prediction contracts
-  if (feature.venue === 'PREDICTION_MARKET' && (askPrice < 0.45 || askPrice > 0.82)) {
-    const blockedReason = `Blocked by Fee Gate: Ask $${askPrice.toFixed(2)} outside [$0.45, $0.82] band ($0.02 fee drag, Spot $${resolvedSpot.toLocaleString()})`;
+  // Risk-First Check: Enforce V3 Fee Gate on Kalshi prediction contracts
+  if (
+    feature.venue === 'PREDICTION_MARKET' &&
+    (askPrice < LEAD_LAG_PARAMS.askGateMin || askPrice > LEAD_LAG_PARAMS.askGateMax)
+  ) {
+    const blockedReason = `Blocked by Fee Gate: Ask $${askPrice.toFixed(2)} outside ${LEAD_LAG_ASK_BAND_TEXT} band ($${LEAD_LAG_PARAMS.feePerContract.toFixed(2)} fee drag, Spot $${resolvedSpot.toLocaleString()})`;
     recordMlTelemetryRow({
       timestamp_utc: new Date().toISOString(),
       symbol: feature.symbol,
@@ -15169,7 +15629,7 @@ async function mcpToolExecuteKalshiOrPublicOrder(args: Record<string, any>): Pro
       no_ask: Number(Math.max(0.01, 1.02 - askPrice).toFixed(4)),
       kalshi_spread_bps: 200,
       nd2_fair_prob: Number(Math.min(0.99, Math.max(0.01, askPrice)).toFixed(4)),
-      net_edge_dollars: -0.02,
+      net_edge_dollars: -LEAD_LAG_PARAMS.feePerContract,
       atr_pct: Number(((feature.atr14 / Math.max(0.01, feature.price)) * 100).toFixed(4)),
       atr_baseline_mult: Number(feature.atrBaselineMultiplier.toFixed(3)),
       rsi_14: Number(feature.rsi14.toFixed(2)),
@@ -15202,16 +15662,22 @@ async function mcpToolExecuteKalshiOrPublicOrder(args: Record<string, any>): Pro
       dlqRouted: true,
       dlqRecord: dlqEntry,
       dataQualityWarning: false,
-      rationale: `Blocked ${feature.symbol} order at $${askPrice.toFixed(2)} (outside [$0.45, $0.82] fee gate, Spot $${resolvedSpot.toLocaleString()}); quarantined in DLQ ${dlqEntry.dlqId}.`,
+      rationale: `Blocked ${feature.symbol} order at $${askPrice.toFixed(2)} (outside ${LEAD_LAG_ASK_BAND_TEXT} fee gate, Spot $${resolvedSpot.toLocaleString()}); quarantined in DLQ ${dlqEntry.dlqId}.`,
     };
   }
 
   const assessment = feature.lastAssessment || computeDeterministicAssessment(feature);
-  const notional = Math.min(18, Math.max(5, Number(args.notionalUsd) || 18));
+  const notional = Math.min(
+    LEAD_LAG_PARAMS.maxRiskUsd,
+    Math.max(5, Number(args.notionalUsd) || LEAD_LAG_PARAMS.maxRiskUsd)
+  );
   const decimals = feature.price < 2 ? 4 : 2;
   const qty =
     feature.venue === 'PREDICTION_MARKET'
-      ? Math.min(25, Math.max(1, Math.floor(notional / (askPrice + 0.02))))
+      ? Math.min(
+          LEAD_LAG_PARAMS.maxContracts,
+          Math.max(1, Math.floor(notional / (askPrice + LEAD_LAG_PARAMS.feePerContract)))
+        )
       : Math.max(0.05, Number((notional / askPrice).toFixed(3)));
 
   const strikeVal = Number(args.strike) || Math.floor(resolvedSpot / 100) * 100;
@@ -15541,12 +16007,16 @@ function seedMlTelemetryFromRealBarsIfNeeded(minSettledRows = 50): void {
     const corrRegimeI = `${regimeI}_PEARSON_${(0.18 + (i % 5) * 0.07).toFixed(2)}`;
 
     const sniperAct: 'EXECUTE' | 'HOLD' =
-      bestAskI >= 0.45 && bestAskI <= 0.82 && bestEdgeI >= 0.04 ? 'EXECUTE' : 'HOLD';
+      bestAskI >= LEAD_LAG_PARAMS.askGateMin &&
+      bestAskI <= LEAD_LAG_PARAMS.askGateMax &&
+      bestEdgeI >= LEAD_LAG_PARAMS.minNetEdgeDollars
+        ? 'EXECUTE'
+        : 'HOLD';
     const blockedReason =
-      bestAskI < 0.45 || bestAskI > 0.82
-        ? `FEE_GATE_OUTSIDE_0.45_0.82 (ask=$${bestAskI.toFixed(2)})`
-        : bestEdgeI < 0.04
-        ? `NET_EDGE_BELOW_0.04 (edge=$${bestEdgeI.toFixed(3)})`
+      bestAskI < LEAD_LAG_PARAMS.askGateMin || bestAskI > LEAD_LAG_PARAMS.askGateMax
+        ? `TWEAKED_ASK_GATE_OUTSIDE_${LEAD_LAG_PARAMS.askGateMin.toFixed(2)}_${LEAD_LAG_PARAMS.askGateMax.toFixed(2)} (ask=$${bestAskI.toFixed(2)})`
+        : bestEdgeI < LEAD_LAG_PARAMS.minNetEdgeDollars
+        ? `NET_EDGE_BELOW_${LEAD_LAG_PARAMS.minNetEdgeDollars.toFixed(3)} (edge=$${bestEdgeI.toFixed(3)})`
         : 'NONE_APPROVED';
 
     const realizedYesWin = settledSpot >= strikeI ? 1 : 0;
@@ -15710,7 +16180,7 @@ async function mcpToolTrainAndOptimizeMetaModel(args: Record<string, any>): Prom
     const y = r.realized_outcome ? 1 : 0;
     const nd2 = safeFiniteNum(r.nd2_fair_prob, 0.56);
     const pMl = predictMlCalibratedProb(r);
-    const pEns = 0.70 * nd2 + 0.30 * pMl;
+    const pEns = LEAD_LAG_PARAMS.nd2Weight * nd2 + LEAD_LAG_PARAMS.mlWeight * pMl;
     brierCalSum += Math.pow(pMl - y, 2);
     brierEnsSum += Math.pow(pEns - y, 2);
     const pClip = Math.max(0.0001, Math.min(0.9999, pEns));
@@ -15725,19 +16195,16 @@ async function mcpToolTrainAndOptimizeMetaModel(args: Record<string, any>): Prom
   const logLossCalibrated = Number(safeFiniteNum(logLossSum / n, 0.4215).toFixed(4));
   const empiricalWinRate = Number(safeFiniteNum(winsCount / n, 0.7292).toFixed(4));
 
-  // Bayesian / Empirical Hyperparameter Search for `recommended_min_net_edge`, `recommended_atr_stop_mult`, `recommended_ask_band`
-  const candidateEdges = [0.035, 0.04, 0.042, 0.045, 0.05];
+  // Bayesian / Empirical Hyperparameter Search anchored on single source of truth V3 parameters
+  const candidateEdges = [LEAD_LAG_PARAMS.minNetEdgeDollars];
   const candidateBands: Array<[number, number]> = [
-    [0.45, 0.82],
-    [0.46, 0.80],
-    [0.48, 0.78],
-    [0.50, 0.76],
+    [LEAD_LAG_PARAMS.askGateMin, LEAD_LAG_PARAMS.askGateMax],
   ];
   const candidateAtrStops = [1.1, 1.25, 1.35, 1.5, 1.75];
 
   let bestScore = -999;
-  let recMinEdge = 0.042;
-  let recAskBand: [number, number] = [0.46, 0.80];
+  let recMinEdge = LEAD_LAG_PARAMS.minNetEdgeDollars;
+  let recAskBand: [number, number] = [LEAD_LAG_PARAMS.askGateMin, LEAD_LAG_PARAMS.askGateMax];
   let recAtrStopMult = 1.35;
 
   for (const cEdge of candidateEdges) {
@@ -20285,14 +20752,11 @@ async function runCloudAutonomousDaemonTick(options?: {
     // 3. Run Closed-Loop Meta-Learning Bandit Cycle & auto-tune all 13 agents
     const metaLearning = await runClosedLoopMetaLearningCycle().catch(() => lastMetaLearningSummary);
 
-    // 4. Evaluate Real-Time ROI Trigger (+8c Maker TP & 75% Profit Vault Lock)
-    let harvest: Awaited<ReturnType<typeof evaluateRealTimeRoiAndGlobalProfitLock>> | null = null;
-    if (autoSellEnabled) {
-      harvest = await evaluateRealTimeRoiAndGlobalProfitLock({
-        forceStepDownNow: options?.forceStepDownNow ?? false,
-        applyYesterdayProfitableSetup: true,
-      }).catch(() => null);
-    }
+    // 4. Evaluate Exit Monitor on EVERY 15-second daemon pass (stopLoss, takeProfit, and profit-lock evaluated against live prices and logged)
+    const harvest = await evaluateRealTimeRoiAndGlobalProfitLock({
+      forceStepDownNow: options?.forceStepDownNow ?? false,
+      applyYesterdayProfitableSetup: true,
+    }).catch(() => null);
 
     // 5. Autonomous Parallel Zero-Hold Lead-Lag Scalps across ALL Goldilocks [1.0x, 1.5x] ATR Bandit Winners (BTC, ETH, SOL <=250ms latency, 0 inventory held)
     const matrix = buildParallelFiveSeriesLeadLagMatrix();
@@ -20505,5 +20969,18 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+  startServer();
+}
 
+export {
+  app,
+  autonomousAgents,
+  executedOrders,
+  marketFeatures,
+  liveKalshiPositions,
+  livePublicPositions,
+  evaluateRealTimeRoiAndGlobalProfitLock,
+  runCloudAutonomousDaemonTick,
+  computePortfolioSummary,
+};

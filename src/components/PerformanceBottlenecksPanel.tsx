@@ -21,6 +21,7 @@ import type {
   McpCallLogEntry,
   PerformanceBottleneckSnapshot,
 } from '../types/quant.ts';
+import { LEAD_LAG_ASK_BAND_TEXT } from '../config/strategyParams.ts';
 
 interface PerformanceBottlenecksPanelProps {
   agents: AutonomousAgent[];
@@ -65,7 +66,7 @@ const STAGE_META: Record<
     barClass: 'bg-emerald-500',
     dotClass: 'bg-emerald-400',
     textClass: 'text-emerald-400',
-    description: '<12% single-asset NLV check, [$0.52, $0.74] fee gate, 2.2x ATR circuit-breaker, and SHA-256 idempotency_key lookup.',
+    description: `<12% single-asset NLV check, ${LEAD_LAG_ASK_BAND_TEXT} fee gate, 2.2x ATR circuit-breaker, and SHA-256 idempotency_key lookup.`,
   },
   VENUE_SIGNING_AND_ROUTING: {
     label: 'Cryptographic Signing & HTTP Dispatch',

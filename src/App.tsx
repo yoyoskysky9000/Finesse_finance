@@ -54,6 +54,7 @@ import { MentionLipReadSniperLab } from './components/MentionLipReadSniperLab.ts
 import { PerformanceBottlenecksPanel } from './components/PerformanceBottlenecksPanel.tsx';
 import { StrategyBacktester } from './components/StrategyBacktester.tsx';
 import { authenticatedApiFetch, syncQuantStateToFirestore } from './services/firestoreSyncService.ts';
+import { LEAD_LAG_ASK_BAND_TEXT, LEAD_LAG_CATALOG_LABEL } from './config/strategyParams.ts';
 
 type WorkspaceTab =
   | 'COMMAND_CENTER'
@@ -660,11 +661,17 @@ export default function App() {
     }
   };
 
-  const handleExecuteAgentTrade = async (agentId: string) => {
+  const handleExecuteAgentTrade = async (agentId: string, customIdempotencyKey?: string) => {
+    const idempotencyKey =
+      customIdempotencyKey ||
+      `ui-exec-${agentId}-${Math.floor(Date.now() / 5000)}`;
     const res = await authenticatedApiFetch('/api/agents/execute-trade', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId }),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify({ agentId, idempotencyKey }),
     });
     if (res.ok) {
       const data = await res.json();
@@ -673,7 +680,9 @@ export default function App() {
       setPortfolio(data.portfolio);
       setStatusBanner({
         type: 'success',
-        message: `Executed deterministic OCO order ${data.order.id} on ${data.order.symbol} at ${data.order.fillPrice}.`,
+        message: data.idempotentReplay
+          ? `Idempotent replay: returned existing order ${data.order.id} (${data.idempotencyKey}).`
+          : `Executed deterministic OCO order ${data.order.id} on ${data.order.symbol} at ${data.order.fillPrice}.`,
       });
     } else {
       const err = await res.json();
@@ -1844,7 +1853,7 @@ export default function App() {
                 )}
               </div>
 
-              {/* Public.com Master Quant Playbook & Code Vault: Live BTC Lead-Lag Sniper, $0.45-$0.82 Fee Gate & 16-Position Dust Sweeper */}
+              {/* Public.com Master Quant Playbook & Code Vault: BTC Lead-Lag Sniper & 16-Position Dust Sweeper */}
               <MasterPlaybookVault
                 features={features}
                 cleanupAudit={playbookCleanupAudit}
@@ -1996,6 +2005,7 @@ export default function App() {
                           <th className="py-2 px-3 text-right">Market Value</th>
                           <th className="py-2 px-3 text-right">Unrealized P&amp;L</th>
                           <th className="py-2 px-3 text-right">Portfolio %</th>
+                          <th className="py-2 px-3 text-right">Exit Monitor Eval</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/70">
@@ -2043,6 +2053,16 @@ export default function App() {
                               </td>
                               <td className="py-2 px-3 text-right text-slate-400">
                                 {pos.percentOfPortfolio.toFixed(2)}%
+                              </td>
+                              <td className="py-2 px-3 text-right font-mono text-[10px]">
+                                <div className="text-cyan-300">
+                                  {pos.lastExitEvaluationResult || 'EVALUATED_NO_ACTION'}
+                                </div>
+                                <div className="text-slate-500">
+                                  {pos.lastExitEvaluatedAt
+                                    ? new Date(pos.lastExitEvaluatedAt).toLocaleTimeString()
+                                    : 'Pending pass'}
+                                </div>
                               </td>
                             </tr>
                           );
@@ -2354,7 +2374,7 @@ export default function App() {
                           (${topAgent.metrics.allocatedCapitalUsd.toFixed(2)} #1 KXBTC15M Primary [{exposurePct}% NLV &lt; 12.0% Single-Asset Cap] + ${(coSniper?.metrics.allocatedCapitalUsd ?? 65).toFixed(2)} #2 KXETH15M Co-Sniper)
                         </div>
                         <div className="text-[11px] text-cyan-300/90 font-mono">
-                          Execution Upgrades Active: 30s Auto-HFT Kalshi Pulse · Zero False Kill-Switch Halts · [$0.35, $0.82] Sweet-Spot Band · +$0.10 Auto-Scale-Out
+                          Execution Upgrades Active: 30s Auto-HFT Kalshi Pulse · Zero False Kill-Switch Halts · {LEAD_LAG_ASK_BAND_TEXT} Sweet-Spot Band · +$0.10 Auto-Scale-Out
                         </div>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
@@ -2985,6 +3005,14 @@ export default function App() {
                               >
                                 {ord.status}
                               </span>
+                              {ord.lastExitEvaluationResult && (
+                                <div className="text-[10px] text-slate-400 mt-0.5">
+                                  {ord.lastExitEvaluationResult} ·{' '}
+                                  {ord.lastExitEvaluatedAt
+                                    ? new Date(ord.lastExitEvaluatedAt).toLocaleTimeString()
+                                    : ''}
+                                </div>
+                              )}
                             </td>
                           </tr>
                         );
@@ -3501,7 +3529,7 @@ export default function App() {
                         className="w-full px-3 py-2 bg-[#0B0F17] border border-slate-800 text-cyan-300 font-mono rounded focus:outline-none focus:border-cyan-400"
                       >
                         <option value="BTC_LEAD_LAG_SNIPER">
-                          Coinbase-to-Kalshi 15m Lead-Lag Sniper ($0.45–$0.82 Fee Gate + Black-Scholes d2)
+                          {LEAD_LAG_CATALOG_LABEL}
                         </option>
                         <option value="HFT_15M_CLOB_MICRO_SCALPER">
                           15m HFT CLOB Micro-Imbalance &amp; Tape Velocity Scalper

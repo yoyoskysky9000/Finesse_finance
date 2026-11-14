@@ -19,6 +19,11 @@ import type {
   OHLCVBar,
   StrategyArchetype,
 } from '../types/quant.ts';
+import {
+  LEAD_LAG_CATALOG_FORMULA,
+  LEAD_LAG_CATALOG_LABEL,
+  LEAD_LAG_PARAMS,
+} from '../config/strategyParams.ts';
 
 export interface StrategyBacktesterProps {
   features: MarketFeatureVector[];
@@ -93,9 +98,9 @@ interface RegimeMetricsSummary {
 const STRATEGY_SPECS: StrategySpec[] = [
   {
     id: 'BTC_LEAD_LAG_SNIPER',
-    label: 'Coinbase-to-Kalshi 15m Lead-Lag Sniper (Black-Scholes N(d2))',
+    label: LEAD_LAG_CATALOG_LABEL,
     archetype: 'SHORT_AND_FAST',
-    formulaSummary: 'Spot-to-Strike N(d2) divergence > +320 bps + $0.00 Post-Only Maker bid in [$0.16, $0.66]',
+    formulaSummary: LEAD_LAG_CATALOG_FORMULA,
     optimalRegimes: ['TRENDING_BULL', 'TRENDING_BEAR'],
   },
   {
@@ -240,19 +245,26 @@ function classifyBarRegime(
   const vwapDeltaPct = bar.vwap > 0 ? ((bar.close - bar.vwap) / bar.vwap) * 100 : 0;
   if (vwapDeltaPct > trendThreshold * 0.55) return 'TRENDING_BULL';
   if (vwapDeltaPct < -trendThreshold * 0.55) return 'TRENDING_BEAR';
-  return index % 4 === 0 ? 'HIGH_VOLATILITY_RANGE' : 'LOW_VOLATILITY_COMPRESSION';
+  return 'LOW_VOLATILITY_COMPRESSION';
 }
 
-function runDeterministicRegimeBacktest(params: {
-  feature: MarketFeatureVector;
-  strategyId: IndicatorStrategyId;
-  regimeFilter: RegimeFilterOption;
-  initialCapitalUsd: number;
-  contractMultiplier: number;
-  executionFeeMode: 'MAKER_POST_ONLY' | 'TAKER_QUADRATIC';
-  takeProfitCentsOrPct: number;
-  stopLossCentsOrPct: number;
+export function runDeterministicRegimeBacktest(params?: {
+  feature?: MarketFeatureVector | null | undefined;
+  strategyId?: IndicatorStrategyId;
+  regimeFilter?: RegimeFilterOption;
+  initialCapitalUsd?: number;
+  contractMultiplier?: number;
+  executionFeeMode?: 'MAKER_POST_ONLY' | 'TAKER_QUADRATIC';
+  takeProfitCentsOrPct?: number;
+  stopLossCentsOrPct?: number;
 }): {
+  hasData: boolean;
+  emptyStateMessage: string | null;
+  dataSourceLabel: string | null;
+  periodStart: string | null;
+  periodEnd: string | null;
+  barsCount: number;
+  isSimulation: true;
   trades: SimulatedRegimeTrade[];
   equityCurve: EquityCurvePoint[];
   regimeBreakdown: RegimeMetricsSummary[];
@@ -270,17 +282,50 @@ function runDeterministicRegimeBacktest(params: {
 } {
   const {
     feature,
-    strategyId,
-    regimeFilter,
-    initialCapitalUsd,
-    contractMultiplier,
-    executionFeeMode,
-    takeProfitCentsOrPct,
-    stopLossCentsOrPct,
-  } = params;
+    strategyId = 'BTC_LEAD_LAG_SNIPER',
+    regimeFilter = 'ALL_REGIMES',
+    initialCapitalUsd = 1000,
+    contractMultiplier = 22,
+    executionFeeMode = 'MAKER_POST_ONLY',
+    takeProfitCentsOrPct = 6,
+    stopLossCentsOrPct = 4,
+  } = params || {};
 
-  const bars = feature.bars && feature.bars.length > 2 ? feature.bars : [];
+  const bars = feature?.bars && Array.isArray(feature.bars) ? feature.bars : [];
+  if (!feature || bars.length === 0) {
+    return {
+      hasData: false,
+      emptyStateMessage: 'no data — nothing to show',
+      dataSourceLabel: null,
+      periodStart: null,
+      periodEnd: null,
+      barsCount: 0,
+      isSimulation: true,
+      trades: [],
+      equityCurve: [],
+      regimeBreakdown: [],
+      overallMetrics: {
+        netPnlUsd: 0,
+        totalReturnPct: 0,
+        winRatePct: 0,
+        sharpeRatio: 0,
+        profitFactor: 0,
+        maxDrawdownPct: 0,
+        avgNetEdgeBps: 0,
+        totalFeesUsd: 0,
+        totalTrades: 0,
+      },
+    };
+  }
+
   const isPrediction = feature.assetClass === 'PREDICTION_CONTRACT';
+  const dataSourceLabel =
+    feature.dataSource ||
+    (feature.venue === 'PREDICTION_MARKET'
+      ? 'Kalshi CLOB v2 / Coinbase Historical Candle Feed'
+      : 'Public.com / Coinbase Historical OHLCV Feed');
+  const periodStart = bars[0]?.timestamp || null;
+  const periodEnd = bars[bars.length - 1]?.timestamp || null;
 
   const barRegimes: MarketRegime[] = bars.map((_, idx) => classifyBarRegime(bars, idx, feature));
 
@@ -355,39 +400,44 @@ function runDeterministicRegimeBacktest(params: {
 
     switch (strategyId) {
       case 'BTC_LEAD_LAG_SNIPER': {
-        triggered = Math.abs(barReturn) >= 0.0015 || Math.abs(vwapSpread) >= 0.0012;
+        const candidatePx = isPrediction ? (barReturn >= 0 ? bar.close : 1 - bar.close) : bar.close;
+        const gateOk =
+          !isPrediction ||
+          (candidatePx >= LEAD_LAG_PARAMS.askGateMin && candidatePx <= LEAD_LAG_PARAMS.askGateMax);
+        triggered =
+          gateOk && (Math.abs(barReturn) >= 0.0015 || Math.abs(vwapSpread) >= 0.0012);
         side = isPrediction ? (barReturn >= 0 ? 'BUY_YES' : 'BUY_NO') : 'LONG';
-        rationale = `Spot lead-lag impulse ${(barReturn * 10000).toFixed(1)} bps vs strike; N(d2) edge in ${barRegime}`;
+        rationale = `Simulation: Spot lead-lag impulse ${(barReturn * 10000).toFixed(1)} bps vs strike in ${barRegime}`;
         break;
       }
       case 'HFT_15M_VWAP_SNAPBACK': {
         triggered = Math.abs(vwapSpread) >= 0.001 || closePositionInBar < 0.35 || closePositionInBar > 0.65;
         side = isPrediction ? (vwapSpread <= 0 ? 'BUY_YES' : 'BUY_NO') : 'LONG';
-        rationale = `Micro-VWAP snapback (${(vwapSpread * 100).toFixed(2)}% spread) in ${barRegime}`;
+        rationale = `Simulation: Micro-VWAP snapback (${(vwapSpread * 100).toFixed(2)}% spread) in ${barRegime}`;
         break;
       }
       case 'HFT_15M_GAMMA_CONVERGENCE': {
-        triggered = closePositionInBar >= 0.52 || barRegime === 'LOW_VOLATILITY_COMPRESSION' || barRegime === 'TRENDING_BULL';
+        triggered = closePositionInBar >= 0.5 || barRegime === 'LOW_VOLATILITY_COMPRESSION' || barRegime === 'TRENDING_BULL';
         side = isPrediction ? (bar.close >= bar.vwap ? 'BUY_YES' : 'BUY_NO') : 'LONG';
-        rationale = `15m Gamma convergence & strike pinning (VWAP=${bar.vwap.toFixed(2)}) in ${barRegime}`;
+        rationale = `Simulation: 15m Gamma convergence & strike pinning (VWAP=${bar.vwap.toFixed(2)}) in ${barRegime}`;
         break;
       }
       case 'KALSHI_CLOB_IMBALANCE': {
         triggered = bar.volume >= prevBar.volume * 0.92;
         side = isPrediction ? (barReturn >= -0.0005 ? 'BUY_YES' : 'BUY_NO') : 'LONG';
-        rationale = `CLOB L2 bid/ask imbalance (${feature.orderbookImbalance.toFixed(2)}) + tape flow in ${barRegime}`;
+        rationale = `Simulation: CLOB L2 bid/ask imbalance (${feature.orderbookImbalance.toFixed(2)}) + tape flow in ${barRegime}`;
         break;
       }
       case 'RSI_ATR_MEAN_REVERSION': {
         triggered = closePositionInBar <= 0.58 || barRegime === 'LOW_VOLATILITY_COMPRESSION' || barRegime === 'HIGH_VOLATILITY_RANGE';
         side = isPrediction ? (barReturn <= 0 ? 'BUY_YES' : 'BUY_NO') : 'LONG';
-        rationale = `Wilder RSI(${feature.rsi14.toFixed(1)}) + ATR(${feature.atrBaselineMultiplier.toFixed(2)}x) accumulation in ${barRegime}`;
+        rationale = `Simulation: Wilder RSI(${feature.rsi14.toFixed(1)}) + ATR(${feature.atrBaselineMultiplier.toFixed(2)}x) accumulation in ${barRegime}`;
         break;
       }
       default: {
         triggered = Math.abs(barReturn) >= 0.0008 || bar.close >= bar.vwap;
         side = isPrediction ? (bar.close >= bar.vwap ? 'BUY_YES' : 'BUY_NO') : 'LONG';
-        rationale = `${strategyId} momentum/VWAP alignment in ${barRegime}`;
+        rationale = `Simulation: ${strategyId} momentum/VWAP alignment in ${barRegime}`;
         break;
       }
     }
@@ -400,20 +450,25 @@ function runDeterministicRegimeBacktest(params: {
     const holdBars = Math.min(2, bars.length - 1 - i);
     const exitBar = bars[i + holdBars] || nextBar;
 
-    // Calculate realistic entry/exit and Kalshi V2 / Brokerage fees
-    const spec = STRATEGY_SPECS.find((s) => s.id === strategyId) || STRATEGY_SPECS[0];
-    const regimeAligned = spec.optimalRegimes.includes(barRegime);
-
-    let entryPrice = Number(bar.close.toFixed(isPrediction ? 2 : 2));
-    if (isPrediction) {
-      entryPrice = Math.min(0.66, Math.max(0.18, side === 'BUY_NO' ? Number((1 - bar.close).toFixed(2)) : entryPrice));
-    }
+    // Compute entry and exit strictly from real loaded historical candle data (no alignmentEdge bonus or artificial dampening)
+    const entryPrice = isPrediction
+      ? Number((side === 'BUY_NO' ? 1 - bar.close : bar.close).toFixed(4))
+      : Number(bar.close.toFixed(2));
 
     const rawNextClose = isPrediction
+      ? Number((side === 'BUY_NO' ? 1 - exitBar.close : exitBar.close).toFixed(4))
+      : Number(exitBar.close.toFixed(2));
+
+    const barFavorableHigh = isPrediction
       ? side === 'BUY_NO'
-        ? Math.min(0.92, Math.max(0.08, 1 - exitBar.close))
-        : Math.min(0.92, Math.max(0.08, exitBar.close))
-      : exitBar.close;
+        ? 1 - exitBar.low
+        : exitBar.high
+      : exitBar.high;
+    const barAdverseLow = isPrediction
+      ? side === 'BUY_NO'
+        ? 1 - exitBar.high
+        : exitBar.low
+      : exitBar.low;
 
     const tpDelta = isPrediction
       ? takeProfitCentsOrPct / 100
@@ -422,26 +477,16 @@ function runDeterministicRegimeBacktest(params: {
       ? stopLossCentsOrPct / 100
       : entryPrice * (stopLossCentsOrPct / 100);
 
-    // Determine outcome from real bar trajectory + regime alignment
-    const rawMove = rawNextClose - entryPrice;
-    const alignmentEdge = regimeAligned
-      ? isPrediction
-        ? 0.035
-        : entryPrice * 0.0085
-      : isPrediction
-      ? 0.008
-      : entryPrice * 0.0015;
-
-    const effectiveMove = rawMove * 0.65 + alignmentEdge;
-    let exitPrice = entryPrice + effectiveMove;
+    // Pure historical candle evaluation: check stop-loss first (conservative), then take-profit, else close at real bar close
+    let exitPrice = rawNextClose;
     let exitReason: SimulatedRegimeTrade['exitReason'] = 'WINDOW_CLOSE';
 
-    if (effectiveMove >= tpDelta * 0.75) {
-      exitPrice = entryPrice + tpDelta;
-      exitReason = 'TAKE_PROFIT';
-    } else if (effectiveMove <= -slDelta) {
-      exitPrice = Math.max(0.04, entryPrice - slDelta);
+    if (entryPrice - barAdverseLow >= slDelta) {
+      exitPrice = Math.max(0.01, Number((entryPrice - slDelta).toFixed(4)));
       exitReason = 'STOP_LOSS';
+    } else if (barFavorableHigh - entryPrice >= tpDelta) {
+      exitPrice = Number((entryPrice + tpDelta).toFixed(4));
+      exitReason = 'TAKE_PROFIT';
     } else if (barRegimes[i + holdBars] !== barRegime) {
       exitReason = 'REGIME_SHIFT';
     }
@@ -534,14 +579,15 @@ function runDeterministicRegimeBacktest(params: {
     const totalFeesUsd = Number(list.reduce((s, t) => s + t.feeUsd, 0).toFixed(2));
     const grossProfit = wins.reduce((s, t) => s + t.netPnlUsd, 0);
     const grossLoss = Math.abs(losses.reduce((s, t) => s + t.netPnlUsd, 0));
-    const profitFactor = grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : grossProfit > 0 ? 3.4 : 1.0;
+    const profitFactor = grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : 0;
     const avgNetEdgeBps = Math.round(list.reduce((s, t) => s + t.netReturnBps, 0) / count);
     const rets = list.map((t) => t.netReturnBps / 100);
     const meanRet = rets.reduce((s, r) => s + r, 0) / count;
     const variance =
-      rets.reduce((s, r) => s + Math.pow(r - meanRet, 2), 0) / Math.max(1, count - 1);
-    const stdDev = Math.max(0.35, Math.sqrt(variance));
-    const sharpeRatio = Number(Math.min(4.8, Math.max(-1.5, (meanRet / stdDev) * Math.sqrt(count))).toFixed(2));
+      count > 1 ? rets.reduce((s, r) => s + Math.pow(r - meanRet, 2), 0) / (count - 1) : 0;
+    const stdDev = Math.sqrt(variance);
+    const sharpeRatio =
+      stdDev > 0 ? Number(((meanRet / stdDev) * Math.sqrt(count)).toFixed(2)) : 0;
 
     return {
       netPnlUsd,
@@ -580,6 +626,13 @@ function runDeterministicRegimeBacktest(params: {
   const overall = computeStatsForTrades(trades, maxDrawdownPct);
 
   return {
+    hasData: true,
+    emptyStateMessage: null,
+    dataSourceLabel,
+    periodStart,
+    periodEnd,
+    barsCount: bars.length,
+    isSimulation: true,
     trades,
     equityCurve,
     regimeBreakdown,
@@ -640,9 +693,10 @@ export const StrategyBacktester: React.FC<StrategyBacktesterProps> = ({
     stopLossCentsOrPct,
   ]);
 
-  // Cross-Feature Regime Matrix Leaderboard: evaluates all features in the active regimeFilter
+  // Cross-Feature Regime Matrix Leaderboard: evaluates only features with loaded historical bars
   const crossAssetRegimeLeaderboard = useMemo(() => {
     return features
+      .filter((feat) => feat.bars && feat.bars.length > 0)
       .map((feat) => {
         const res = runDeterministicRegimeBacktest({
           feature: feat,
@@ -696,15 +750,39 @@ export const StrategyBacktester: React.FC<StrategyBacktesterProps> = ({
     }
   };
 
-  if (!activeFeature || !simulation) {
+  if (
+    !activeFeature ||
+    !activeFeature.bars ||
+    activeFeature.bars.length === 0 ||
+    !simulation ||
+    !simulation.hasData
+  ) {
     return (
-      <div className="p-6 border border-slate-800 bg-[#111827] text-xs font-mono text-slate-400">
-        Hydrating historical feature bars for regime backtesting...
+      <div
+        data-testid="strategy-backtester-no-data"
+        className="p-6 border border-slate-800 bg-[#111827] text-xs font-mono text-slate-300 space-y-2"
+      >
+        <div className="uppercase tracking-wider text-amber-300 font-semibold">
+          SIMULATION ONLY — HISTORICAL BACKTESTER
+        </div>
+        <div className="text-sm font-bold text-slate-100">no data — nothing to show</div>
+        <p className="text-slate-400">
+          No historical OHLCV candle data is currently loaded for the selected instrument. Simulation metrics are withheld until real historical bars are available.
+        </p>
       </div>
     );
   }
 
-  const { overallMetrics, regimeBreakdown, equityCurve, trades } = simulation;
+  const {
+    overallMetrics,
+    regimeBreakdown,
+    equityCurve,
+    trades,
+    dataSourceLabel,
+    periodStart,
+    periodEnd,
+    barsCount,
+  } = simulation;
 
   // SVG Chart dimensions
   const chartWidth = 760;
@@ -732,22 +810,27 @@ export const StrategyBacktester: React.FC<StrategyBacktesterProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-3.5">
           <div>
             <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+              <span className="px-2 py-0.5 bg-amber-500/20 border border-amber-500/50 text-amber-300 font-bold uppercase">
+                SIMULATION
+              </span>
               <span className="text-sm font-semibold font-sans text-slate-100">
-                Multi-Regime Historical Strategy Backtester
+                Multi-Regime Historical Strategy Backtester (Simulation)
               </span>
               <span aria-hidden="true" className="text-slate-600">·</span>
               <span className="text-emerald-400">
-                {activeFeature.bars.length} Historical Bars ({activeFeature.symbol})
+                {barsCount} Loaded Candles ({activeFeature.symbol})
               </span>
               <span aria-hidden="true" className="text-slate-600">·</span>
               <span className="text-cyan-300">
-                Live Regime: {activeFeature.lastAssessment?.market_regime || 'LOW_VOLATILITY_COMPRESSION'}
+                Source: {dataSourceLabel}
               </span>
               <span aria-hidden="true" className="text-slate-600">·</span>
-              <span className="text-amber-300">{contractMultiplier}x Contract Sizing</span>
+              <span className="text-slate-300">
+                Period: {periodStart} &rarr; {periodEnd}
+              </span>
             </div>
             <p className="text-xs text-slate-400 mt-1">
-              Partitions real historical OHLCV &amp; Kalshi CLOB bars into the 4 canonical market regimes (<span className="font-mono text-emerald-300">TRENDING_BULL</span>, <span className="font-mono text-rose-300">TRENDING_BEAR</span>, <span className="font-mono text-amber-300">HIGH_VOLATILITY_RANGE</span>, <span className="font-mono text-cyan-300">LOW_VOLATILITY_COMPRESSION</span>) to verify fee-adjusted net edge before live capital deployment.
+              <strong className="text-amber-300 font-mono">SIMULATION OUTPUT ONLY:</strong> Computed strictly from {barsCount} loaded historical candles from <span className="font-mono text-slate-200">{dataSourceLabel}</span> covering <span className="font-mono text-slate-200">{periodStart}</span> to <span className="font-mono text-slate-200">{periodEnd}</span> with zero synthetic alignment bonuses.
             </p>
           </div>
 
@@ -916,12 +999,12 @@ export const StrategyBacktester: React.FC<StrategyBacktesterProps> = ({
         </div>
       </div>
 
-      {/* Top 3 Summary KPI Cards (Max 3 cards in a row, max 4 data points per card) */}
+      {/* Top 3 Summary KPI Cards (Labeled as Simulation) */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="p-4 border border-emerald-500/40 bg-[#111827]">
           <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>Fee-Adjusted Net Return ({regimeFilter === 'ALL_REGIMES' ? 'All Regimes' : REGIME_META[regimeFilter].shortLabel})</span>
-            <span className="font-mono text-emerald-400">{executionFeeMode}</span>
+            <span>Simulated Fee-Adjusted Net Return ({regimeFilter === 'ALL_REGIMES' ? 'All Regimes' : REGIME_META[regimeFilter].shortLabel})</span>
+            <span className="font-mono text-emerald-400">SIMULATION · {executionFeeMode}</span>
           </div>
           <div
             className={`mt-1 text-2xl font-bold font-mono tabular-nums ${
@@ -933,36 +1016,36 @@ export const StrategyBacktester: React.FC<StrategyBacktesterProps> = ({
             {overallMetrics.totalReturnPct.toFixed(2)}%)
           </div>
           <div className="mt-1.5 flex items-center justify-between text-xs font-mono text-slate-400">
-            <span>Avg Net Edge: {overallMetrics.avgNetEdgeBps >= 0 ? '+' : ''}{overallMetrics.avgNetEdgeBps} bps</span>
-            <span>Total Fees: ${overallMetrics.totalFeesUsd.toFixed(2)}</span>
+            <span>Simulated Avg Net Edge: {overallMetrics.avgNetEdgeBps >= 0 ? '+' : ''}{overallMetrics.avgNetEdgeBps} bps</span>
+            <span>Simulated Fees: ${overallMetrics.totalFeesUsd.toFixed(2)}</span>
           </div>
         </div>
 
         <div className="p-4 border border-slate-800 bg-[#111827]">
           <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>Walk-Forward Sharpe &amp; Profit Factor</span>
+            <span>Simulated Walk-Forward Sharpe &amp; Profit Factor</span>
             <span className="font-mono text-cyan-400">{overallMetrics.totalTrades} Simulated Fills</span>
           </div>
           <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-100">
             Sharpe {overallMetrics.sharpeRatio.toFixed(2)} · PF {overallMetrics.profitFactor.toFixed(2)}
           </div>
           <div className="mt-1.5 flex items-center justify-between text-xs font-mono text-slate-400">
-            <span className="text-emerald-400">Win Rate: {overallMetrics.winRatePct.toFixed(1)}%</span>
-            <span>Sizing: {contractMultiplier}x Contracts</span>
+            <span className="text-emerald-400">Simulated Win Rate: {overallMetrics.winRatePct.toFixed(1)}%</span>
+            <span>Simulation Sizing: {contractMultiplier}x</span>
           </div>
         </div>
 
         <div className="p-4 border border-slate-800 bg-[#111827]">
           <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>Max Drawdown &amp; Live Feature Telemetry</span>
-            <span className="font-mono text-amber-300">ATR {activeFeature.atrBaselineMultiplier.toFixed(2)}x</span>
+            <span>Simulated Max Drawdown &amp; Candle Period</span>
+            <span className="font-mono text-amber-300">SIMULATION</span>
           </div>
           <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-amber-300">
-            -{overallMetrics.maxDrawdownPct.toFixed(2)}% Max DD
+            -{overallMetrics.maxDrawdownPct.toFixed(2)}% Simulated Max DD
           </div>
           <div className="mt-1.5 flex items-center justify-between text-xs font-mono text-slate-400">
-            <span>RSI(14): {activeFeature.rsi14.toFixed(1)}</span>
-            <span>Spread: {activeFeature.bidAskSpreadBps} bps</span>
+            <span>Source: {dataSourceLabel}</span>
+            <span>{barsCount} Candles</span>
           </div>
         </div>
       </div>

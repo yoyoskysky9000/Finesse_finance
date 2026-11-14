@@ -19,6 +19,7 @@ import type {
   StrategyTournamentEntry,
 } from '../types/quant.ts';
 import { StrategyCorrelationMatrix } from './StrategyCorrelationMatrix.tsx';
+import { LEAD_LAG_CATALOG_FORMULA, LEAD_LAG_CATALOG_LABEL } from '../config/strategyParams.ts';
 
 interface AlphaScannerBacktestProps {
   features: MarketFeatureVector[];
@@ -44,8 +45,8 @@ const INDICATOR_OPTIONS: Array<{
 }> = [
   {
     id: 'BTC_LEAD_LAG_SNIPER',
-    label: 'Coinbase-to-Kalshi 15m Lead-Lag Sniper ($0.45–$0.82 Fee Gate + Black-Scholes d2)',
-    formula: 'Ask in [$0.45, $0.82] ONLY + Black-Scholes N(d2) Net Edge > +$0.04 after $0.02 Fee + Max 25 Contracts ($18 Cap)',
+    label: LEAD_LAG_CATALOG_LABEL,
+    formula: LEAD_LAG_CATALOG_FORMULA,
   },
   {
     id: 'HFT_15M_CLOB_MICRO_SCALPER',

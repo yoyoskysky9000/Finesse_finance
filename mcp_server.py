@@ -1096,14 +1096,39 @@ async def fetch_live_coinbase_candles_and_telemetry(
 # =====================================================================
 # 3. STRATEGY CATALOG, PORTFOLIO SNAPSHOT & RISK-FIRST MATH HELPERS
 # =====================================================================
+_STRATEGY_PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_params.json")
+with open(_STRATEGY_PARAMS_PATH, "r", encoding="utf-8") as _sp_file:
+    STRATEGY_PARAMS: Dict[str, Any] = json.load(_sp_file)
+
+LEAD_LAG_PARAMS: Dict[str, Any] = STRATEGY_PARAMS["btcLeadLagSniper"]
+LEAD_LAG_ASK_MIN: float = float(LEAD_LAG_PARAMS["askGateMin"])
+LEAD_LAG_ASK_MAX: float = float(LEAD_LAG_PARAMS["askGateMax"])
+LEAD_LAG_MIN_EDGE: float = float(LEAD_LAG_PARAMS["minNetEdgeDollars"])
+LEAD_LAG_WIN_MIN: float = float(LEAD_LAG_PARAMS["timeWindowMinutes"][0])
+LEAD_LAG_WIN_MAX: float = float(LEAD_LAG_PARAMS["timeWindowMinutes"][1])
+LEAD_LAG_VOL_CUSHION_NEAR_THRESH: float = float(LEAD_LAG_PARAMS["volCushionNearExpiryThresholdMins"])
+LEAD_LAG_VOL_CUSHION_NEAR_MULT: float = float(LEAD_LAG_PARAMS["volCushionNearExpiryMult"])
+LEAD_LAG_VOL_CUSHION_STD_MULT: float = float(LEAD_LAG_PARAMS["volCushionStandardMult"])
+LEAD_LAG_ND2_WEIGHT: float = float(LEAD_LAG_PARAMS["nd2Weight"])
+LEAD_LAG_ML_WEIGHT: float = float(LEAD_LAG_PARAMS["mlWeight"])
+LEAD_LAG_MAX_CONTRACTS: int = int(LEAD_LAG_PARAMS["maxContracts"])
+LEAD_LAG_MAX_RISK_USD: float = float(LEAD_LAG_PARAMS["maxRiskUsd"])
+LEAD_LAG_ASK_BAND_STR: str = f"[${LEAD_LAG_ASK_MIN:.2f}, ${LEAD_LAG_ASK_MAX:.2f}]"
+LEAD_LAG_ASK_RANGE_STR: str = f"${LEAD_LAG_ASK_MIN:.2f}–${LEAD_LAG_ASK_MAX:.2f}"
+
 INDICATOR_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     {
         "id": "BTC_LEAD_LAG_SNIPER",
-        "label": "Coinbase-to-Kalshi 15m Lead-Lag Sniper ($0.45–$0.82 Fee Gate + Black-Scholes d2)",
-        "formula": "Ask in [$0.45, $0.82] ONLY + Black-Scholes N(d2) Net Edge > +$0.04 after $0.02 Fee + Max 25 Contracts ($18 Cap)",
+        "label": f"Coinbase-to-Kalshi 15m Lead-Lag Sniper ({LEAD_LAG_ASK_RANGE_STR} Gate + {int(LEAD_LAG_ND2_WEIGHT * 100)}/{int(LEAD_LAG_ML_WEIGHT * 100)} N(d2)/ML)",
+        "formula": (
+            f"Ask in {LEAD_LAG_ASK_BAND_STR} + Net Edge >= +${LEAD_LAG_MIN_EDGE:.3f} + "
+            f"T in [{LEAD_LAG_WIN_MIN:.1f}m, {LEAD_LAG_WIN_MAX:.1f}m] + "
+            f"{int(LEAD_LAG_ND2_WEIGHT * 100)}% Jump-N(d2)/{int(LEAD_LAG_ML_WEIGHT * 100)}% ML + "
+            f"Max {LEAD_LAG_MAX_CONTRACTS} Contracts (${LEAD_LAG_MAX_RISK_USD:.0f} Cap)"
+        ),
         "archetype": "SHORT_AND_FAST",
-        "stop_atr": 0.9,
-        "tp_atr": 2.5,
+        "stop_atr": float(LEAD_LAG_PARAMS["stopAtr"]),
+        "tp_atr": float(LEAD_LAG_PARAMS["tpAtr"]),
     },
     {
         "id": "HFT_15M_CLOB_MICRO_SCALPER",
@@ -1271,9 +1296,9 @@ def get_active_meta_model(con: Optional[_LedgerConnectionWrapper] = None) -> Dic
                 "log_loss_calibrated": float(row[6] or 0.44),
                 "empirical_win_rate": float(row[7] or 0.68),
                 "avg_realized_pnl_bps": float(weights_data.get("avg_realized_pnl_bps", 48.5)),
-                "recommended_min_net_edge": float(row[8] or 0.042),
+                "recommended_min_net_edge": float(row[8] or LEAD_LAG_MIN_EDGE),
                 "recommended_atr_stop_mult": float(row[12] or weights_data.get("recommended_atr_stop_mult", 1.35)),
-                "recommended_ask_band": [float(row[9] or 0.47), float(row[10] or 0.80)],
+                "recommended_ask_band": [float(row[9] or LEAD_LAG_ASK_MIN), float(row[10] or LEAD_LAG_ASK_MAX)],
                 "weights": weights_data.get(
                     "weights",
                     {
@@ -1302,9 +1327,9 @@ def get_active_meta_model(con: Optional[_LedgerConnectionWrapper] = None) -> Dic
             "log_loss_calibrated": 0.465,
             "empirical_win_rate": 0.667,
             "avg_realized_pnl_bps": 42.0,
-            "recommended_min_net_edge": 0.04,
+            "recommended_min_net_edge": LEAD_LAG_MIN_EDGE,
             "recommended_atr_stop_mult": 1.35,
-            "recommended_ask_band": [0.45, 0.82],
+            "recommended_ask_band": [LEAD_LAG_ASK_MIN, LEAD_LAG_ASK_MAX],
             "weights": {
                 "intercept": -1.45,
                 "nd2_fair_prob": 2.90,
@@ -1556,15 +1581,18 @@ async def bootstrap_ml_telemetry_from_live_candles(min_rows: int = 50) -> int:
             l2_imb_i = round(0.18 + (0.14 if best_side_yes else -0.12) + (ma_spread_i * 0.2), 3)
             corr_regime_i = f"{regime_i}_PEARSON_{0.18 + (i % 5) * 0.07:.2f}"
 
-            if best_ask_i < 0.45 or best_ask_i > 0.82:
+            if best_ask_i < LEAD_LAG_ASK_MIN or best_ask_i > LEAD_LAG_ASK_MAX:
                 sniper_act = "HOLD"
-                blocked_reason = f"FEE_GATE_OUTSIDE_0.45_0.82 (ask=${best_ask_i:.2f})"
-            elif best_edge_i < 0.04:
+                blocked_reason = f"TWEAKED_ASK_GATE_OUTSIDE_{LEAD_LAG_ASK_MIN:.2f}_{LEAD_LAG_ASK_MAX:.2f} (ask=${best_ask_i:.2f})"
+            elif minutes_left_i < LEAD_LAG_WIN_MIN or minutes_left_i > LEAD_LAG_WIN_MAX:
                 sniper_act = "HOLD"
-                blocked_reason = f"NET_EDGE_BELOW_0.04 (edge=${best_edge_i:+.3f})"
+                blocked_reason = f"TIME_WINDOW_GUARD_OUTSIDE_{LEAD_LAG_WIN_MIN:.1f}M_{LEAD_LAG_WIN_MAX:.1f}M (T={minutes_left_i:.1f}m)"
+            elif best_edge_i < LEAD_LAG_MIN_EDGE:
+                sniper_act = "HOLD"
+                blocked_reason = f"NET_EDGE_BELOW_{LEAD_LAG_MIN_EDGE:.3f}_MIN (edge=${best_edge_i:+.3f})"
             else:
                 sniper_act = "EXECUTE"
-                blocked_reason = "NONE_APPROVED"
+                blocked_reason = "PAPER_SHADOW_APPROVED_V3"
 
             realized_yes_win = 1 if settled_spot >= strike_i else 0
             favored_win = realized_yes_win if best_side_yes else (1 - realized_yes_win)
@@ -1634,9 +1662,9 @@ def compute_btc_lead_lag_gate(
     market_regime: str = "LOW_VOLATILITY_COMPRESSION",
 ) -> Dict[str, Any]:
     """
-    Calculates analytical Black-Scholes N(d2) binary probability, blends it with the trained
-    DuckDB Meta-Model probability (`ensemble_prob = 0.70 * nd2_fair_prob + 0.30 * ml_calibrated_prob`),
-    and enforces the [$0.45, $0.82] fee gate.
+    Calculates analytical Jump-Damped Black-Scholes N(d2) binary probability, blends it with the trained
+    DuckDB Meta-Model probability using shared V3 weights (40% N(d2) + 60% ML),
+    and enforces the shared ask gate, time window, and minimum net edge from strategy_params.json.
     """
     if coinbase_spot <= 0 or strike <= 0 or minutes_left <= 0 or annual_vol <= 0:
         return {
@@ -1655,8 +1683,10 @@ def compute_btc_lead_lag_gate(
         }
 
     t_years = max(minutes_left, 0.1) / (365.25 * 24 * 60)
-    sigma_t = annual_vol * math.sqrt(t_years)
-    d2 = (math.log(coinbase_spot / strike) - 0.5 * (annual_vol ** 2) * t_years) / sigma_t
+    vol_cushion_mult = LEAD_LAG_VOL_CUSHION_NEAR_MULT if minutes_left < LEAD_LAG_VOL_CUSHION_NEAR_THRESH else LEAD_LAG_VOL_CUSHION_STD_MULT
+    effective_jump_vol = round(annual_vol * vol_cushion_mult, 4)
+    sigma_t = max(1e-4, effective_jump_vol * math.sqrt(t_years))
+    d2 = (math.log(coinbase_spot / strike) - 0.5 * (effective_jump_vol ** 2) * t_years) / sigma_t
     nd2_fair_prob = round(0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0))), 4)
 
     implied_yes_bid = max(0.01, round(1.0 - no_ask, 4))
@@ -1672,7 +1702,7 @@ def compute_btc_lead_lag_gate(
         minutes_left=minutes_left,
         model_state=model_state,
     )
-    ensemble_yes_prob = round(0.70 * nd2_fair_prob + 0.30 * ml_calibrated_prob, 4)
+    ensemble_yes_prob = round(LEAD_LAG_ND2_WEIGHT * nd2_fair_prob + LEAD_LAG_ML_WEIGHT * ml_calibrated_prob, 4)
     ensemble_no_prob = round(1.0 - ensemble_yes_prob, 4)
 
     yes_edge = ensemble_yes_prob - (yes_ask + fee_per_contract)
@@ -1680,19 +1710,24 @@ def compute_btc_lead_lag_gate(
 
     best_side = "BUY_YES" if yes_edge >= no_edge else "BUY_NO"
     best_ask = yes_ask if best_side == "BUY_YES" else no_ask
+    maker_limit_bid = round(max(0.05, best_ask - 0.01), 2)
     best_edge = max(yes_edge, no_edge)
 
-    fee_gate_passed = 0.45 <= best_ask <= 0.82
-    edge_gate_passed = best_edge >= 0.04
+    fee_gate_passed = LEAD_LAG_ASK_MIN <= best_ask <= LEAD_LAG_ASK_MAX
+    time_window_passed = LEAD_LAG_WIN_MIN <= minutes_left <= LEAD_LAG_WIN_MAX
+    edge_gate_passed = best_edge >= LEAD_LAG_MIN_EDGE
 
     if not fee_gate_passed:
-        gate_reason = f"FEE_GATE_OUTSIDE_0.45_0.82 (ask=${best_ask:.2f})"
+        gate_reason = f"TWEAKED_ASK_GATE_OUTSIDE_{LEAD_LAG_ASK_MIN:.2f}_{LEAD_LAG_ASK_MAX:.2f} (ask=${best_ask:.2f})"
         sniper_action: Literal["EXECUTE", "HOLD"] = "HOLD"
+    elif not time_window_passed:
+        gate_reason = f"TIME_WINDOW_GUARD_OUTSIDE_{LEAD_LAG_WIN_MIN:.1f}M_{LEAD_LAG_WIN_MAX:.1f}M (T={minutes_left:.1f}m)"
+        sniper_action = "HOLD"
     elif not edge_gate_passed:
-        gate_reason = f"NET_EDGE_BELOW_0.04 (edge=${best_edge:+.3f})"
+        gate_reason = f"NET_EDGE_BELOW_{LEAD_LAG_MIN_EDGE:.3f}_MIN (edge=${best_edge:+.3f})"
         sniper_action = "HOLD"
     else:
-        gate_reason = "NONE_APPROVED"
+        gate_reason = "PAPER_SHADOW_APPROVED_V3"
         sniper_action = "EXECUTE"
 
     # Log telemetry row into persistent DuckDB `ml_telemetry_ledger`
@@ -1715,7 +1750,22 @@ def compute_btc_lead_lag_gate(
         realized_outcome=None,
     )
 
-    if not fee_gate_passed:
+    if not fee_gate_passed or not time_window_passed or not edge_gate_passed:
+        if not fee_gate_passed:
+            rationale_str = (
+                f"Blocked by V3 Tightened Ask Gate: Ask ${best_ask:.2f} outside {LEAD_LAG_ASK_BAND_STR} sweet spot "
+                f"(N(d2)={nd2_fair_prob:.3f}, ML={ml_calibrated_prob:.3f}, Ensemble={ensemble_yes_prob:.3f})."
+            )
+        elif not time_window_passed:
+            rationale_str = (
+                f"Blocked by V3 Theta/Gamma Window Guard: T={minutes_left:.1f}m outside "
+                f"[{LEAD_LAG_WIN_MIN:.1f}m, {LEAD_LAG_WIN_MAX:.1f}m]."
+            )
+        else:
+            rationale_str = (
+                f"Hold posture: Ensemble net edge +${best_edge:.3f}/contract below +${LEAD_LAG_MIN_EDGE:.3f} threshold "
+                f"(N(d2)={nd2_fair_prob:.3f}, ML={ml_calibrated_prob:.3f})."
+            )
         return {
             "action": "HOLD",
             "sniper_action": "HOLD",
@@ -1725,46 +1775,24 @@ def compute_btc_lead_lag_gate(
             "spotSource": spot_source,
             "bestSide": best_side,
             "bestAsk": round(best_ask, 2),
+            "makerLimitBid": maker_limit_bid,
             "nd2_fair_prob": nd2_fair_prob,
             "ml_calibrated_prob": ml_calibrated_prob,
             "ensemble_prob": ensemble_yes_prob,
             "fairYesProb": ensemble_yes_prob,
             "netEdgePerContract": round(best_edge, 4),
-            "feeGatePassed": False,
+            "feeGatePassed": fee_gate_passed,
+            "timeWindowGatePassed": time_window_passed,
             "edgeGatePassed": edge_gate_passed,
             "gate_blocked_reason": gate_reason,
             "metaModelId": model_state["model_id"],
             "metaModelTrained": model_state["is_trained"],
             "dataQualityWarning": False,
-            "rationale": f"Blocked by Fee Gate: Ask ${best_ask:.2f} outside [$0.45, $0.82] band (N(d2)={nd2_fair_prob:.3f}, ML={ml_calibrated_prob:.3f}, Ensemble={ensemble_yes_prob:.3f}).",
+            "rationale": rationale_str,
         }
 
-    if not edge_gate_passed:
-        return {
-            "action": "HOLD",
-            "sniper_action": "HOLD",
-            "contracts": 0,
-            "coinbaseSpot": round(coinbase_spot, 2),
-            "strike": round(strike, 2),
-            "spotSource": spot_source,
-            "bestSide": best_side,
-            "bestAsk": round(best_ask, 2),
-            "nd2_fair_prob": nd2_fair_prob,
-            "ml_calibrated_prob": ml_calibrated_prob,
-            "ensemble_prob": ensemble_yes_prob,
-            "fairYesProb": ensemble_yes_prob,
-            "netEdgePerContract": round(best_edge, 4),
-            "feeGatePassed": True,
-            "edgeGatePassed": False,
-            "gate_blocked_reason": gate_reason,
-            "metaModelId": model_state["model_id"],
-            "metaModelTrained": model_state["is_trained"],
-            "dataQualityWarning": False,
-            "rationale": f"Hold posture: Ensemble net edge +${best_edge:.3f}/contract below +$0.04 threshold (N(d2)={nd2_fair_prob:.3f}, ML={ml_calibrated_prob:.3f}).",
-        }
-
-    contracts = min(4, max(1, int(3.00 // (best_ask + fee_per_contract))))
-    total_risk = round(contracts * (best_ask + fee_per_contract), 2)
+    contracts = min(LEAD_LAG_MAX_CONTRACTS, max(1, int(LEAD_LAG_MAX_RISK_USD // maker_limit_bid)))
+    total_risk = round(contracts * maker_limit_bid, 2)
     return {
         "action": best_side,
         "sniper_action": "EXECUTE",
@@ -1775,14 +1803,16 @@ def compute_btc_lead_lag_gate(
         "spotSource": spot_source,
         "bestSide": best_side,
         "bestAsk": round(best_ask, 2),
+        "makerLimitBid": maker_limit_bid,
         "nd2_fair_prob": nd2_fair_prob,
         "ml_calibrated_prob": ml_calibrated_prob,
         "ensemble_prob": ensemble_yes_prob,
         "fairYesProb": ensemble_yes_prob,
         "netEdgePerContract": round(best_edge, 4),
         "feeGatePassed": True,
+        "timeWindowGatePassed": True,
         "edgeGatePassed": True,
-        "gate_blocked_reason": "NONE_APPROVED",
+        "gate_blocked_reason": "PAPER_SHADOW_APPROVED_V3",
         "metaModelId": model_state["model_id"],
         "metaModelTrained": model_state["is_trained"],
         "dataQualityWarning": False,
@@ -2077,8 +2107,8 @@ async def evaluate_btc_lead_lag(
     fee_per_contract: float = 0.02,
 ) -> Dict[str, Any]:
     """
-    Asynchronously runs the Black-Scholes N(d2) + DuckDB ML Meta-Model Ensemble binary probability
-    (`ensemble_prob = 0.70 * nd2_fair_prob + 0.30 * ml_calibrated_prob`) & [$0.45, $0.82] fee gate evaluation.
+    Asynchronously runs the Jump-Damped Black-Scholes N(d2) + DuckDB ML Meta-Model Ensemble binary probability
+    (40% N(d2) + 60% ML) and shared V3 ask-gate evaluation from strategy_params.json.
     Automatically fetches live BTC-USD spot price from Coinbase WebSocket (`wss://ws-feed.exchange.coinbase.com`, channel `ticker`)
     with automatic fallback to Coinbase REST (`https://api.exchange.coinbase.com/products/BTC-USD/ticker`) when `coinbase_spot` is omitted,
     and logs a feature vector row into `ml_telemetry_ledger`.
@@ -5934,7 +5964,7 @@ async def train_and_optimize_meta_model(
         for i in range(n_samples):
             nd2_p, atr_m, rsi_v, ma_s, sp_bps, min_l = X_raw[i]
             p_ml = predict_ml_calibrated_prob(nd2_p, atr_m, rsi_v, ma_s, sp_bps, min_l, temp_state)
-            p_ens = 0.70 * nd2_p + 0.30 * p_ml
+            p_ens = LEAD_LAG_ND2_WEIGHT * nd2_p + LEAD_LAG_ML_WEIGHT * p_ml
             y_true = y_vec[i]
             brier_cal_sum += (p_ml - y_true) ** 2
             brier_ens_sum += (p_ens - y_true) ** 2
@@ -5950,12 +5980,12 @@ async def train_and_optimize_meta_model(
         avg_realized_pnl_bps = round(sum(pnl_bps_vec) / max(1, n_samples), 2)
 
         # Bayesian / Empirical Grid Optimization for Sniper Hyperparameters (`recommended_min_net_edge`, `recommended_atr_stop_mult`, `recommended_ask_band`)
-        candidate_edges = [0.035, 0.040, 0.042, 0.045, 0.050]
-        candidate_bands = [(0.45, 0.82), (0.46, 0.80), (0.48, 0.78), (0.50, 0.76)]
+        candidate_edges = [LEAD_LAG_MIN_EDGE]
+        candidate_bands = [(LEAD_LAG_ASK_MIN, LEAD_LAG_ASK_MAX)]
         candidate_atr_stops = [1.10, 1.25, 1.35, 1.50, 1.75]
         best_hyper_score = -999.0
-        rec_min_edge = 0.042
-        rec_ask_band = [0.46, 0.80]
+        rec_min_edge = LEAD_LAG_MIN_EDGE
+        rec_ask_band = [LEAD_LAG_ASK_MIN, LEAD_LAG_ASK_MAX]
         rec_atr_stop_mult = 1.35
 
         for c_edge in candidate_edges:
@@ -6048,7 +6078,7 @@ async def train_and_optimize_meta_model(
                 "recommended_min_net_edge": rec_min_edge,
                 "recommended_atr_stop_mult": rec_atr_stop_mult,
                 "recommended_ask_band": rec_ask_band,
-                "ensembleBlendFormula": "0.70 * nd2_fair_prob + 0.30 * ml_calibrated_prob",
+                "ensembleBlendFormula": f"{LEAD_LAG_ND2_WEIGHT:.2f} * nd2_fair_prob + {LEAD_LAG_ML_WEIGHT:.2f} * ml_calibrated_prob",
             },
             "learnedWeights": trained_state["weights"],
             "gradientBoostedStumpsCount": len(gb_stumps),
@@ -6425,7 +6455,7 @@ async def btc_lead_lag_sniper_gate(
     no_ask: float = 0.40,
     coinbase_spot: Optional[float] = None,
 ) -> str:
-    """Black-Scholes N(d2) binary probability and [$0.45, $0.82] fee-gate execution prompt."""
+    """Black-Scholes N(d2) binary probability and shared V3 fee-gate execution prompt."""
     if coinbase_spot is None or coinbase_spot <= 0:
         spot_res = await fetch_live_coinbase_spot("BTC-USD")
         spot_label = f"${spot_res['price']:,.2f} (live {spot_res['source']})" if spot_res.get("ok") else "DATA_UNAVAILABLE"
@@ -6434,8 +6464,9 @@ async def btc_lead_lag_sniper_gate(
     return (
         f"Evaluate 15m BTC Lead-Lag Sniper execution for Coinbase Spot={spot_label} vs Strike=${strike:,.2f} "
         f"({minutes_left:.1f}m remaining, YES Ask=${yes_ask:.2f}, NO Ask=${no_ask:.2f}). "
-        "Enforce hard rules: (1) Contract price must be inside [$0.45, $0.82], (2) Subtract $0.02 flat fee from Black-Scholes N(d2) fair probability and require Net EV >= +$0.04/contract, "
-        "(3) Cap position size at 25 contracts or $18.00 risk, (4) Route rejected mutations to route_to_dlq with a required idempotency_key."
+        f"Enforce hard rules: (1) Contract price must be inside {LEAD_LAG_ASK_BAND_STR}, "
+        f"(2) Time-to-expiry must be inside [{LEAD_LAG_WIN_MIN:.1f}m, {LEAD_LAG_WIN_MAX:.1f}m] and require 40/60 Ensemble Net EV >= +${LEAD_LAG_MIN_EDGE:.3f}/contract, "
+        f"(3) Cap position size at {LEAD_LAG_MAX_CONTRACTS} contracts or ${LEAD_LAG_MAX_RISK_USD:.2f} risk, (4) Route rejected mutations to route_to_dlq with a required idempotency_key."
     )
 
 
@@ -6461,7 +6492,7 @@ async def dlq_incident_recovery_triage(
     """Dead-Letter Queue (DLQ) fallback inspection and idempotent replay safety triage prompt."""
     return (
         f"Triage Dead-Letter Queue entry for failed_tool='{failed_tool}' (idempotency_key='{idempotency_key}', reason='{error_reason}'). "
-        "Verify whether failure was triggered by the [$0.45, $0.82] fee gate, insufficient net edge (<+$0.04), or unavailable live Coinbase telemetry. "
+        f"Verify whether failure was triggered by the {LEAD_LAG_ASK_BAND_STR} fee gate, insufficient net edge (<+${LEAD_LAG_MIN_EDGE:.3f}), or unavailable live Coinbase telemetry. "
         "Maintain neutral HOLD posture until downside risk parameters and idempotency state are verified."
     )
 

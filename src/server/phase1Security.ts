@@ -629,6 +629,14 @@ export const apiMutationRateLimiter = rateLimit({
   },
 });
 
+let customTokenVerifier: ((token: string) => Promise<DecodedIdToken | null>) | null = null;
+
+export function setCustomTokenVerifier(
+  verifier: ((token: string) => Promise<DecodedIdToken | null>) | null
+): void {
+  customTokenVerifier = verifier;
+}
+
 export const firebaseIdTokenAuthMiddleware: RequestHandler = async (
   req: AuthenticatedRequest,
   res: Response,
@@ -652,16 +660,15 @@ export const firebaseIdTokenAuthMiddleware: RequestHandler = async (
   const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
   const idToken = bearerMatch?.[1]?.trim() || '';
 
+  // Strict auth is the default (fail closed). Only an explicit STRICT_API_AUTH_REQUIRED=false acts as a loudly-logged dev override.
+  const strictAuthRequired =
+    (process.env.STRICT_API_AUTH_REQUIRED || 'true').trim().toLowerCase() !== 'false';
+
   if (!idToken) {
-    const strictAuthRequired =
-      (process.env.STRICT_API_AUTH_REQUIRED || 'false').trim().toLowerCase() === 'true';
     if (!strictAuthRequired) {
-      req.firebaseUser = {
-        uid: 'operator-local-session',
-        email: 'lakeskyler904@gmail.com',
-        email_verified: true,
-        admin: true,
-      } as unknown as DecodedIdToken;
+      console.warn(
+        `[SECURITY WARNING] Development override STRICT_API_AUTH_REQUIRED=false is active: bypassing token check for ${methodUpper} ${cleanPath} (no session fabricated).`
+      );
       next();
       return;
     }
@@ -675,6 +682,21 @@ export const firebaseIdTokenAuthMiddleware: RequestHandler = async (
   }
 
   try {
+    if (customTokenVerifier) {
+      const customDecoded = await customTokenVerifier(idToken);
+      if (!customDecoded) {
+        res.status(401).json({
+          error: 'Firebase ID token verification failed: token rejected by verifier.',
+          code: 'INVALID_FIREBASE_ID_TOKEN',
+          method: methodUpper,
+          path: cleanPath,
+        });
+        return;
+      }
+      req.firebaseUser = customDecoded;
+      next();
+      return;
+    }
     getFirebaseAdminApp();
     const decoded = await getAuth().verifyIdToken(idToken);
     req.firebaseUser = decoded;
@@ -689,3 +711,4 @@ export const firebaseIdTokenAuthMiddleware: RequestHandler = async (
     });
   }
 };
+

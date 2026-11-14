@@ -277,8 +277,17 @@ export interface DataFeedSpec {
   enabled: boolean;
 }
 
+export type ExitEvaluationResultStatus =
+  | 'EVALUATED_NO_ACTION'
+  | 'TRIGGERED_TAKE_PROFIT'
+  | 'TRIGGERED_STOP_LOSS'
+  | 'TRIGGERED_PROFIT_LOCK'
+  | 'TRIGGERED_EXPIRATION_FLATTEN'
+  | 'TRIGGERED_EXPIRATION_CLIFF';
+
 export interface ExecutedOrder {
   id: string;
+  idempotencyKey?: string;
   timestamp: string;
   agentId: string;
   agentName: string;
@@ -288,11 +297,15 @@ export interface ExecutedOrder {
   orderType: 'LIMIT_OCO' | 'MARKET_IOC' | 'STOP_LOSS_EXIT';
   quantity: number;
   fillPrice: number;
+  notionalUsd?: number;
   stopLossPrice: number;
   takeProfitPrice: number;
   regimeAtEntry: MarketRegime;
   status: 'FILLED' | 'WORKING_OCO' | 'CANCELLED_BY_KILL_SWITCH';
   rationale: string;
+  lastExitEvaluatedAt?: string;
+  lastExitEvaluationResult?: ExitEvaluationResultStatus;
+  lastEvaluatedPrice?: number;
 }
 
 export interface AutonomousAgent {
@@ -382,6 +395,11 @@ export interface PublicApiPosition {
   percentOfPortfolio: number;
   instrumentType: string;
   openedAt?: string;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
+  lastExitEvaluatedAt?: string;
+  lastExitEvaluationResult?: ExitEvaluationResultStatus;
+  lastEvaluatedPrice?: number;
 }
 
 export interface PublicApiOrder {
@@ -418,6 +436,11 @@ export interface KalshiPosition {
   feesPaidUsd: number;
   totalTradedUsd: number;
   lastUpdatedTs: string;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
+  lastExitEvaluatedAt?: string;
+  lastExitEvaluationResult?: ExitEvaluationResultStatus;
+  lastEvaluatedPrice?: number;
 }
 
 export interface KalshiFill {
