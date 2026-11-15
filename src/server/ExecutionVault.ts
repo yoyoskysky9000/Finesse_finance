@@ -17,13 +17,42 @@ import {
   type PortfolioCorrelationGuardInput,
   type PortfolioCorrelationGuardResult,
 } from '../risk/PortfolioCorrelationGuard';
+import {
+  LEAD_LAG_CHAMPION_VERSION,
+  LEAD_LAG_DEFAULT_CONFIG,
+  buildLeadLag900sIdempotencyKey,
+  evaluateChampion260Envelope,
+  evaluateGkx5Minute1StopTightening,
+  evaluateGkx5Trigger,
+  evaluateLeadLagAnomalyTriggers,
+  evaluateSvb60Trigger,
+  evaluateXvdTrigger,
+  type LeadLagCombinedEvaluationInput,
+  type LeadLagCombinedEvaluationResult,
+  type LeadLagTriggerId,
+} from '../strategies/LeadLagAnomalyTriggers';
 
-export { evaluatePortfolioCorrelationAndCap, getLossFraction };
+export {
+  evaluatePortfolioCorrelationAndCap,
+  getLossFraction,
+  LEAD_LAG_CHAMPION_VERSION,
+  LEAD_LAG_DEFAULT_CONFIG,
+  buildLeadLag900sIdempotencyKey,
+  evaluateChampion260Envelope,
+  evaluateGkx5Minute1StopTightening,
+  evaluateGkx5Trigger,
+  evaluateLeadLagAnomalyTriggers,
+  evaluateSvb60Trigger,
+  evaluateXvdTrigger,
+};
 export type {
   ActiveRiskPosition,
   CorrelationMatrix,
   PortfolioCorrelationGuardInput,
   PortfolioCorrelationGuardResult,
+  LeadLagCombinedEvaluationInput,
+  LeadLagCombinedEvaluationResult,
+  LeadLagTriggerId,
 };
 
 export type CooldownTimeframe = '5m' | '15m' | '1h';

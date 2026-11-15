@@ -122,5 +122,66 @@
     "status": "PROMOTED_TASK_04",
     "choppy_compression_gate": "CHOP(14) < 50 entry, > 61.8 pause; ADX >= 25 entry, < 20 pause; ER(10) >= 0.35",
     "high_volatility_vrp_gate": "125-bar BBW_pct >= 0.20, ATR_ratio_pct >= 0.20, GK_VRP_pct <= 0.85"
+  },
+  "lead_lag_triggers": {
+    "version": "2.7.0-LEAD-LAG-LIVE-CHAMPION",
+    "envelope": "2.6.0-PORTFOLIO-GUARD-CHAMPION",
+    "envelope_gates": {
+      "chop_14_max": 50.0,
+      "adx_14_min": 25.0,
+      "lhs_min": 0.65,
+      "ask_gate_min": 0.52,
+      "ask_gate_max": 0.74,
+      "idempotency_bucket_seconds": 900,
+      "settled_cash_cap_fraction": 0.03,
+      "portfolio_correlation_guard_enabled": true
+    },
+    "SVB-60": {
+      "id": "SVB-60",
+      "name": "60s Spot Velocity Burst",
+      "min_abs_z_velocity": 2.75,
+      "consecutive_5s_checks": 2,
+      "max_dual_venue_spot_spread_usd": 15.0,
+      "spot_venues": ["COINBASE", "KRAKEN"],
+      "max_kalshi_ask_move_10s_dollars": 0.01,
+      "min_fv_minus_ask_dollars": 0.18,
+      "window_minutes": [4.5, 13.5],
+      "settled_cash_cap_fraction": 0.03,
+      "stale_feed_breaker": {
+        "spot_max_latency_ms": 1000,
+        "kalshi_max_latency_ms": 1500,
+        "inter_venue_skew_max_ms": 200
+      }
+    },
+    "GKX-5": {
+      "id": "GKX-5",
+      "name": "5m Garman-Klass Volatility Expansion",
+      "min_r_gk_vs_30d_tod_median": 1.60,
+      "min_abs_z_velocity_5m": 2.0,
+      "require_stable_sign_across_candle": true,
+      "min_delta_fv_proj_dollars": 0.24,
+      "min_fv_minus_ask_dollars": 0.18,
+      "minute_1_sign_flip_stop_loss_dollars": -0.03,
+      "settled_cash_cap_fraction": 0.03,
+      "stale_feed_breaker": {
+        "candle_finalization_max_latency_ms": 2000,
+        "kalshi_max_latency_ms": 1500
+      }
+    },
+    "XVD": {
+      "id": "XVD",
+      "name": "Cross-Venue Divergence (Kalshi vs Polymarket)",
+      "min_abs_prob_divergence_dollars": 0.10,
+      "min_persistence_seconds": 3.0,
+      "min_persistence_snapshots": 3,
+      "require_identical_settlement_source": true,
+      "max_spot_fv_to_leading_venue_dollars": 0.03,
+      "min_fv_minus_ask_lag_dollars": 0.18,
+      "settled_cash_cap_fraction": 0.015,
+      "stale_feed_breaker": {
+        "any_feed_max_latency_ms": 1000,
+        "inter_venue_skew_max_ms": 500
+      }
+    }
   }
 }

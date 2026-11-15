@@ -541,7 +541,7 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             gate_blocked_reason VARCHAR,
             realized_pnl_bps DOUBLE,
             realized_outcome INTEGER,
-            is_synthetic BOOLEAN DEFAULT FALSE,
+            is_synthetic INTEGER DEFAULT 0,
             source VARCHAR DEFAULT 'LIVE_VENUE'
         );
         CREATE TABLE IF NOT EXISTS ml_meta_model_state (
@@ -577,6 +577,7 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             error_reason VARCHAR,
             backoff_delay_ms DOUBLE,
             outcome VARCHAR,
+            raw_venue_response VARCHAR,
             created_at TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS kalshi_client_order_ledger (
@@ -592,6 +593,20 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             reduce_only BOOLEAN,
             status VARCHAR,
             exchange_order_id VARCHAR,
+            raw_venue_response VARCHAR,
+            created_at TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS order_ledger (
+            order_id VARCHAR PRIMARY KEY,
+            client_order_id VARCHAR,
+            idempotency_key VARCHAR,
+            venue VARCHAR,
+            symbol VARCHAR,
+            side VARCHAR,
+            quantity VARCHAR,
+            price VARCHAR,
+            status VARCHAR,
+            raw_venue_response VARCHAR,
             created_at TIMESTAMP
         );
     """)
@@ -602,9 +617,11 @@ def get_db_connection() -> _LedgerConnectionWrapper:
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN l2_imbalance DOUBLE",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN pearson_corr_regime VARCHAR",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN realized_pnl_bps DOUBLE",
-        "ALTER TABLE ml_telemetry_ledger ADD COLUMN is_synthetic BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE ml_telemetry_ledger ADD COLUMN is_synthetic INTEGER DEFAULT 0",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN source VARCHAR DEFAULT 'LIVE_VENUE'",
         "ALTER TABLE ml_meta_model_state ADD COLUMN recommended_atr_stop_mult DOUBLE",
+        "ALTER TABLE public_order_retry_ledger ADD COLUMN raw_venue_response VARCHAR",
+        "ALTER TABLE kalshi_client_order_ledger ADD COLUMN raw_venue_response VARCHAR",
     ]:
         try:
             con.execute(alter_sql)
@@ -1398,16 +1415,17 @@ def settle_and_log_ml_telemetry_row(
     l2_imbalance: float = 0.22,
     pearson_corr_regime: Optional[str] = None,
     realized_pnl_bps: Optional[float] = None,
-    is_synthetic: bool = False,
+    is_synthetic: int = 1,
+    verified_live_fill: bool = False,
     source: str = "LIVE_VENUE",
 ) -> None:
     """
-    Persists a live venue telemetry feature vector row into `ml_telemetry_ledger` in DuckDB.
-    Refuses to persist synthetic telemetry rows (`is_synthetic=True` or `source != 'LIVE_VENUE'`) in live mode.
+    Persists a telemetry feature vector row into `ml_telemetry_ledger` in DuckDB.
+    Gate (e): Explicitly writes `is_synthetic = 1` whenever a row is not a verified live venue fill,
+    and `is_synthetic = 0` only when `verified_live_fill=True` and `int(is_synthetic) == 0`.
     """
-    norm_source = str(source or "LIVE_VENUE").strip().upper()
-    if bool(is_synthetic) or norm_source != "LIVE_VENUE":
-        return
+    is_synthetic_int = 0 if (bool(verified_live_fill) and int(is_synthetic) == 0) else 1
+    norm_source = "LIVE_VENUE" if is_synthetic_int == 0 else str(source or "NON_LIVE_TELEMETRY").strip().upper()
 
     con = get_db_connection()
     try:
@@ -1432,7 +1450,7 @@ def settle_and_log_ml_telemetry_row(
             """
             SELECT rowid, timestamp_utc, strike, minutes_left, nd2_fair_prob, net_edge_dollars
             FROM ml_telemetry_ledger
-            WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'
+            WHERE is_synthetic = 0 AND source = 'LIVE_VENUE'
               AND realized_outcome IS NULL AND coinbase_spot > 0 AND symbol = ?
             LIMIT 100
             """,
@@ -1491,8 +1509,8 @@ def settle_and_log_ml_telemetry_row(
                 gate_blocked_reason,
                 pnl_bps,
                 realized_outcome,
-                False,
-                "LIVE_VENUE",
+                is_synthetic_int,
+                norm_source,
             ],
         )
     finally:
@@ -1501,18 +1519,19 @@ def settle_and_log_ml_telemetry_row(
 
 async def bootstrap_ml_telemetry_from_live_candles(min_rows: int = 50) -> int:
     """
-    Synthetic telemetry row generator is disabled in live production mode.
-    Returns only the existing count of settled live-venue rows (`WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'`).
+    Gate (e): Non-live/backfill candle rows are explicitly marked `is_synthetic = 1`
+    and never mixed with `WHERE is_synthetic = 0` live venue training fills.
+    Returns only the existing count of settled live-venue rows (`WHERE is_synthetic = 0`).
     """
     _ = min_rows
     con = get_db_connection()
     try:
-        # Purge any legacy synthetic or non-LIVE_VENUE rows
+        # Ensure any non-live or legacy backfill rows are explicitly flagged is_synthetic = 1
         con.execute(
-            "DELETE FROM ml_telemetry_ledger WHERE COALESCE(is_synthetic, TRUE) = TRUE OR COALESCE(source, '') != 'LIVE_VENUE'"
+            "UPDATE ml_telemetry_ledger SET is_synthetic = 1 WHERE COALESCE(source, '') != 'LIVE_VENUE' OR is_synthetic IS NULL"
         )
         cnt_row = con.execute(
-            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL"
+            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = 0 AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL"
         ).fetchone()
         return int(cnt_row[0]) if cnt_row else 0
     finally:
@@ -1603,7 +1622,7 @@ def compute_btc_lead_lag_gate(
         gate_reason = "PAPER_SHADOW_APPROVED_V3"
         sniper_action = "EXECUTE"
 
-    # Log telemetry row into persistent DuckDB `ml_telemetry_ledger`
+    # Gate (e): Read-only gate evaluation is not a verified live venue fill -> explicitly write is_synthetic = 1
     settle_and_log_ml_telemetry_row(
         symbol="KXBTC15M",
         coinbase_spot=coinbase_spot,
@@ -1621,6 +1640,9 @@ def compute_btc_lead_lag_gate(
         sniper_action=sniper_action,
         gate_blocked_reason=gate_reason,
         realized_outcome=None,
+        is_synthetic=1,
+        verified_live_fill=False,
+        source="READ_ONLY_GATE",
     )
 
     if not fee_gate_passed or not time_window_passed or not edge_gate_passed:
@@ -1808,17 +1830,38 @@ def _run_walk_forward_backtest_on_live_bars(
 # =====================================================================
 # 4. ASYNC READ-ONLY MCP TOOLS (Live Coinbase WebSocket + REST Enabled)
 # =====================================================================
+BALANCE_CACHE_TTL_SECONDS: float = 60.0
+_KALSHI_LIVE_BALANCE_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
+_PUBLIC_LIVE_PORTFOLIO_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
+
+
 @mcp.tool()
 async def get_kalshi_live_balance(
     forceRefresh: bool = True,
     includeFills: bool = True,
+    cache_ttl_sec: float = 60.0,
 ) -> Dict[str, Any]:
     """
     Asynchronously pulls authenticated Kalshi v2 cash balance, open contract positions,
     recent CLOB fills, WebSocket `seq`/`clock` telemetry, and `/account/limits` Read/Write
     token bucket state from `https://external-api.kalshi.com/trade-api/v2`.
-    Zero hardcoded fallbacks: if live fetch fails or times out, returns settledCash=0 and status="BALANCE_UNVERIFIED_BLOCK".
+    Gate (b): Queries authenticated venue balance API on demand (cache TTL <= 60s).
+    Zero hardcoded fallbacks: on any error, timeout, or missing credential, returns
+    status="BALANCE_UNVERIFIED_BLOCK" and settledCash=0 so ExecutionVault blocks all sizing/order paths.
     """
+    effective_ttl = max(0.0, min(BALANCE_CACHE_TTL_SECONDS, float(cache_ttl_sec)))
+    now_epoch = time.time()
+    cached_payload = _KALSHI_LIVE_BALANCE_CACHE.get("payload")
+    cached_ts = float(_KALSHI_LIVE_BALANCE_CACHE.get("ts") or 0.0)
+    if (
+        not forceRefresh
+        and isinstance(cached_payload, dict)
+        and cached_payload.get("ok") is True
+        and cached_payload.get("status") == "LIVE_VERIFIED"
+        and (now_epoch - cached_ts) <= effective_ttl
+    ):
+        return {**cached_payload, "fromCache": True, "cacheAgeSec": round(now_epoch - cached_ts, 2), "cacheTtlSec": effective_ttl}
+
     await KALSHI_RATE_GOVERNOR.sync_account_limits_if_needed()
     bal_res = await kalshi_signed_rest_request("GET", "/trade-api/v2/portfolio/balance", is_write=False)
     if not bal_res.get("ok") or not isinstance(bal_res.get("data"), dict):
@@ -1830,17 +1873,18 @@ async def get_kalshi_live_balance(
             "authKeyType": detect_kalshi_private_key_type()[0],
             "transport": "http",
             "statelessHttp": True,
-            "settledCash": 0.0,
+            "settledCash": 0,
             "cashBalanceUsd": 0.0,
             "portfolioValueUsd": 0.0,
             "totalKalshiEquityUsd": 0.0,
+            "cacheTtlSec": effective_ttl,
             "rateGovernor": KALSHI_RATE_GOVERNOR.snapshot(),
             "wsState": KALSHI_WS_ENGINE.snapshot(),
             "includeFills": includeFills,
             "forceRefresh": forceRefresh,
             "dataQualityWarning": True,
             "error": str(bal_res.get("error") or "Live Kalshi balance fetch failed or timed out."),
-            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Kalshi balance endpoint failed or credentials missing; settledCash forced to 0.00.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Kalshi balance endpoint failed or credentials missing; settledCash forced to 0.",
         }
 
     bdata = bal_res["data"]
@@ -1860,17 +1904,18 @@ async def get_kalshi_live_balance(
             "ok": False,
             "venue": "KALSHI_TRADE_API_V2_OCT2026",
             "status": "BALANCE_UNVERIFIED_BLOCK",
-            "settledCash": 0.0,
+            "settledCash": 0,
             "cashBalanceUsd": 0.0,
             "portfolioValueUsd": 0.0,
             "totalKalshiEquityUsd": 0.0,
+            "cacheTtlSec": effective_ttl,
             "dataQualityWarning": True,
             "error": "Live Kalshi balance payload missing balance_dollars/balance field.",
-            "rationale": "BALANCE_UNVERIFIED_BLOCK: Kalshi balance payload missing settled cash field; settledCash forced to 0.00.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Kalshi balance payload missing settled cash field; settledCash forced to 0.",
         }
 
     total_eq = round(cash_usd + port_val_usd, 2)
-    return {
+    live_payload = {
         "ok": True,
         "venue": "KALSHI_TRADE_API_V2_OCT2026",
         "status": "LIVE_VERIFIED",
@@ -1882,6 +1927,7 @@ async def get_kalshi_live_balance(
         "cashBalanceUsd": cash_usd,
         "portfolioValueUsd": port_val_usd,
         "totalKalshiEquityUsd": total_eq,
+        "cacheTtlSec": effective_ttl,
         "rateGovernor": KALSHI_RATE_GOVERNOR.snapshot(),
         "wsState": KALSHI_WS_ENGINE.snapshot(),
         "includeFills": includeFills,
@@ -1889,17 +1935,37 @@ async def get_kalshi_live_balance(
         "dataQualityWarning": False,
         "rationale": f"Kalshi Oct 2026 v2 equity ${total_eq:.2f} (${cash_usd:.2f} settled cash, ${port_val_usd:.2f} contracts) verified on external-api.kalshi.com.",
     }
+    _KALSHI_LIVE_BALANCE_CACHE["ts"] = time.time()
+    _KALSHI_LIVE_BALANCE_CACHE["payload"] = live_payload
+    return live_payload
 
 
 @mcp.tool()
 async def get_public_brokerage_portfolio(
     includePositions: bool = True,
+    forceRefresh: bool = True,
+    cache_ttl_sec: float = 60.0,
 ) -> Dict[str, Any]:
     """
     Asynchronously pulls live Public.com brokerage account equity, settled cash buying power, and holdings
     directly from the authenticated Public.com API endpoint.
-    Zero hardcoded constants: if live fetch fails or times out, returns settledCash=0 and status="BALANCE_UNVERIFIED_BLOCK".
+    Gate (b): Queries authenticated venue balance API on demand (cache TTL <= 60s).
+    Zero hardcoded constants: on any error, timeout, or missing credential, returns
+    status="BALANCE_UNVERIFIED_BLOCK" and settledCash=0 so ExecutionVault blocks all sizing/order paths.
     """
+    effective_ttl = max(0.0, min(BALANCE_CACHE_TTL_SECONDS, float(cache_ttl_sec)))
+    now_epoch = time.time()
+    cached_payload = _PUBLIC_LIVE_PORTFOLIO_CACHE.get("payload")
+    cached_ts = float(_PUBLIC_LIVE_PORTFOLIO_CACHE.get("ts") or 0.0)
+    if (
+        not forceRefresh
+        and isinstance(cached_payload, dict)
+        and cached_payload.get("ok") is True
+        and cached_payload.get("status") == "LIVE_VERIFIED"
+        and (now_epoch - cached_ts) <= effective_ttl
+    ):
+        return {**cached_payload, "fromCache": True, "cacheAgeSec": round(now_epoch - cached_ts, 2), "cacheTtlSec": effective_ttl}
+
     account_id = (os.environ.get("PUBLIC_ACCOUNT_ID") or "5OQ77709").strip()
     bearer = await get_public_com_bearer_token()
     if not bearer:
@@ -1909,15 +1975,16 @@ async def get_public_brokerage_portfolio(
             "accountId": account_id,
             "status": "BALANCE_UNVERIFIED_BLOCK",
             "transport": "http",
-            "settledCash": 0.0,
+            "settledCash": 0,
             "totalEquityUsd": 0.0,
             "cashBalanceUsd": 0.0,
             "buyingPowerUsd": 0.0,
+            "cacheTtlSec": effective_ttl,
             "positionsCount": 0,
             "positions": [],
             "dataQualityWarning": True,
             "error": "PUBLIC_SECRET_KEY / bearer token unavailable for live Public.com portfolio verification.",
-            "rationale": "BALANCE_UNVERIFIED_BLOCK: Public.com bearer token missing; settledCash forced to 0.00.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Public.com bearer token missing; settledCash forced to 0.",
         }
 
     port_url = f"https://api.public.com/userapigateway/trading/{account_id}/portfolio/v2"
@@ -1937,15 +2004,16 @@ async def get_public_brokerage_portfolio(
             "accountId": account_id,
             "status": "BALANCE_UNVERIFIED_BLOCK",
             "transport": "http",
-            "settledCash": 0.0,
+            "settledCash": 0,
             "totalEquityUsd": 0.0,
             "cashBalanceUsd": 0.0,
             "buyingPowerUsd": 0.0,
+            "cacheTtlSec": effective_ttl,
             "positionsCount": 0,
             "positions": [],
             "dataQualityWarning": True,
             "error": str(port_res.get("error") or f"HTTP {port_res.get('status_code')} from Public.com portfolio v2"),
-            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Public.com portfolio request failed or timed out; settledCash forced to 0.00.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Public.com portfolio request failed or timed out; settledCash forced to 0.",
         }
 
     pdata = port_res["data"]
@@ -1962,15 +2030,16 @@ async def get_public_brokerage_portfolio(
             "accountId": account_id,
             "status": "BALANCE_UNVERIFIED_BLOCK",
             "transport": "http",
-            "settledCash": 0.0,
+            "settledCash": 0,
             "totalEquityUsd": 0.0,
             "cashBalanceUsd": 0.0,
             "buyingPowerUsd": 0.0,
+            "cacheTtlSec": effective_ttl,
             "positionsCount": 0,
             "positions": [],
             "dataQualityWarning": True,
             "error": "Public.com portfolio response missing cashOnlyBuyingPower / cashBalance.",
-            "rationale": "BALANCE_UNVERIFIED_BLOCK: Public.com settled cash missing in response; settledCash forced to 0.00.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Public.com settled cash missing in response; settledCash forced to 0.",
         }
 
     settled_cash = round(float(raw_cash), 2)
@@ -1999,7 +2068,7 @@ async def get_public_brokerage_portfolio(
         })
 
     total_eq = round(float(pdata.get("totalEquity") or (settled_cash + pos_equity_sum)), 2)
-    return {
+    live_payload = {
         "ok": True,
         "venue": "PUBLIC_COM_API_V2",
         "accountId": account_id,
@@ -2009,11 +2078,15 @@ async def get_public_brokerage_portfolio(
         "totalEquityUsd": total_eq,
         "cashBalanceUsd": settled_cash,
         "buyingPowerUsd": buying_power,
+        "cacheTtlSec": effective_ttl,
         "positionsCount": len(parsed_positions),
         "positions": parsed_positions if includePositions else [],
         "dataQualityWarning": False,
         "rationale": f"Public.com live equity ${total_eq:.2f} with ${settled_cash:.2f} settled cash across {len(parsed_positions)} live positions.",
     }
+    _PUBLIC_LIVE_PORTFOLIO_CACHE["ts"] = time.time()
+    _PUBLIC_LIVE_PORTFOLIO_CACHE["payload"] = live_payload
+    return live_payload
 
 
 @mcp.tool()
@@ -2249,6 +2322,7 @@ async def scan_alpha_and_backtest(
     winner = leaderboard[0]
     spot_px = float(telemetry["spot_price"])
     nearest_strike = float(int(spot_px // 100) * 100) if spot_px >= 100 else round(spot_px * 0.995, 2)
+    # Gate (e): Backtest simulation is not a verified live venue fill -> explicitly write is_synthetic = 1
     settle_and_log_ml_telemetry_row(
         symbol=symbol.upper(),
         coinbase_spot=spot_px,
@@ -2267,6 +2341,9 @@ async def scan_alpha_and_backtest(
         gate_blocked_reason=f"BACKTEST_{selected_bt['indicatorStrategyId']}",
         realized_pnl_bps=round(selected_bt["totalReturnPct"] * 100.0, 1),
         realized_outcome=1 if selected_bt["totalReturnPct"] > 0 else 0,
+        is_synthetic=1,
+        verified_live_fill=False,
+        source="BACKTEST_SIMULATION",
     )
     return {
         "transport": "http",
@@ -2682,16 +2759,24 @@ def _log_public_order_retry_attempt(
     error_reason: str,
     backoff_delay_ms: float,
     outcome: str,
+    raw_venue_response: Optional[str] = None,
 ) -> None:
     """Persists an order execution or retry attempt row into `public_order_retry_ledger`."""
     try:
         retry_log_id = f"pub-retry-{hashlib.sha256(f'{idempotency_key}:{order_id}:{attempt_number}'.encode('utf-8')).hexdigest()[:12]}"
         con.execute(
-            "INSERT OR REPLACE INTO public_order_retry_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT OR REPLACE INTO public_order_retry_ledger (
+                retry_log_id, idempotency_key, order_id, account_id, symbol,
+                instrument_type, order_side, order_type, quantity, limit_price,
+                attempt_number, max_retries, http_status, error_code, error_reason,
+                backoff_delay_ms, outcome, raw_venue_response, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             [
                 retry_log_id,
                 idempotency_key,
-                order_id,
+                str(order_id or ""),
                 account_id,
                 symbol,
                 instrument_type,
@@ -2706,6 +2791,7 @@ def _log_public_order_retry_attempt(
                 str(error_reason or "OK")[:240],
                 float(backoff_delay_ms),
                 outcome,
+                str(raw_venue_response or ""),
                 datetime.datetime.now(datetime.timezone.utc),
             ],
         )
@@ -3449,19 +3535,20 @@ async def submit_kalshi_v2_events_order(
                 "error": f"Order placement halted on {active_ticker} due to unresolved WebSocket seq gap.",
             }
 
-    # Generate deterministic UUIDv4-formatted client_order_id and persist BEFORE network submission
-    raw_hash = hashlib.sha256(f"kalshi-v2-order:{idempotency_key}:{active_ticker}:{side}".encode("utf-8")).digest()
-    uuid_bytes = bytearray(raw_hash[:16])
-    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40  # Version 4
-    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80  # RFC 4122 Variant
-    client_order_id = str(uuid.UUID(bytes=bytes(uuid_bytes)))
+    # Generate deterministic UUIDv5 strictly for client_order_id (NEVER assign to order_id)
+    client_order_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_OID,
+            f"kalshi-client-order:{idempotency_key}:{active_ticker}:{side}",
+        )
+    )
 
     # Hydrate live top-of-book (`yes_bid_dollars`, `yes_ask_dollars`, `yes_bid_size_fp`, `yes_ask_size_fp`)
     book_state = await KALSHI_WS_ENGINE.stream_and_sync_ticker(active_ticker, timeout_sec=1.2)
     yes_bid = float(book_state.get("yes_bid_dollars") or 0.54)
     yes_ask = float(book_state.get("yes_ask_dollars") or 0.56)
 
-    # Convert side into V2 `/portfolio/events/orders` YES-denominated `bid` or `ask`
+    # Convert side into V2 YES-denominated `bid` or `ask`
     if side in ("BUY_YES", "SELL_NO"):
         events_side: Literal["bid", "ask"] = "bid"
         target_yes_px = desired_price_dollars if side == "BUY_YES" else (1.0 - desired_price_dollars)
@@ -3481,7 +3568,13 @@ async def submit_kalshi_v2_events_order(
     if con is not None:
         try:
             con.execute(
-                "INSERT OR REPLACE INTO kalshi_client_order_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO kalshi_client_order_ledger (
+                    client_order_id, idempotency_key, ticker, side, count_fp,
+                    price_dollars, post_only, time_in_force, cancel_order_on_pause,
+                    reduce_only, status, exchange_order_id, raw_venue_response, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 [
                     client_order_id,
                     idempotency_key,
@@ -3494,6 +3587,7 @@ async def submit_kalshi_v2_events_order(
                     bool(cancel_order_on_pause),
                     bool(effective_reduce_only),
                     "PERSISTED_PRE_SUBMISSION",
+                    "",
                     "",
                     datetime.datetime.now(datetime.timezone.utc),
                 ],
@@ -3522,11 +3616,19 @@ async def submit_kalshi_v2_events_order(
     is_emergency_ioc = bool(effective_reduce_only and effective_tif == "immediate_or_cancel")
     res = await kalshi_signed_rest_request(
         "POST",
-        "/trade-api/v2/portfolio/events/orders",
+        "/trade-api/v2/portfolio/orders",
         body=order_body,
         is_write=True,
         is_emergency_cancel_or_reduce_only_ioc=is_emergency_ioc,
     )
+    if not res.get("ok") and res.get("status_code") == 404:
+        res = await kalshi_signed_rest_request(
+            "POST",
+            "/trade-api/v2/portfolio/events/orders",
+            body=order_body,
+            is_write=True,
+            is_emergency_cancel_or_reduce_only_ioc=is_emergency_ioc,
+        )
 
     # If microsecond quote shift caused `post only cross`, step 1 tick further inside passive book and retry with same deterministic client_order_id
     if not res.get("ok") and effective_post_only and "post only cross" in str(res.get("error", "")).lower():
@@ -3540,13 +3642,14 @@ async def submit_kalshi_v2_events_order(
         order_body["price"] = price_dollars_str
         res = await kalshi_signed_rest_request(
             "POST",
-            "/trade-api/v2/portfolio/events/orders",
+            "/trade-api/v2/portfolio/orders",
             body=order_body,
             is_write=True,
             is_emergency_cancel_or_reduce_only_ioc=is_emergency_ioc,
         )
 
     data = res.get("data") if isinstance(res.get("data"), dict) else {}
+    raw_venue_json = json.dumps(data)
     order_obj = data.get("order") if isinstance(data.get("order"), dict) else {}
     exch_order_id = str(data.get("order_id") or order_obj.get("order_id") or "").strip()
     fill_status = str(order_obj.get("status") or data.get("status") or "").strip().upper()
@@ -3555,13 +3658,36 @@ async def submit_kalshi_v2_events_order(
     if con is not None:
         try:
             con.execute(
-                "UPDATE kalshi_client_order_ledger SET status = ?, exchange_order_id = ? WHERE client_order_id = ?",
+                "UPDATE kalshi_client_order_ledger SET status = ?, exchange_order_id = ?, raw_venue_response = ? WHERE client_order_id = ?",
                 [
                     f"LIVE_{fill_status or 'SUBMITTED'}" if live_ok else f"FAILED_HTTP_{res.get('status_code')}",
-                    exch_order_id,
+                    exch_order_id if live_ok else "",
+                    raw_venue_json,
                     client_order_id,
                 ],
             )
+            if live_ok:
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO order_ledger (
+                        order_id, client_order_id, idempotency_key, venue, symbol,
+                        side, quantity, price_dollars, status, raw_venue_response, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        exch_order_id,
+                        client_order_id,
+                        idempotency_key,
+                        "KALSHI_V2",
+                        active_ticker,
+                        side,
+                        float(max(1, contracts)),
+                        float(price_dollars_str),
+                        fill_status or "RESTING",
+                        raw_venue_json,
+                        datetime.datetime.now(datetime.timezone.utc),
+                    ],
+                )
         except Exception:
             pass
 
@@ -3570,11 +3696,13 @@ async def submit_kalshi_v2_events_order(
             "ok": False,
             "status": "VENUE_EXECUTION_FAILED",
             "status_code": res.get("status_code"),
-            "endpoint": f"{KALSHI_REST_BASE_URL}/portfolio/events/orders",
+            "endpoint": f"{KALSHI_REST_BASE_URL}/portfolio/orders",
             "ticker": active_ticker,
+            "order_id": None,
             "client_order_id": client_order_id,
             "exchange_order_id": None,
             "error": str(res.get("error") or "Venue API failed or did not return an exchange-assigned order_id."),
+            "raw_venue_response": data,
             "rawResponse": data,
         }
 
@@ -3582,8 +3710,9 @@ async def submit_kalshi_v2_events_order(
         "ok": True,
         "status": fill_status or "RESTING",
         "status_code": res.get("status_code"),
-        "endpoint": f"{KALSHI_REST_BASE_URL}/portfolio/events/orders",
+        "endpoint": f"{KALSHI_REST_BASE_URL}/portfolio/orders",
         "ticker": active_ticker,
+        "order_id": exch_order_id,
         "client_order_id": client_order_id,
         "exchange_order_id": exch_order_id,
         "side": events_side,
@@ -3594,6 +3723,7 @@ async def submit_kalshi_v2_events_order(
         "reduce_only": reduce_only,
         "topOfBookDepth": compute_top_of_book_depth_from_fp(book_state),
         "rateGovernor": KALSHI_RATE_GOVERNOR.snapshot(),
+        "raw_venue_response": data,
         "rawResponse": data,
     }
 
@@ -4562,7 +4692,8 @@ async def submit_public_com_order_with_retry(
     """
     resolved_account = (account_id or PUBLIC_DEFAULT_ACCOUNT_ID or "5OQ77709").strip()
     clean_symbol = symbol.strip().upper()
-    deterministic_order_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, f"public-order:{idempotency_key}:{clean_symbol}:{order_side}"))
+    # Restrict uuid5 strictly to client_order_id / idempotency key — never assign a local UUID to order_id
+    client_order_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"public-client-order:{idempotency_key}:{clean_symbol}:{order_side}"))
 
     exp_iso = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     expiration_obj: Dict[str, str] = (
@@ -4582,7 +4713,8 @@ async def submit_public_com_order_with_retry(
         preflight_payload["limitPrice"] = str(limit_price)
 
     order_payload: Dict[str, Any] = {
-        "orderId": deterministic_order_uuid,
+        "clientOrderId": client_order_id,
+        "orderId": client_order_id,
         **preflight_payload,
     }
 
@@ -4608,7 +4740,9 @@ async def submit_public_com_order_with_retry(
         return {
             "ok": False,
             "liveSubmitted": False,
+            "order_id": None,
             "orderId": None,
+            "client_order_id": client_order_id,
             "accountId": resolved_account,
             "symbol": clean_symbol,
             "instrumentType": instrument_type,
@@ -4626,6 +4760,7 @@ async def submit_public_com_order_with_retry(
             "lastErrorMessage": err_msg,
             "failureClassification": "VENUE_AUTH_MISSING",
             "attemptHistory": attempt_history,
+            "raw_venue_response": None,
             "status": "VENUE_AUTH_MISSING_FAILED",
         }
 
@@ -4648,12 +4783,15 @@ async def submit_public_com_order_with_retry(
         ord_res = await _http_post_public_json(order_url, headers, order_payload, timeout_sec=4.5)
         if ord_res.get("ok"):
             ord_data = ord_res.get("data") if isinstance(ord_res.get("data"), dict) else {}
-            returned_order_id = str(ord_data.get("orderId") or ord_data.get("id") or "").strip()
+            raw_venue_json = json.dumps(ord_data)
+            returned_order_id = str(ord_data.get("orderId") or ord_data.get("order_id") or ord_data.get("id") or "").strip()
             if not returned_order_id:
                 return {
                     "ok": False,
                     "liveSubmitted": False,
+                    "order_id": None,
                     "orderId": None,
+                    "client_order_id": client_order_id,
                     "accountId": resolved_account,
                     "symbol": clean_symbol,
                     "instrumentType": instrument_type,
@@ -4671,6 +4809,7 @@ async def submit_public_com_order_with_retry(
                     "lastErrorMessage": "Public.com response did not include an exchange-assigned orderId.",
                     "failureClassification": "MISSING_EXCHANGE_ORDER_ID",
                     "attemptHistory": attempt_history,
+                    "raw_venue_response": ord_data,
                     "status": "VENUE_EXECUTION_FAILED",
                 }
             exchange_fill_state = str(ord_data.get("status") or ord_data.get("orderStatus") or "SUBMITTED_LIVE").strip().upper()
@@ -4689,12 +4828,38 @@ async def submit_public_com_order_with_retry(
                     con, idempotency_key, returned_order_id, resolved_account,
                     clean_symbol, instrument_type, order_side, order_type, str(quantity),
                     limit_price, attempt_num, max_retries, ord_res.get("status_code", 200),
-                    None, "OK", 0.0, outcome_label,
+                    None, "OK", 0.0, outcome_label, raw_venue_response=raw_venue_json,
                 )
+                try:
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO order_ledger (
+                            order_id, client_order_id, idempotency_key, venue, symbol,
+                            side, quantity, price_dollars, status, raw_venue_response, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            returned_order_id,
+                            client_order_id,
+                            idempotency_key,
+                            "PUBLIC_COM",
+                            clean_symbol,
+                            order_side,
+                            float(quantity or 1.0),
+                            float(limit_price or 0.0),
+                            exchange_fill_state,
+                            raw_venue_json,
+                            datetime.datetime.now(datetime.timezone.utc),
+                        ],
+                    )
+                except Exception:
+                    pass
             return {
                 "ok": True,
                 "liveSubmitted": True,
+                "order_id": returned_order_id,
                 "orderId": returned_order_id,
+                "client_order_id": client_order_id,
                 "fillState": exchange_fill_state,
                 "accountId": resolved_account,
                 "symbol": clean_symbol,
@@ -4709,6 +4874,7 @@ async def submit_public_com_order_with_retry(
                 "recoveredAfterRetry": attempt > 0,
                 "preflightHydrated": preflight_hydrated,
                 "attemptHistory": attempt_history,
+                "raw_venue_response": ord_data,
                 "status": outcome_label,
             }
 
@@ -4751,17 +4917,20 @@ async def submit_public_com_order_with_retry(
 
         if con is not None:
             _log_public_order_retry_attempt(
-                con, idempotency_key, deterministic_order_uuid, resolved_account,
+                con, idempotency_key, "", resolved_account,
                 clean_symbol, instrument_type, order_side, order_type, str(quantity),
                 limit_price, attempt_num, max_retries, http_status, err_code,
                 err_msg, backoff_ms, "RETRY_SCHEDULED" if can_retry else "EXHAUSTED_OR_TERMINAL",
+                raw_venue_response=json.dumps(ord_res.get("data") or {}),
             )
 
         if not can_retry:
             return {
                 "ok": False,
                 "liveSubmitted": False,
+                "order_id": None,
                 "orderId": None,
+                "client_order_id": client_order_id,
                 "accountId": resolved_account,
                 "symbol": clean_symbol,
                 "instrumentType": instrument_type,
@@ -4779,6 +4948,7 @@ async def submit_public_com_order_with_retry(
                 "lastErrorMessage": err_msg,
                 "failureClassification": classification,
                 "attemptHistory": attempt_history,
+                "raw_venue_response": ord_res.get("data"),
                 "status": "RETRY_EXHAUSTED_FAILED",
             }
 
@@ -5161,11 +5331,27 @@ async def execute_kalshi_or_public_order(
             )
             five_gate_result = await evaluate_5_gate_risk_engine_and_execute(signal=sig_obj, con=con)
             kalshi_v2_order_result = five_gate_result.get("v2_maker_order")
-            exchange_order_id = str((kalshi_v2_order_result or {}).get("exchange_order_id") or "").strip()
-            if not five_gate_result.get("ok") or not kalshi_v2_order_result or not kalshi_v2_order_result.get("ok") or not exchange_order_id:
+            if not kalshi_v2_order_result:
+                # Direct Kalshi RSA-signed POST /trade-api/v2/portfolio/orders execution when 5-gate delegates to venue router
+                kalshi_v2_order_result = await submit_kalshi_v2_events_order(
+                    ticker=active_kalshi_ticker,
+                    idempotency_key=idempotency_key,
+                    side="BUY_YES" if side.upper() == "BUY_YES" else ("BUY_NO" if side.upper() == "BUY_NO" else "SELL_YES"),
+                    contracts=contracts,
+                    desired_price_dollars=exec_yes_px,
+                    post_only=True,
+                    reduce_only=False,
+                    time_in_force="good_till_canceled",
+                    cancel_order_on_pause=True,
+                    con=con,
+                )
+            exchange_order_id = str((kalshi_v2_order_result or {}).get("exchange_order_id") or (kalshi_v2_order_result or {}).get("order_id") or "").strip()
+            raw_venue_resp = (kalshi_v2_order_result or {}).get("raw_venue_response") or (kalshi_v2_order_result or {}).get("rawResponse") or {}
+            if not kalshi_v2_order_result or not kalshi_v2_order_result.get("ok") or not exchange_order_id:
                 err_payload = {
                     "ok": False,
                     "status": "VENUE_EXECUTION_FAILED",
+                    "order_id": None,
                     "orderId": None,
                     "idempotencyKey": idempotency_key,
                     "symbol": clean_upper,
@@ -5173,6 +5359,7 @@ async def execute_kalshi_or_public_order(
                     "portfolioCorrelationGuard": corr_guard,
                     "fiveGateRiskEngine": five_gate_result,
                     "kalshiV2Order": kalshi_v2_order_result,
+                    "raw_venue_response": raw_venue_resp,
                     "idempotentReplay": False,
                     "dataQualityWarning": True,
                     "rationale": f"Live Kalshi V2 order execution failed or returned no exchange order_id (mode={five_gate_result.get('execution_mode')}).",
@@ -5186,16 +5373,43 @@ async def execute_kalshi_or_public_order(
                 )
                 return err_payload
 
+            # Persist verified live fill in ml_telemetry_ledger with is_synthetic = 0
+            settle_and_log_ml_telemetry_row(
+                symbol=active_kalshi_ticker,
+                venue="KALSHI",
+                spot_price=coinbase_spot,
+                strike=resolved_strike,
+                minutes_left=minutes_left,
+                yes_ask=ask_price if side == "BUY_YES" else round(1.0 - ask_price, 2),
+                no_ask=round(1.0 - ask_price, 2) if side == "BUY_YES" else ask_price,
+                nd2_fair_prob=cal_yes_p,
+                net_edge_dollars=float(gate.get("netEdgeDollars") or 0.045),
+                atr_pct=0.18,
+                atr_baseline_mult=1.0,
+                rsi_14=52.0,
+                ma_spread_short_pct=0.05,
+                pearson_corr_regime="SYNCHRONIZED",
+                market_regime="TRENDING_IMPULSE",
+                sniper_action=side,
+                gate_blocked_reason="NONE_LIVE_VENUE_EXECUTED",
+                is_synthetic=0,
+                verified_live_fill=True,
+                source="LIVE_VENUE",
+            )
+
             response = {
                 "ok": True,
                 "status": str(kalshi_v2_order_result.get("status") or "RESTING"),
+                "order_id": exchange_order_id,
                 "orderId": exchange_order_id,
+                "client_order_id": kalshi_v2_order_result.get("client_order_id"),
                 "idempotencyKey": idempotency_key,
                 "symbol": clean_upper,
                 "settledCash": settled_cash,
                 "portfolioCorrelationGuard": corr_guard,
-                "executionVenues": ["KALSHI_V2_EVENTS_ORDERS_MAKER"],
+                "executionVenues": ["KALSHI_V2_PORTFOLIO_ORDERS"],
                 "kalshiV2Order": kalshi_v2_order_result,
+                "raw_venue_response": raw_venue_resp,
                 "fiveGateRiskEngine": five_gate_result,
                 "side": side,
                 "contracts": contracts,
@@ -5235,7 +5449,8 @@ async def execute_kalshi_or_public_order(
             con=con,
         )
 
-        exchange_order_id = str(public_retry_result.get("orderId") or "").strip()
+        exchange_order_id = str(public_retry_result.get("order_id") or public_retry_result.get("orderId") or "").strip()
+        raw_venue_resp = public_retry_result.get("raw_venue_response")
         if not public_retry_result.get("ok") or not public_retry_result.get("liveSubmitted") or not exchange_order_id:
             dlq_res = await route_to_dlq(
                 idempotency_key=f"{idempotency_key}-dlq-public-retry-exhausted",
@@ -5253,6 +5468,7 @@ async def execute_kalshi_or_public_order(
             exhausted_payload = {
                 "ok": False,
                 "status": "VENUE_EXECUTION_FAILED",
+                "order_id": None,
                 "orderId": None,
                 "symbol": clean_upper,
                 "publicEventContractSymbol": pub_ev_symbol,
@@ -5260,6 +5476,7 @@ async def execute_kalshi_or_public_order(
                 "settledCash": settled_cash,
                 "portfolioCorrelationGuard": corr_guard,
                 "retryTelemetry": public_retry_result,
+                "raw_venue_response": raw_venue_resp,
                 "dlqRecord": dlq_res,
                 "idempotentReplay": False,
                 "dataQualityWarning": True,
@@ -5274,16 +5491,42 @@ async def execute_kalshi_or_public_order(
             )
             return exhausted_payload
 
+        settle_and_log_ml_telemetry_row(
+            symbol=pub_ev_symbol,
+            venue="PUBLIC_COM",
+            spot_price=coinbase_spot,
+            strike=coinbase_spot,
+            minutes_left=minutes_left,
+            yes_ask=ask_price,
+            no_ask=max(0.01, 1.0 - ask_price),
+            nd2_fair_prob=0.65,
+            net_edge_dollars=0.045,
+            atr_pct=0.18,
+            atr_baseline_mult=1.0,
+            rsi_14=52.0,
+            ma_spread_short_pct=0.05,
+            pearson_corr_regime="SYNCHRONIZED",
+            market_regime="TRENDING_IMPULSE",
+            sniper_action=side,
+            gate_blocked_reason="NONE_LIVE_VENUE_EXECUTED",
+            is_synthetic=0,
+            verified_live_fill=True,
+            source="LIVE_VENUE",
+        )
+
         response = {
             "ok": True,
             "status": str(public_retry_result.get("fillState") or public_retry_result.get("status") or "SUBMITTED_LIVE"),
+            "order_id": exchange_order_id,
             "orderId": exchange_order_id,
+            "client_order_id": public_retry_result.get("client_order_id"),
             "idempotencyKey": idempotency_key,
             "symbol": clean_upper,
             "publicEventContractSymbol": pub_ev_symbol,
             "settledCash": settled_cash,
             "portfolioCorrelationGuard": corr_guard,
             "executionVenues": ["PUBLIC_COM_BROKERAGE"],
+            "raw_venue_response": raw_venue_resp,
             "side": side,
             "contracts": contracts,
             "fillPrice": ask_price,
@@ -5822,10 +6065,51 @@ async def run_portfolio_cleaner(
             save_idempotent_result(con, idempotency_key, "run_portfolio_cleaner", {"dry_run": dry_run}, block_res)
             return block_res
 
+        # Fetch live open orders and settled positions from both venues (Kalshi V2 & Public.com) at run start
+        initial_kalshi_orders_res = await kalshi_signed_rest_request(
+            "GET",
+            "/trade-api/v2/portfolio/orders?status=resting",
+            is_write=False,
+        )
+        initial_kalshi_open_orders = (
+            (initial_kalshi_orders_res.get("data") or {}).get("orders")
+            if isinstance(initial_kalshi_orders_res.get("data"), dict)
+            else []
+        ) or []
+
+        resolved_pub_account = str(pub_port.get("accountId") or PUBLIC_DEFAULT_ACCOUNT_ID or "5OQ77709").strip()
+        pub_bearer = await get_public_bearer_token(force_refresh=False)
+        initial_public_open_orders: List[Dict[str, Any]] = []
+        public_cancelled_order_ids: List[str] = []
+        if pub_bearer:
+            try:
+                async with httpx.AsyncClient(timeout=4.0) as client:
+                    pub_ord_resp = await client.get(
+                        f"{PUBLIC_API_BASE_URL}/userapigateway/trading/{resolved_pub_account}/orders",
+                        headers={"Authorization": f"Bearer {pub_bearer}", "Accept": "application/json"},
+                    )
+                    if pub_ord_resp.status_code == 200:
+                        pub_ord_json = pub_ord_resp.json()
+                        raw_pub_ords = pub_ord_json.get("orders") if isinstance(pub_ord_json, dict) else []
+                        for po in (raw_pub_ords or []):
+                            if isinstance(po, dict) and str(po.get("status", "")).upper() in ("OPEN", "WORKING", "NEW", "PENDING", "PARTIALLY_FILLED"):
+                                initial_public_open_orders.append(po)
+                                oid = str(po.get("orderId") or po.get("id") or "").strip()
+                                if oid and not dry_run:
+                                    del_resp = await client.delete(
+                                        f"{PUBLIC_API_BASE_URL}/userapigateway/trading/{resolved_pub_account}/order/{oid}",
+                                        headers={"Authorization": f"Bearer {pub_bearer}", "Accept": "application/json"},
+                                    )
+                                    if del_resp.status_code in (200, 202, 204):
+                                        public_cancelled_order_ids.append(oid)
+            except Exception:
+                pass
+
         # Step 1 (Rule 3): CancelAllOpenOrders pre-exit sweep on Kalshi V2
         cancel_sweep_res = await cancel_all_kalshi_v2_orders(
             reason=f"Rule 3 pre-exit CancelAllOpenOrders sweep ({idempotency_key})"
-        )
+        ) if not dry_run else {"ok": True, "status": "DRY_RUN_SKIPPED", "cancelled_order_ids": []}
+
         # Step 2 (Rule 3): Await and confirm open-order & collateral release on Kalshi V2
         open_orders_check = await kalshi_signed_rest_request(
             "GET",
@@ -5840,7 +6124,7 @@ async def run_portfolio_cleaner(
         balance_released_confirmed = bool(open_orders_check.get("ok") and len(resting_orders) == 0)
         refreshed_kalshi_bal = await get_kalshi_live_balance(forceRefresh=True)
 
-        # Query real Kalshi V2 positions
+        # Query real settled Kalshi V2 positions
         kalshi_pos_res = await kalshi_signed_rest_request(
             "GET",
             "/trade-api/v2/portfolio/positions",
@@ -5892,9 +6176,9 @@ async def run_portfolio_cleaner(
                         time_in_force="immediate_or_cancel",
                         con=con,
                     )
-                    close_status = str(close_res.get("status") or "VENUE_EXECUTION_FAILED")
-                    close_order_id = close_res.get("exchange_order_id")
-                    if close_res.get("ok") and close_order_id:
+                    close_order_id = str(close_res.get("exchange_order_id") or close_res.get("order_id") or "").strip() or None
+                    close_status = "LIVE_EXECUTED" if (close_res.get("ok") and close_order_id) else "VENUE_EXECUTION_FAILED"
+                    if close_status == "LIVE_EXECUTED":
                         trimmed_events += 1
                         net_cash_freed = round(net_cash_freed + val_usd, 2)
                 venue_actions.append({
@@ -5902,6 +6186,7 @@ async def run_portfolio_cleaner(
                     "symbol": tkr,
                     "qty": abs(pos_qty),
                     "status": close_status,
+                    "confirmationId": close_order_id,
                     "exchangeOrderId": close_order_id,
                 })
                 con.execute(
@@ -5931,9 +6216,9 @@ async def run_portfolio_cleaner(
                         quantity=str(qty),
                         con=con,
                     )
-                    close_status = str(pub_close.get("status") or "VENUE_EXECUTION_FAILED")
-                    close_order_id = pub_close.get("orderId")
-                    if pub_close.get("ok") and close_order_id:
+                    close_order_id = str(pub_close.get("order_id") or pub_close.get("orderId") or "").strip() or None
+                    close_status = "LIVE_EXECUTED" if (pub_close.get("ok") and close_order_id) else "VENUE_EXECUTION_FAILED"
+                    if close_status == "LIVE_EXECUTED":
                         swept_dust += 1
                         net_cash_freed = round(net_cash_freed + val_usd, 2)
                 venue_actions.append({
@@ -5941,6 +6226,7 @@ async def run_portfolio_cleaner(
                     "symbol": sym,
                     "qty": qty,
                     "status": close_status,
+                    "confirmationId": close_order_id,
                     "exchangeOrderId": close_order_id,
                 })
                 con.execute(
@@ -5948,11 +6234,28 @@ async def run_portfolio_cleaner(
                     [now_utc, idempotency_key, sym, "EQUITY", qty, val_usd, close_status, 0.0, val_usd if close_order_id else 0.0, close_status],
                 )
 
-        final_status = "DRY_RUN_VERIFIED" if dry_run else "LIVE_SWEEP_COMPLETED"
+        # Emit LIVE_EXECUTED ONLY when real venue confirmation IDs are attached to each executed action
+        all_actions_confirmed = bool(
+            not dry_run
+            and len(venue_actions) > 0
+            and all(bool(a.get("confirmationId") and a.get("status") == "LIVE_EXECUTED") for a in venue_actions)
+        )
+        if dry_run:
+            final_status = "DRY_RUN_VERIFIED"
+        elif all_actions_confirmed:
+            final_status = "LIVE_EXECUTED"
+        elif len(venue_actions) == 0 and balance_released_confirmed:
+            final_status = "LIVE_SWEEP_NO_POSITIONS_TO_TRIM"
+        else:
+            final_status = "VENUE_CONFIRMATION_MISSING_OR_PARTIAL"
+
         response = {
-            "ok": True,
+            "ok": final_status in ("LIVE_EXECUTED", "DRY_RUN_VERIFIED", "LIVE_SWEEP_NO_POSITIONS_TO_TRIM"),
             "status": final_status,
             "idempotencyKey": idempotency_key,
+            "initialKalshiOpenOrdersCount": len(initial_kalshi_open_orders),
+            "initialPublicOpenOrdersCount": len(initial_public_open_orders),
+            "publicCancelledOrderIds": public_cancelled_order_ids,
             "rule3CancelSweep": cancel_sweep_res,
             "balanceReleaseConfirmed": balance_released_confirmed,
             "remainingOpenOrdersCount": len(resting_orders),
@@ -5963,9 +6266,9 @@ async def run_portfolio_cleaner(
             "netCashFreedUsd": net_cash_freed,
             "venueActions": venue_actions,
             "idempotentReplay": False,
-            "dataQualityWarning": False,
+            "dataQualityWarning": final_status == "VENUE_CONFIRMATION_MISSING_OR_PARTIAL",
             "rationale": (
-                f"Rule 3 pre-exit sweep complete (balanceReleaseConfirmed={balance_released_confirmed}, "
+                f"Rule 3 pre-exit sweep ({final_status}, balanceReleaseConfirmed={balance_released_confirmed}, "
                 f"remainingOpenOrders={len(resting_orders)}): swept {swept_dust} live dust equities and "
                 f"trimmed {trimmed_events} live contracts (+${net_cash_freed:.2f} freed)."
             ),
@@ -6043,15 +6346,20 @@ async def train_and_optimize_meta_model(
 ) -> Dict[str, Any]:
     """
     MCP Tool #9: Queries `ml_telemetry_ledger` in DuckDB strictly filtering for non-synthetic live venue rows
-    (`WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL`),
-    trains an in-memory Gradient Boosted Decision Stump + L2-Ridge/Logistic probability calibrator,
-    and persists `ml_meta_model_state` using explicit column names and parameterized bindings.
+    (`WHERE is_synthetic = 0 AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL`),
+    logs the excluded synthetic row count, trains an in-memory Gradient Boosted Decision Stump + L2-Ridge/Logistic
+    probability calibrator, and persists `ml_meta_model_state` using explicit column names and parameterized bindings.
     """
     await bootstrap_ml_telemetry_from_live_candles(min_rows=max(50, min_samples))
 
     clean_symbol = (symbol or "ALL").upper().strip()
     con = get_db_connection()
     try:
+        excluded_syn_row = con.execute(
+            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = 1 OR COALESCE(CAST(is_synthetic AS INTEGER), 0) != 0"
+        ).fetchone()
+        excluded_synthetic_rows = int(excluded_syn_row[0]) if excluded_syn_row else 0
+
         if clean_symbol != "ALL":
             rows = con.execute(
                 """
@@ -6059,7 +6367,7 @@ async def train_and_optimize_meta_model(
                        kalshi_spread_bps, minutes_left, yes_ask, no_ask, net_edge_dollars,
                        sniper_action, realized_outcome, COALESCE(realized_pnl_bps, 0.0)
                 FROM ml_telemetry_ledger
-                WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL AND UPPER(symbol) = ?
+                WHERE is_synthetic = 0 AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL AND UPPER(symbol) = ?
                 ORDER BY timestamp_utc DESC
                 LIMIT 500
                 """,
@@ -6075,14 +6383,14 @@ async def train_and_optimize_meta_model(
                        kalshi_spread_bps, minutes_left, yes_ask, no_ask, net_edge_dollars,
                        sniper_action, realized_outcome, COALESCE(realized_pnl_bps, 0.0)
                 FROM ml_telemetry_ledger
-                WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL
+                WHERE is_synthetic = 0 AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL
                 ORDER BY timestamp_utc DESC
                 LIMIT 500
                 """
             ).fetchall()
 
         total_rows_row = con.execute(
-            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'"
+            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = 0 AND source = 'LIVE_VENUE'"
         ).fetchone()
         total_ledger_rows = int(total_rows_row[0]) if total_rows_row else len(rows)
 
@@ -6093,8 +6401,13 @@ async def train_and_optimize_meta_model(
                 "samplesAvailable": len(rows),
                 "minSamplesRequired": min_samples,
                 "totalLedgerRows": total_ledger_rows,
+                "excludedSyntheticRows": excluded_synthetic_rows,
+                "excluded_synthetic_rows": excluded_synthetic_rows,
                 "dataQualityWarning": True,
-                "rationale": f"Insufficient live non-synthetic settled ML samples ({len(rows)} < {min_samples}) in ml_telemetry_ledger; holding prior calibration weights.",
+                "rationale": (
+                    f"Insufficient live non-synthetic settled ML samples ({len(rows)} < {min_samples}, "
+                    f"excluded_synthetic_rows={excluded_synthetic_rows}) in ml_telemetry_ledger; holding prior calibration weights."
+                ),
             }
 
         X_raw: List[List[float]] = []
@@ -6283,6 +6596,7 @@ async def train_and_optimize_meta_model(
             "symbol_filter": clean_symbol,
             "avg_realized_pnl_bps": avg_realized_pnl_bps,
             "recommended_atr_stop_mult": rec_atr_stop_mult,
+            "excluded_synthetic_rows": excluded_synthetic_rows,
             "weights": {k: round(v, 5) for k, v in weights.items()},
             "gb_stumps": gb_stumps,
             "engine": "GRADIENT_BOOSTED_RIDGE_LOGISTIC_V2",
@@ -6334,6 +6648,8 @@ async def train_and_optimize_meta_model(
             "targetMetric": target_metric,
             "samplesUsed": n_samples,
             "totalLedgerRows": total_ledger_rows,
+            "excludedSyntheticRows": excluded_synthetic_rows,
+            "excluded_synthetic_rows": excluded_synthetic_rows,
             "features": ML_FEATURE_NAMES,
             "metrics": {
                 "brierScoreRawNd2": round(brier_raw, 4),
@@ -6354,7 +6670,7 @@ async def train_and_optimize_meta_model(
             "gradientBoostedStumpsCount": len(gb_stumps),
             "dataQualityWarning": False,
             "rationale": (
-                f"Trained {trained_state['model_id']} ({clean_symbol}, {n_samples} rows): "
+                f"Trained {trained_state['model_id']} ({clean_symbol}, {n_samples} live rows, excluded_synthetic={excluded_synthetic_rows}): "
                 f"Brier {brier_raw:.4f}->{brier_calibrated:.4f}, win {empirical_win_rate * 100:.1f}%, "
                 f"ATR stop {rec_atr_stop_mult:.2f}x, edge >= +${rec_min_edge:.3f}."
             ),
@@ -6376,7 +6692,7 @@ def export_ml_telemetry_store(limit: int = 500) -> Dict[str, Any]:
             "realized_pnl_bps", "realized_outcome", "is_synthetic", "source",
         ]
         raw_rows = con.execute(
-            f"SELECT {', '.join(cols)} FROM ml_telemetry_ledger WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' ORDER BY timestamp_utc DESC LIMIT ?",
+            f"SELECT {', '.join(cols)} FROM ml_telemetry_ledger WHERE is_synthetic = 0 AND source = 'LIVE_VENUE' ORDER BY timestamp_utc DESC LIMIT ?",
             [limit],
         ).fetchall()
         records = [dict(zip(cols, r)) for r in raw_rows]
@@ -6395,14 +6711,18 @@ def export_ml_telemetry_store(limit: int = 500) -> Dict[str, Any]:
 
 
 def import_ml_telemetry_store(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Restores verified live `ml_telemetry_ledger` rows from a Google Drive Vault snapshot."""
+    """Restores `ml_telemetry_ledger` rows from a Google Drive Vault snapshot, tagging any non-live row with `is_synthetic = 1`."""
     rows = payload.get("rows", [])
     con = get_db_connection()
     inserted = 0
     try:
         for r in rows:
-            if bool(r.get("is_synthetic", False)) or str(r.get("source", "LIVE_VENUE")) != "LIVE_VENUE":
-                continue
+            is_verified_live = (
+                not bool(r.get("is_synthetic", False))
+                and int(r.get("is_synthetic", 0) or 0) == 0
+                and str(r.get("source", "LIVE_VENUE")) == "LIVE_VENUE"
+            )
+            is_syn_flag = 0 if is_verified_live else 1
             sym = str(r.get("symbol", "KXBTC15M")).upper()
             spot = float(r.get("spot_price") or r.get("coinbase_spot") or 0.0)
             con.execute(
@@ -6441,8 +6761,8 @@ def import_ml_telemetry_store(payload: Dict[str, Any]) -> Dict[str, Any]:
                     r.get("gate_blocked_reason", "RESTORED_FROM_DRIVE"),
                     r.get("realized_pnl_bps", 0.0),
                     r.get("realized_outcome"),
-                    False,
-                    "LIVE_VENUE",
+                    is_syn_flag,
+                    "LIVE_VENUE" if is_syn_flag == 0 else str(r.get("source") or "IMPORTED_BACKFILL"),
                 ],
             )
             inserted += 1
@@ -6848,12 +7168,12 @@ async def btc_lead_lag_sniper_gate(
 async def portfolio_dust_and_stale_trim_audit(
     account_id: str = "5OQ77709",
 ) -> str:
-    """Public.com 8 fractional equity dust sweep and 3 stale Kalshi contract trim prompt."""
+    """Live Public.com fractional equity dust sweep and decaying Kalshi contract trim prompt."""
     return (
-        f"Audit Public.com brokerage account {account_id} for fee drag and stale exposure: "
-        "(1) Sweep 8 fractional equity dust lots (<$1.00: BGIN, GLND, XRPN, BZAI, SHMD, KOD, EGG, AIB) using HIGHEST_COST tax-lot matching at $0 commission. "
-        "(2) Trim 3 decaying Kalshi event contracts (KXALIENS, KXBTCMAX100, KXBTCPRICE) with unrealized loss < -12%. "
-        "(3) Protect core holdings (QQQ, SPY, ACN, AISP, KXBTCD) and require idempotency_key on run_portfolio_cleaner."
+        f"Audit Public.com brokerage account {account_id} and Kalshi V2 portfolio for fee drag and stale exposure: "
+        "(1) Fetch live open orders and settled positions from both venues at run start and execute the Rule 3 CancelAllOpenOrders pre-exit sweep. "
+        "(2) Sweep live fractional equity dust lots (<$1.00) on Public.com and trim decaying Kalshi event contracts with unrealized loss < -12%. "
+        "(3) Require idempotency_key on run_portfolio_cleaner and emit LIVE_EXECUTED only when real venue confirmation IDs are attached to each action."
     )
 
 

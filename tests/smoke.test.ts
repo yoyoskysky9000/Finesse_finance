@@ -1125,7 +1125,7 @@ async function runSmokeSuite() {
     assert.equal(serverMod.venueOrderSubmissionCount, 0);
     assert.equal(blockedCorrGuard.maxPairwiseRho, 0.8);
 
-    // (10) Verify mcp_server.py 100% live-production wiring invariants (Part 1 & Part 2)
+    // (10) Verify mcp_server.py 100% live-production wiring invariants (Part 1 Gates a-e)
     const mcpSource = fs.readFileSync(path.resolve(process.cwd(), 'mcp_server.py'), 'utf-8');
     assert(!mcpSource.includes('625.35'), 'mcp_server.py must not contain hardcoded $625.35 balance');
     assert(!mcpSource.includes('435.08'), 'mcp_server.py must not contain hardcoded $435.08 cash');
@@ -1135,23 +1135,157 @@ async function runSmokeSuite() {
     assert(!mcpSource.includes('PAPER_LOGGED_BY_GATE_3'), 'mcp_server.py must not contain simulated PAPER_LOGGED_BY_GATE_3 state');
     assert(mcpSource.includes('BALANCE_UNVERIFIED_BLOCK'), 'mcp_server.py must return BALANCE_UNVERIFIED_BLOCK when live balance verification fails');
     assert(
+      mcpSource.includes('BALANCE_CACHE_TTL_SECONDS: float = 60.0'),
+      'mcp_server.py must enforce <= 60s balance cache TTL'
+    );
+    assert(
+      mcpSource.includes('/trade-api/v2/portfolio/orders'),
+      'mcp_server.py must route live Kalshi orders through /trade-api/v2/portfolio/orders'
+    );
+    assert(
+      mcpSource.includes('INSERT OR REPLACE INTO order_ledger ('),
+      'mcp_server.py must persist venue-returned order_id and raw_venue_response to order_ledger'
+    );
+    assert(
       mcpSource.includes('INSERT OR REPLACE INTO ml_meta_model_state (\n                model_id,'),
       'mcp_server.py must use explicit column names on INSERT INTO ml_meta_model_state'
     );
     assert(
-      mcpSource.includes("WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'"),
-      'mcp_server.py must filter ML training queries with WHERE is_synthetic = FALSE AND source = \'LIVE_VENUE\''
+      mcpSource.includes('is_synthetic INTEGER DEFAULT 0'),
+      'mcp_server.py must define is_synthetic INTEGER DEFAULT 0 on ml_telemetry_ledger'
+    );
+    assert(
+      mcpSource.includes("WHERE is_synthetic = 0 AND source = 'LIVE_VENUE'"),
+      'mcp_server.py must filter ML training queries with WHERE is_synthetic = 0 AND source = \'LIVE_VENUE\''
+    );
+    assert(
+      mcpSource.includes('excluded_synthetic_rows'),
+      'mcp_server.py must log excluded_synthetic_rows in train_and_optimize_meta_model'
+    );
+    assert(
+      mcpSource.includes('final_status = "LIVE_EXECUTED"'),
+      'mcp_server.py run_portfolio_cleaner must emit LIVE_EXECUTED only when real venue confirmation IDs are attached'
     );
     assert(
       mcpSource.includes('def evaluate_portfolio_correlation_and_cap('),
       'mcp_server.py must enforce evaluate_portfolio_correlation_and_cap'
     );
 
+    // (11) Verify TASK-06 Cross-Market Lead-Lag Triggers (2.7.0-LEAD-LAG-LIVE-CHAMPION: SVB-60, GKX-5, XVD)
+    const {
+      LEAD_LAG_CHAMPION_VERSION,
+      evaluateSvb60Trigger,
+      evaluateGkx5Trigger,
+      evaluateGkx5Minute1StopTightening,
+      evaluateXvdTrigger,
+      evaluateLeadLagAnomalyTriggers,
+    } = await import('../src/strategies/LeadLagAnomalyTriggers');
+
+    const rawChampionJson = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), 'champion_config.json'), 'utf-8')
+    ) as Record<string, any>;
+    assert.equal(rawChampionJson.lead_lag_triggers?.version, '2.7.0-LEAD-LAG-LIVE-CHAMPION');
+    assert.equal(rawChampionJson.lead_lag_triggers?.envelope, '2.6.0-PORTFOLIO-GUARD-CHAMPION');
+    assert.equal(rawChampionJson.lead_lag_triggers?.['SVB-60']?.min_abs_z_velocity, 2.75);
+    assert.equal(rawChampionJson.lead_lag_triggers?.['GKX-5']?.min_r_gk_vs_30d_tod_median, 1.6);
+    assert.equal(rawChampionJson.lead_lag_triggers?.['XVD']?.settled_cash_cap_fraction, 0.015);
+
+    // Trigger 1: SVB-60 pass & stale-feed breaker test
+    const svbPass = evaluateSvb60Trigger({
+      zVelocityChecks5s: [2.82, 3.05],
+      coinbaseSpotUsd: 91250,
+      krakenSpotUsd: 91241,
+      kalshiAskMove10sDollars: 0.01,
+      fairValueProb: 0.82,
+      kalshiAskDollars: 0.62,
+      minutesRemaining: 9.0,
+      spotLatencyMs: 120,
+      kalshiLatencyMs: 240,
+      interVenueSkewMs: 45,
+    });
+    assert.equal(svbPass.triggered, true);
+    assert.equal(svbPass.direction, 'BUY_YES');
+
+    const svbStale = evaluateSvb60Trigger({
+      zVelocityChecks5s: [2.9, 3.1],
+      coinbaseSpotUsd: 91250,
+      krakenSpotUsd: 91245,
+      kalshiAskMove10sDollars: 0.0,
+      fairValueProb: 0.82,
+      kalshiAskDollars: 0.62,
+      minutesRemaining: 9.0,
+      spotLatencyMs: 1150, // > 1000ms trips breaker
+      kalshiLatencyMs: 240,
+      interVenueSkewMs: 45,
+    });
+    assert.equal(svbStale.triggered, false);
+    assert.equal(svbStale.staleFeedBreakerTripped, true);
+
+    // Trigger 2: GKX-5 pass & minute-1 sign flip -$0.03 stop tightening
+    const gkxPass = evaluateGkx5Trigger({
+      rGkRatio: 1.75,
+      zVelocity5m: 2.35,
+      intraCandleVelocitySigns: [0.8, 1.4, 2.1, 2.35],
+      deltaFvProjDollars: 0.27,
+      fairValueProb: 0.81,
+      kalshiAskDollars: 0.60,
+      candleFinalizationLatencyMs: 420,
+      kalshiLatencyMs: 310,
+      minute1ZVelocity5m: -0.45, // sign flipped in minute 1 -> tightens SL to -$0.03
+      entryPriceDollars: 0.60,
+    });
+    assert.equal(gkxPass.triggered, true);
+    assert.equal(gkxPass.stopLossDeltaDollars, -0.03);
+    assert.equal(gkxPass.minute1StopTightening.signFlippedInMinute1, true);
+    assert.equal(gkxPass.minute1StopTightening.effectiveStopLossPriceDollars, 0.57);
+
+    const slNoFlip = evaluateGkx5Minute1StopTightening(2.35, 1.85, 0.60, -0.12);
+    assert.equal(slNoFlip.signFlippedInMinute1, false);
+    assert.equal(slNoFlip.tightenedStopLossDeltaDollars, -0.12);
+
+    // Trigger 3: XVD pass & half-cap (1.5% settled cash) sizing inside 2.6.0 envelope
+    const xvdCombined = evaluateLeadLagAnomalyTriggers({
+      envelope: {
+        symbol: 'KXBTC15M',
+        side: 'BUY_YES',
+        chop14: 38.4,
+        adx14: 31.2,
+        lhs: 0.78,
+        ask: 0.60,
+        atrDollar: 0.05,
+        settledCashUsd: 1000,
+        activePositions: [],
+        correlationMatrix: {},
+        timestampMs: 1763193600000,
+      },
+      xvd: {
+        snapshots: [
+          { timestampMs: 1000, kalshiProb: 0.60, polymarketProb: 0.72 },
+          { timestampMs: 2600, kalshiProb: 0.60, polymarketProb: 0.73 },
+          { timestampMs: 4200, kalshiProb: 0.60, polymarketProb: 0.74 },
+        ],
+        identicalSettlementSource: true,
+        spotFairValueProb: 0.76,
+        leadingVenueProb: 0.74,
+        laggingVenueAskDollars: 0.58,
+        kalshiLatencyMs: 220,
+        polymarketLatencyMs: 310,
+        spotLatencyMs: 95,
+        interVenueSkewMs: 140,
+      },
+    });
+    assert.equal(xvdCombined.version, LEAD_LAG_CHAMPION_VERSION);
+    assert.equal(xvdCombined.triggered, true);
+    assert.equal(xvdCombined.activeTriggerId, 'XVD');
+    assert.equal(xvdCombined.settledCashCapFraction, 0.015);
+    assert.equal(xvdCombined.approvedNotionalUsd, 15.0); // 1.5% of $1,000 settled cash = $15.00
+    assert.equal(xvdCombined.approvedContracts, 25); // $15.00 / $0.60 = 25 contracts
+
     console.log(
-      'PASS [TASK-08 / 2.6.0-PORTFOLIO-GUARD-CHAMPION]: PortfolioCorrelationGuard, Telemetry Completeness Gate, mcp_server.py 100% live wiring, and post-lock pre-exchange ordering passed.'
+      'PASS [TASK-06 & TASK-08 / 2.7.0-LEAD-LAG-LIVE-CHAMPION]: PortfolioCorrelationGuard, Telemetry Gate, mcp_server.py de-sim Gates (a)-(e), and LeadLagAnomalyTriggers (SVB-60, GKX-5, XVD) passed.'
     );
 
-    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + MCP LIVE WIRING PASSED.');
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION PASSED.');
   } finally {
     setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);
