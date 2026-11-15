@@ -183,5 +183,79 @@
         "inter_venue_skew_max_ms": 500
       }
     }
+  },
+  "task07c": {
+    "mode": "shadow",
+    "live_enabled": false,
+    "freshness_and_alignment": {
+      "market_max_event_age_ms": 500,
+      "market_max_receive_age_ms": 500,
+      "fx_age_ms": 1000,
+      "book_age_ms": 1000,
+      "oi_age_ms": 5000,
+      "liquidation_heartbeat_age_ms": 2000,
+      "cross_source_skew_ms": 250,
+      "max_abs_clock_offset_ms": 100
+    },
+    "net_edge_after_reserves": {
+      "min_raw_fv_minus_ask": 0.18,
+      "min_net_edge_after_reserves": 0.18
+    },
+    "perp_basis_and_liquidation_cascade": {
+      "max_abs_basis_bp": 15,
+      "max_abs_basis_z": 3,
+      "max_basis_range_10_bp": 12,
+      "whipsaw_min_5s_delta_bp": 5,
+      "cascade_liquidation_share_60_min": 0.10,
+      "cascade_oi_change_60_max": -0.005,
+      "two_sided_liquidation_share_60_min": 0.03,
+      "two_sided_basis_range_10_bp_min": 8
+    },
+    "xvd_confirmation": {
+      "min_brcs": 95,
+      "max_gross_cash_fraction_of_settled_cash": 0.015
+    },
+    "spot_vpin_and_flow_confirmation": {
+      "vpin_min": 0.20,
+      "vpin_max": 0.70,
+      "d60_min": 0.20,
+      "d15_min": 0.10,
+      "classified_coverage_min": 0.95,
+      "completed_buckets_min": 12,
+      "persistence_min": 0.75,
+      "continuous_pass_ms_min": 10000,
+      "svb60": {
+        "aligned_return_60_bp_min": 12,
+        "z60_min": 3,
+        "venue_return_bp_min": 8,
+        "inter_venue_diff_bp_max": 8
+      },
+      "gkx5": {
+        "aligned_return_300_bp_min": 20,
+        "gk_expansion_min": 2,
+        "venue_return_bp_min": 12,
+        "inter_venue_diff_bp_max": 12
+      }
+    }
+  },
+  "ml_meta_model_governance": {
+    "n_min": 100,
+    "min_trading_days": 20,
+    "shrinkage_k": 60,
+    "w_cap_early": 0.5,
+    "w_cap_late": 0.75,
+    "n_late": 250,
+    "size_mult_min": 0.5,
+    "size_mult_max": 1.0,
+    "brier_window": 50,
+    "bss_floor": 0.0,
+    "brier_vs_base_margin": 0.02,
+    "logloss_gap_max": 0.05,
+    "ph_delta": 0.005,
+    "ph_lambda": 1.0,
+    "hard_cash_cap_pct": 0.03,
+    "hard_drawdown_pct": 0.035
   }
 }
+
+

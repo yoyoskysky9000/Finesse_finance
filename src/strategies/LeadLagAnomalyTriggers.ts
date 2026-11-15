@@ -808,6 +808,312 @@ export function evaluateXvdTrigger(input: XvdTriggerInput): XvdEvaluationResult 
 }
 
 /**
+ * TASK-07C: Order-Flow Toxicity (VPIN), Perp Basis & Feed Freshness Helper
+ */
+export interface SpotVenueFlowTelemetry {
+  vpin: number;
+  d60?: number;
+  d15?: number;
+  classifiedCoverage?: number;
+  completedBuckets?: number;
+  returnBp?: number;
+  persistence?: number;
+  continuousPassMs?: number;
+}
+
+export interface Snapshot {
+  trigger?: LeadLagTriggerId;
+  // 1. Freshness & Alignment (<= 500ms)
+  feedAgeMs?: number;
+  marketMaxEventAgeMs?: number;
+  marketMaxReceiveAgeMs?: number;
+  fxAgeMs?: number;
+  bookAgeMs?: number;
+  oiAgeMs?: number;
+  liquidationHeartbeatAgeMs?: number;
+  crossSourceSkewMs?: number;
+  clockOffsetMs?: number;
+
+  // 2. Net Edge After Reserves Floor (fv - ask >= 0.18)
+  fv: number;
+  ask: number;
+  feesPerShare?: number;
+  slippagePerShare?: number;
+  modelReservePerShare?: number;
+
+  // 3. Perp Basis (|basisBp| <= 15) & Liquidation Cascade Breaker
+  basisBp: number;
+  basisZ?: number;
+  basisRange10Bp?: number;
+  latest5Bp?: number;
+  prev5Bp?: number;
+  liquidationShare60?: number;
+  oiChange60?: number;
+  longLiquidationShare60?: number;
+  shortLiquidationShare60?: number;
+
+  // 4A. XVD Trigger-Specific Confirmation
+  hardCompatible?: boolean;
+  rulesHashCurrent?: boolean;
+  historyQualified?: boolean;
+  resolutionReady?: boolean;
+  executionReady?: boolean;
+  flowCleared?: boolean;
+  basisReplayScore?: number;
+  timestampScore?: number;
+  reservedGrossCash?: number;
+  proposedGrossCash?: number;
+  settledCash?: number;
+
+  // 4B. Spot VPIN ([0.20, 0.70]) & Multi-Venue Confirmation
+  vpin?: number | [number, number] | number[];
+  d60?: [number, number] | number[];
+  d15?: [number, number] | number[];
+  classifiedCoverage?: [number, number] | number[];
+  completedBuckets?: [number, number] | number[];
+  persistence?: number | [number, number] | number[];
+  continuousPassMs?: number | [number, number] | number[];
+  venues?: [SpotVenueFlowTelemetry, SpotVenueFlowTelemetry] | SpotVenueFlowTelemetry[];
+  venueReturnsBp?: [number, number] | number[];
+  venueReturn60Bp?: [number, number] | number[];
+  venueReturn300Bp?: [number, number] | number[];
+
+  // SVB-60 specific
+  alignedReturn60Bp?: number;
+  z60?: number;
+
+  // GKX-5 specific
+  alignedReturn300Bp?: number;
+  gkExpansion?: number;
+}
+
+export interface OrderFlowToxicityAndBasisVerdict {
+  allowed: boolean;
+  approved: boolean;
+  action: 'ALLOW' | 'REJECT';
+  reason: string;
+  code: string;
+  trigger: LeadLagTriggerId;
+  rawEdge: number;
+  netEdgeAfterReserves: number;
+  brcs?: number;
+}
+
+export function evaluateOrderFlowToxicityAndBasis(
+  s: Snapshot,
+): OrderFlowToxicityAndBasisVerdict {
+  const trigger: LeadLagTriggerId = s.trigger ?? 'SVB-60';
+  const rawEdge = Number((s.fv - s.ask).toFixed(6));
+  const netEdgeAfterReserves = Number(
+    (
+      s.fv -
+      s.ask -
+      (s.feesPerShare ?? 0) -
+      (s.slippagePerShare ?? 0) -
+      (s.modelReservePerShare ?? 0)
+    ).toFixed(6),
+  );
+
+  const reject = (code: string): OrderFlowToxicityAndBasisVerdict => ({
+    allowed: false,
+    approved: false,
+    action: 'REJECT',
+    reason: code,
+    code,
+    trigger,
+    rawEdge,
+    netEdgeAfterReserves,
+  });
+
+  // 1. Freshness & Alignment Gate (feed freshness <= 500ms)
+  const eventAgeMs = s.marketMaxEventAgeMs ?? s.feedAgeMs ?? 0;
+  const receiveAgeMs = s.marketMaxReceiveAgeMs ?? s.feedAgeMs ?? 0;
+  if (
+    !Number.isFinite(eventAgeMs) ||
+    eventAgeMs > 500 ||
+    !Number.isFinite(receiveAgeMs) ||
+    receiveAgeMs > 500 ||
+    (s.fxAgeMs !== undefined && (!Number.isFinite(s.fxAgeMs) || s.fxAgeMs > 1000)) ||
+    (s.bookAgeMs !== undefined && (!Number.isFinite(s.bookAgeMs) || s.bookAgeMs > 1000)) ||
+    (s.oiAgeMs !== undefined && (!Number.isFinite(s.oiAgeMs) || s.oiAgeMs > 5000)) ||
+    (s.liquidationHeartbeatAgeMs !== undefined &&
+      (!Number.isFinite(s.liquidationHeartbeatAgeMs) || s.liquidationHeartbeatAgeMs > 2000)) ||
+    (s.crossSourceSkewMs !== undefined &&
+      (!Number.isFinite(s.crossSourceSkewMs) || s.crossSourceSkewMs > 250)) ||
+    (s.clockOffsetMs !== undefined &&
+      (!Number.isFinite(s.clockOffsetMs) || Math.abs(s.clockOffsetMs) > 100))
+  ) {
+    return reject('STALE_OR_UNALIGNED');
+  }
+
+  // 2. Net Edge After Reserves Floor (fv - ask >= 0.18)
+  if (
+    !Number.isFinite(rawEdge) ||
+    rawEdge < 0.18 - 1e-9 ||
+    !Number.isFinite(netEdgeAfterReserves) ||
+    netEdgeAfterReserves < 0.18 - 1e-9
+  ) {
+    return reject('EDGE_BELOW_FLOOR');
+  }
+
+  // 3. Perp Basis (|basisBp| <= 15) & Liquidation Cascade Breaker
+  const basisSignFlipped =
+    s.latest5Bp !== undefined &&
+    s.prev5Bp !== undefined &&
+    s.latest5Bp * s.prev5Bp < 0 &&
+    Math.min(Math.abs(s.latest5Bp), Math.abs(s.prev5Bp)) >= 5;
+  if (
+    !Number.isFinite(s.basisBp) ||
+    Math.abs(s.basisBp) > 15 ||
+    (s.basisZ !== undefined && Math.abs(s.basisZ) > 3) ||
+    (s.basisRange10Bp !== undefined && s.basisRange10Bp > 12) ||
+    basisSignFlipped
+  ) {
+    return reject('BASIS_DISLOCATION_OR_WHIPSAW');
+  }
+
+  const oneSidedCascade =
+    (s.liquidationShare60 ?? 0) >= 0.10 && (s.oiChange60 ?? 0) <= -0.005;
+  const twoSidedCascade =
+    (s.longLiquidationShare60 ?? 0) >= 0.03 &&
+    (s.shortLiquidationShare60 ?? 0) >= 0.03 &&
+    (s.basisRange10Bp ?? 0) > 8;
+  if (oneSidedCascade || twoSidedCascade) {
+    return reject('CASCADE');
+  }
+
+  // 4. Trigger-Specific Confirmation & VPIN ([0.20, 0.70])
+  if (trigger === 'XVD') {
+    const hardFlagsOk =
+      (s.hardCompatible ?? true) &&
+      (s.rulesHashCurrent ?? true) &&
+      (s.historyQualified ?? true) &&
+      (s.resolutionReady ?? true) &&
+      (s.executionReady ?? true) &&
+      (s.flowCleared ?? true);
+    const brcs =
+      40 +
+      20 * (s.basisReplayScore ?? 1) +
+      15 * (s.timestampScore ?? 1) +
+      15 * Number(Boolean(s.resolutionReady ?? true)) +
+      10 * Number(Boolean(s.executionReady ?? true));
+    const settledCash = s.settledCash ?? 1000;
+    const reservedGrossCash = s.reservedGrossCash ?? 0;
+    const proposedGrossCash = s.proposedGrossCash ?? 0;
+    const cashCapOk =
+      settledCash > 0 &&
+      proposedGrossCash >= 0 &&
+      reservedGrossCash + proposedGrossCash <= 0.015 * settledCash + 1e-9;
+
+    if (!hardFlagsOk || brcs < 95 || !cashCapOk) {
+      return {
+        ...reject(
+          !hardFlagsOk
+            ? 'XVD_EQUIVALENCE_OR_FLOW_REJECTED'
+            : brcs < 95
+              ? 'BRCS_BELOW_95'
+              : 'XVD_GROSS_CASH_CAP_EXCEEDED',
+        ),
+        brcs,
+      };
+    }
+
+    return {
+      allowed: true,
+      approved: true,
+      action: 'ALLOW',
+      reason: 'OK',
+      code: 'OK',
+      trigger,
+      rawEdge,
+      netEdgeAfterReserves,
+      brcs,
+    };
+  }
+
+  const vpinList: number[] =
+    typeof s.vpin === 'number'
+      ? [s.vpin, s.vpin]
+      : Array.isArray(s.vpin)
+        ? s.vpin
+        : s.venues
+          ? s.venues.map((v) => v.vpin)
+          : [];
+
+  if (vpinList.length === 0 || vpinList.some((v) => !Number.isFinite(v) || v < 0.20 || v > 0.70)) {
+    return reject('FLOW_CONFIRMATION_FAILED');
+  }
+
+  for (let i = 0; i < Math.min(2, vpinList.length); i += 1) {
+    const d60Val = s.d60?.[i] ?? s.venues?.[i]?.d60;
+    const d15Val = s.d15?.[i] ?? s.venues?.[i]?.d15;
+    const covVal = s.classifiedCoverage?.[i] ?? s.venues?.[i]?.classifiedCoverage;
+    const bktVal = s.completedBuckets?.[i] ?? s.venues?.[i]?.completedBuckets;
+    const persVal = Array.isArray(s.persistence)
+      ? s.persistence[i]
+      : (s.persistence ?? s.venues?.[i]?.persistence);
+    const contPassVal = Array.isArray(s.continuousPassMs)
+      ? s.continuousPassMs[i]
+      : (s.continuousPassMs ?? s.venues?.[i]?.continuousPassMs);
+
+    if (
+      (d60Val !== undefined && d60Val < 0.20) ||
+      (d15Val !== undefined && d15Val < 0.10) ||
+      (covVal !== undefined && covVal < 0.95) ||
+      (bktVal !== undefined && bktVal < 12) ||
+      (persVal !== undefined && persVal < 0.75) ||
+      (contPassVal !== undefined && contPassVal < 10000)
+    ) {
+      return reject('FLOW_CONFIRMATION_FAILED');
+    }
+  }
+
+  const venueRets =
+    s.venueReturnsBp ??
+    (trigger === 'SVB-60' ? s.venueReturn60Bp : s.venueReturn300Bp) ??
+    (s.venues
+      ? s.venues.map((v) => v.returnBp).filter((v): v is number => v !== undefined)
+      : undefined);
+
+  if (trigger === 'SVB-60') {
+    if (
+      (s.alignedReturn60Bp !== undefined && s.alignedReturn60Bp < 12) ||
+      (s.z60 !== undefined && s.z60 < 3) ||
+      (venueRets !== undefined &&
+        (venueRets.length < 2 ||
+          venueRets[0] < 8 ||
+          venueRets[1] < 8 ||
+          Math.abs(venueRets[0] - venueRets[1]) > 8))
+    ) {
+      return reject('SVB60_CONFIRMATION_FAILED');
+    }
+  } else if (trigger === 'GKX-5') {
+    if (
+      (s.alignedReturn300Bp !== undefined && s.alignedReturn300Bp < 20) ||
+      (s.gkExpansion !== undefined && s.gkExpansion < 2) ||
+      (venueRets !== undefined &&
+        (venueRets.length < 2 ||
+          venueRets[0] < 12 ||
+          venueRets[1] < 12 ||
+          Math.abs(venueRets[0] - venueRets[1]) > 12))
+    ) {
+      return reject('GKX5_CONFIRMATION_FAILED');
+    }
+  }
+
+  return {
+    allowed: true,
+    approved: true,
+    action: 'ALLOW',
+    reason: 'OK',
+    code: 'OK',
+    trigger,
+    rawEdge,
+    netEdgeAfterReserves,
+  };
+}
+
+/**
  * Evaluates all 3 `2.7.0-LEAD-LAG-LIVE-CHAMPION` cross-market lead-lag anomaly triggers
  * (`SVB-60`, `GKX-5`, `XVD`) inside the `2.6.0-PORTFOLIO-GUARD-CHAMPION` envelope.
  */
@@ -858,3 +1164,5 @@ export function evaluateLeadLagAnomalyTriggers(
         }.`,
   };
 }
+
+

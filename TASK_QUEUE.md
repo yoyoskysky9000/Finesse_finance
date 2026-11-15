@@ -32,3 +32,4 @@
 
 - [ ] **TASK-05 `[SANDBOX]`**: Run walk-forward out-of-sample verification on `2.7.0-LEAD-LAG-LIVE-CHAMPION` over live Coinbase/Kalshi 5m & 15m datasets and populate numeric metrics in `champion_config.json`.
 
+

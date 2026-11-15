@@ -1303,6 +1303,7 @@ def get_active_meta_model(con: Optional[_LedgerConnectionWrapper] = None) -> Dic
                 "recommended_min_net_edge": float(row[8] or LEAD_LAG_MIN_EDGE),
                 "recommended_atr_stop_mult": float(row[12] or weights_data.get("recommended_atr_stop_mult", 1.35)),
                 "recommended_ask_band": [float(row[9] or LEAD_LAG_ASK_MIN), float(row[10] or LEAD_LAG_ASK_MAX)],
+                "tripped": bool(weights_data.get("tripped", False)),
                 "weights": weights_data.get(
                     "weights",
                     {
@@ -1334,6 +1335,7 @@ def get_active_meta_model(con: Optional[_LedgerConnectionWrapper] = None) -> Dic
             "recommended_min_net_edge": LEAD_LAG_MIN_EDGE,
             "recommended_atr_stop_mult": 1.35,
             "recommended_ask_band": [LEAD_LAG_ASK_MIN, LEAD_LAG_ASK_MAX],
+            "tripped": False,
             "weights": {
                 "intercept": -1.45,
                 "nd2_fair_prob": 2.90,
@@ -1967,7 +1969,7 @@ async def get_public_brokerage_portfolio(
         return {**cached_payload, "fromCache": True, "cacheAgeSec": round(now_epoch - cached_ts, 2), "cacheTtlSec": effective_ttl}
 
     account_id = (os.environ.get("PUBLIC_ACCOUNT_ID") or "5OQ77709").strip()
-    bearer = await get_public_com_bearer_token()
+    bearer = await get_public_bearer_token()
     if not bearer:
         return {
             "ok": False,
@@ -6054,13 +6056,13 @@ async def run_portfolio_cleaner(
             block_res = {
                 "ok": False,
                 "status": "BALANCE_UNVERIFIED_BLOCK",
-                "settledCash": 0.0,
+                "settledCash": 0,
                 "idempotencyKey": idempotency_key,
                 "kalshiStatus": kalshi_bal.get("status"),
                 "publicStatus": pub_port.get("status"),
                 "idempotentReplay": False,
                 "dataQualityWarning": True,
-                "rationale": "BALANCE_UNVERIFIED_BLOCK: Both Kalshi V2 and Public.com live portfolio endpoints failed verification; cleaner aborted.",
+                "rationale": "BALANCE_UNVERIFIED_BLOCK: Both Kalshi V2 and Public.com live portfolio endpoints failed verification; cleaner blocked.",
             }
             save_idempotent_result(con, idempotency_key, "run_portfolio_cleaner", {"dry_run": dry_run}, block_res)
             return block_res
@@ -6190,7 +6192,12 @@ async def run_portfolio_cleaner(
                     "exchangeOrderId": close_order_id,
                 })
                 con.execute(
-                    "INSERT INTO cleanup_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    """
+                    INSERT INTO cleanup_audit (
+                        ts, idempotency_key, symbol, asset_type, qty,
+                        current_value, action, est_fee, net_cash_freed, mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     [now_utc, idempotency_key, tkr, "EVENT", abs(pos_qty), val_usd, close_status, 0.0, val_usd if close_order_id else 0.0, close_status],
                 )
 
@@ -6230,7 +6237,12 @@ async def run_portfolio_cleaner(
                     "exchangeOrderId": close_order_id,
                 })
                 con.execute(
-                    "INSERT INTO cleanup_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    """
+                    INSERT INTO cleanup_audit (
+                        ts, idempotency_key, symbol, asset_type, qty,
+                        current_value, action, est_fee, net_cash_freed, mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     [now_utc, idempotency_key, sym, "EQUITY", qty, val_usd, close_status, 0.0, val_usd if close_order_id else 0.0, close_status],
                 )
 
