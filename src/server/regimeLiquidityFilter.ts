@@ -74,6 +74,13 @@ export interface UnifiedChampionConfig {
       passive_twap_micro_tranches: number;
     };
   };
+  portfolio_correlation_rules: {
+    per_position_settled_cash_cap_pct: number;
+    max_aggregate_drawdown_pct_15m: number;
+    max_aggregate_notional_pct_at_reference: number;
+    correlation_stress_model: string;
+    unknown_correlation_default: number;
+  };
 }
 
 const baseChampion = rawChampionConfig as unknown as UnifiedChampionConfig;
@@ -132,6 +139,7 @@ export interface RegimeAndLiquidityInput {
   bboDepthUsd: number;
   obiSamples?: ObiSample[];
   nowMs?: number;
+  is24hTickerSnapshot?: boolean;
 }
 
 export interface RegimeAndLiquidityVerdict {

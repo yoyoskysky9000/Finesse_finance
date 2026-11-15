@@ -122,7 +122,11 @@ import {
   evaluateChampionExitSignal,
   evaluateRegimeAndLiquidity,
 } from './src/server/regimeLiquidityFilter.ts';
-import { executionVault } from './src/server/ExecutionVault.ts';
+import {
+  executionVault,
+  evaluatePortfolioCorrelationAndCap,
+  getLossFraction,
+} from './src/server/ExecutionVault.ts';
 
 dotenv.config();
 
@@ -2957,7 +2961,9 @@ export interface ExecuteTradeRejectionRecord {
     | 'POSITION_CAP_EXCEEDED'
     | 'INSUFFICIENT_LIVE_CASH'
     | 'BALANCE_SYNC_UNAVAILABLE'
-    | 'SETTLED_CASH_CAP_EXCEEDED';
+    | 'SETTLED_CASH_CAP_EXCEEDED'
+    | 'PORTFOLIO_CORRELATION_BLOCKED'
+    | 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY';
   reason: string;
   requestedNotionalUsd: number;
   maxPositionNotionalUsd: number;
@@ -13815,7 +13821,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     ).toFixed(2)
   );
 
-  const qty =
+  let qty =
     typeof explicitQuantity === 'number' && explicitQuantity > 0
       ? explicitQuantity
       : typeof explicitNotionalUsd === 'number' && explicitNotionalUsd > 0
@@ -13826,7 +13832,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
       ? Math.max(5, Math.round(rawAllocationNotionalUsd / feature.price))
       : Math.max(0.05, Number((rawAllocationNotionalUsd / feature.price).toFixed(3)));
 
-  const orderNotionalUsd =
+  let orderNotionalUsd =
     typeof explicitNotionalUsd === 'number' && explicitNotionalUsd > 0
       ? Number(explicitNotionalUsd.toFixed(2))
       : typeof explicitQuantity === 'number' && explicitQuantity > 0
@@ -14074,6 +14080,144 @@ app.post('/api/agents/execute-trade', async (req, res) => {
         code: 'VAULT_IDEMPOTENCY_COOLDOWN_ACTIVE',
         lock: vaultLock,
       });
+    }
+  }
+
+  // 2.6.0-PORTFOLIO-GUARD-CHAMPION: Telemetry completeness + post-lock portfolio correlation guard
+  if (req.body?.enforceTelemetryGate || req.body?.regimeAndLiquidity) {
+    const telemetryCheck = executionVault.verifyMicrostructureTelemetry(
+      req.body?.regimeAndLiquidity || {
+        timeframe: tf,
+        askPriceUsd: effectiveUnitPrice,
+        bestBidUsd: Number((feature as any).bestBidUsd ?? 0),
+        bestAskUsd: Number((feature as any).bestAskUsd ?? 0),
+        fairValueUsd: effectiveUnitPrice,
+        atr14Usd: Number(feature.atr14 ?? 0),
+        minutesRemaining: 8,
+        bboDepthUsd: 0,
+        is24hTickerSnapshot: Boolean(req.body?.is24hTickerSnapshot),
+      }
+    );
+    if (!telemetryCheck.verified) {
+      const reason = `${telemetryCheck.reason}: missing [${telemetryCheck.missingFields.join(', ')}]`;
+      const rejection: ExecuteTradeRejectionRecord = {
+        id: `rej-telemetry-${orderRejectionLog.length + 1}`,
+        timestamp: new Date().toISOString(),
+        agentId: agent.id,
+        symbol: resolvedOrderSymbol,
+        venue: feature.venue,
+        code: 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY',
+        reason,
+        requestedNotionalUsd: orderNotionalUsd,
+        maxPositionNotionalUsd,
+        availableCashUsd: availableLiveCashUsd,
+      };
+      orderRejectionLog.unshift(rejection);
+      riskEvents.unshift({
+        id: rejection.id,
+        timestamp: rejection.timestamp,
+        eventType: 'SPREAD_LIQUIDITY_GUARD',
+        severity: 'CRITICAL',
+        agentId: agent.id,
+        agentName: agent.name,
+        archetype: agent.archetype,
+        symbol: resolvedOrderSymbol,
+        venue: feature.venue,
+        triggerMetric: 'microstructureTelemetry',
+        thresholdValue: 'CHOP + ADX + LHS BBO depth verified',
+        observedValue: telemetryCheck.missingFields.join(', '),
+        actionTaken: reason,
+        cancelledOrderIds: [],
+        acknowledged: false,
+      });
+      return res.status(400).json({
+        error: reason,
+        rejected: true,
+        code: 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY',
+        reason,
+        missingFields: telemetryCheck.missingFields,
+      });
+    }
+  }
+
+  if (req.body?.enforceVaultCooldown || req.body?.enforcePortfolioCorrelationGuard) {
+    const activePositionsForGuard = Array.isArray(req.body?.activePositions)
+      ? req.body.activePositions
+      : executedOrders
+          .filter(
+            (o) =>
+              o.status === 'WORKING_OCO' &&
+              !o.agentName.includes('Public.com Event Contract Leg')
+          )
+          .map((o) => ({
+            symbol: o.symbol,
+            notionalUsd: o.notionalUsd,
+            ask: o.fillPrice > 0 ? o.fillPrice : effectiveUnitPrice,
+            atrDollar: Number(feature.atr14 ?? 0.04),
+          }));
+
+    const portfolioGuard = executionVault.evaluatePostLockPortfolioGuard({
+      settledCash: availableLiveCashUsd,
+      activePositions: activePositionsForGuard,
+      candidate: {
+        symbol: resolvedOrderSymbol,
+        requestedNotionalUsd: orderNotionalUsd,
+        ask: effectiveUnitPrice,
+        atrDollar: Number(req.body?.atrDollar ?? feature.atr14 ?? 0.04),
+        lotSizeUsd: req.body?.lotSizeUsd,
+        exchangeLotSizeContracts: req.body?.exchangeLotSizeContracts,
+      },
+      correlationMatrix: req.body?.correlationMatrix || {},
+      lotSizeUsd: req.body?.lotSizeUsd,
+      unknownCorrelation: req.body?.unknownCorrelation,
+    });
+
+    if (!portfolioGuard.allowed) {
+      const rejection: ExecuteTradeRejectionRecord = {
+        id: `rej-corr-${orderRejectionLog.length + 1}`,
+        timestamp: new Date().toISOString(),
+        agentId: agent.id,
+        symbol: resolvedOrderSymbol,
+        venue: feature.venue,
+        code: 'PORTFOLIO_CORRELATION_BLOCKED',
+        reason: portfolioGuard.reason,
+        requestedNotionalUsd: orderNotionalUsd,
+        maxPositionNotionalUsd,
+        availableCashUsd: availableLiveCashUsd,
+      };
+      orderRejectionLog.unshift(rejection);
+      riskEvents.unshift({
+        id: rejection.id,
+        timestamp: rejection.timestamp,
+        eventType: 'SPREAD_LIQUIDITY_GUARD',
+        severity: 'CRITICAL',
+        agentId: agent.id,
+        agentName: agent.name,
+        archetype: agent.archetype,
+        symbol: resolvedOrderSymbol,
+        venue: feature.venue,
+        triggerMetric: 'portfolioMaxRiskUsd_3.5pct_15m',
+        thresholdValue: `$${portfolioGuard.maxRiskUsd.toFixed(4)}`,
+        observedValue: `$${portfolioGuard.adjustedRiskUsd.toFixed(4)}`,
+        actionTaken: portfolioGuard.reason,
+        cancelledOrderIds: [],
+        acknowledged: false,
+      });
+      return res.status(400).json({
+        error: portfolioGuard.reason,
+        rejected: true,
+        code: 'PORTFOLIO_CORRELATION_BLOCKED',
+        reason: portfolioGuard.reason,
+        portfolioGuard,
+      });
+    }
+
+    if (portfolioGuard.approvedNotionalUsd < orderNotionalUsd) {
+      orderNotionalUsd = portfolioGuard.approvedNotionalUsd;
+      qty =
+        feature.venue === 'PREDICTION_MARKET'
+          ? Math.max(1, Math.floor(orderNotionalUsd / effectiveUnitPrice))
+          : Math.max(0.001, Number((orderNotionalUsd / effectiveUnitPrice).toFixed(3)));
     }
   }
 
@@ -21866,6 +22010,8 @@ export {
   runCloudAutonomousDaemonTick,
   computePortfolioSummary,
   executionVault,
+  evaluatePortfolioCorrelationAndCap,
+  getLossFraction,
   evaluateRegimeAndLiquidity,
   evaluateChampionExitSignal,
   computeLiquidityHealthScore,

@@ -9,6 +9,22 @@ import {
   type RegimeAndLiquidityInput,
   type RegimeAndLiquidityVerdict,
 } from './regimeLiquidityFilter';
+import {
+  evaluatePortfolioCorrelationAndCap,
+  getLossFraction,
+  type ActiveRiskPosition,
+  type CorrelationMatrix,
+  type PortfolioCorrelationGuardInput,
+  type PortfolioCorrelationGuardResult,
+} from '../risk/PortfolioCorrelationGuard';
+
+export { evaluatePortfolioCorrelationAndCap, getLossFraction };
+export type {
+  ActiveRiskPosition,
+  CorrelationMatrix,
+  PortfolioCorrelationGuardInput,
+  PortfolioCorrelationGuardResult,
+};
 
 export type CooldownTimeframe = '5m' | '15m' | '1h';
 
@@ -115,9 +131,21 @@ export interface PreExitSweepResult {
   reason: string;
 }
 
+export interface TelemetryCompletenessResult {
+  verified: boolean;
+  reason: 'VERIFIED' | 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY';
+  missingFields: string[];
+}
+
 export interface VaultAuditEntry {
   ts: string;
-  rule: 'RULE_1_SETTLED_CASH_CAP' | 'RULE_2_IDEMPOTENCY_LOCK' | 'RULE_3_PRE_EXIT_SWEEP_LHS' | 'REGIME_LIQUIDITY_GATE';
+  rule:
+    | 'RULE_1_SETTLED_CASH_CAP'
+    | 'RULE_2_IDEMPOTENCY_LOCK'
+    | 'RULE_3_PRE_EXIT_SWEEP_LHS'
+    | 'REGIME_LIQUIDITY_GATE'
+    | 'TELEMETRY_COMPLETENESS_GATE'
+    | 'PORTFOLIO_CORRELATION_GUARD';
   symbol: string;
   outcome: 'APPROVED' | 'REJECTED' | 'EXECUTED';
   detail: string;
@@ -402,19 +430,147 @@ export class ExecutionVault {
   }
 
   /**
-   * Unified Pre-Trade Vault Gate combining Regime + Liquidity Filter + Rule 1 (Settled Cash Cap) + Rule 2 (Idempotency Lock).
+   * Telemetry Completeness Gate (TASK-08 / 2.6.0-PORTFOLIO-GUARD-CHAMPION):
+   * Blocks basic 24h ticker snapshots or any payload missing live 5m/15m CHOP, ADX,
+   * or order-book LHS depth telemetry before new entries can proceed.
+   */
+  public verifyMicrostructureTelemetry(
+    input: RegimeAndLiquidityInput
+  ): TelemetryCompletenessResult {
+    const missingFields: string[] = [];
+    const regCfg = CHAMPION_CONFIG.active_strategy.regime_filters;
+    const bars = Array.isArray(input.bars) ? input.bars : [];
+    const adxPeriod =
+      input.timeframe === '5m' ? regCfg.adx_period_5m : regCfg.adx_period_15m_1h;
+
+    if (input.is24hTickerSnapshot === true) {
+      missingFields.push('24h_ticker_snapshot_only');
+    }
+
+    const hasLiveChop =
+      (typeof input.metricsOverride?.chop14 === 'number' &&
+        Number.isFinite(input.metricsOverride.chop14)) ||
+      bars.length >= regCfg.chop14_period + 1;
+    if (!hasLiveChop) {
+      missingFields.push('live_5m_15m_CHOP');
+    }
+
+    const hasLiveAdx =
+      (typeof input.metricsOverride?.adx === 'number' &&
+        Number.isFinite(input.metricsOverride.adx)) ||
+      bars.length >= adxPeriod + 2;
+    if (!hasLiveAdx) {
+      missingFields.push('live_5m_15m_ADX');
+    }
+
+    const hasValidBbo =
+      Number.isFinite(input.bestBidUsd) &&
+      input.bestBidUsd > 0 &&
+      Number.isFinite(input.bestAskUsd) &&
+      input.bestAskUsd >= input.bestBidUsd &&
+      Number.isFinite(input.bboDepthUsd) &&
+      input.bboDepthUsd > 0;
+    const hasObiSamples =
+      Array.isArray(input.obiSamples) &&
+      input.obiSamples.some(
+        (s) =>
+          Number.isFinite(s.tsMs) &&
+          Number.isFinite(s.bidDepthUsd) &&
+          Number.isFinite(s.askDepthUsd) &&
+          s.bidDepthUsd + s.askDepthUsd > 0
+      );
+    if (!hasValidBbo || !hasObiSamples) {
+      missingFields.push('orderbook_LHS_depth_telemetry');
+    }
+
+    if (missingFields.length > 0) {
+      return {
+        verified: false,
+        reason: 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY',
+        missingFields,
+      };
+    }
+
+    return {
+      verified: true,
+      reason: 'VERIFIED',
+      missingFields: [],
+    };
+  }
+
+  /**
+   * Executes multi-position correlation stress and 3.5% 15m drawdown ceiling guard
+   * immediately after the atomic idempotency lock and before exchange routing.
+   */
+  public evaluatePostLockPortfolioGuard(
+    input: PortfolioCorrelationGuardInput
+  ): PortfolioCorrelationGuardResult {
+    const result = evaluatePortfolioCorrelationAndCap(input);
+    this.pushAudit({
+      ts: new Date().toISOString(),
+      rule: 'PORTFOLIO_CORRELATION_GUARD',
+      symbol: input.candidate.symbol,
+      outcome: result.allowed ? 'APPROVED' : 'REJECTED',
+      detail: `${result.reason} | approvedNotional=$${result.approvedNotionalUsd.toFixed(2)}, maxRho=${result.maxRho.toFixed(3)}, stress=${result.stressMultiplier.toFixed(3)}, adjustedRisk=$${result.adjustedRiskUsd.toFixed(4)}/max=$${result.maxRiskUsd.toFixed(4)}`,
+    });
+    return result;
+  }
+
+  /**
+   * Unified Pre-Trade Vault Gate combining:
+   *  1. Telemetry Completeness Gate (UNVERIFIED_MICROSTRUCTURE_TELEMETRY block)
+   *  2. Regime + Liquidity Filter + Rule 1 (Settled Cash Cap)
+   *  3. Rule 2 (Atomic Idempotency Hash Lock: symbol + side + strategy_id + time_bucket)
+   *  4. 2.6.0 PortfolioCorrelationGuard (executed AFTER idempotency lock, BEFORE exchange routing)
    */
   public validateEntryOrder(params: {
     regimeAndLiquidity: RegimeAndLiquidityInput;
     sizing: SettledCashSizingInput;
     idempotency: IdempotencyLockInput;
+    portfolioCorrelation?: {
+      activePositions?: ActiveRiskPosition[];
+      correlationMatrix?: CorrelationMatrix;
+      requestedNotionalUsd?: number;
+      lotSizeUsd?: number;
+      exchangeLotSizeContracts?: number;
+      unknownCorrelation?: number;
+    };
   }): {
     approved: boolean;
-    regimeVerdict: RegimeAndLiquidityVerdict;
-    sizingResult: SettledCashSizingResult;
+    reason?: string;
+    telemetryCheck: TelemetryCompletenessResult;
+    regimeVerdict: RegimeAndLiquidityVerdict | null;
+    sizingResult: SettledCashSizingResult | null;
     lockResult: IdempotencyLockCheckResult | null;
+    portfolioCorrelationResult: PortfolioCorrelationGuardResult | null;
+    approvedNotionalUsd: number;
     reasons: string[];
   } {
+    const telemetryCheck = this.verifyMicrostructureTelemetry(params.regimeAndLiquidity);
+    if (!telemetryCheck.verified) {
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'TELEMETRY_COMPLETENESS_GATE',
+        symbol: params.idempotency.symbol,
+        outcome: 'REJECTED',
+        detail: `${telemetryCheck.reason}: missing [${telemetryCheck.missingFields.join(', ')}]`,
+      });
+      return {
+        approved: false,
+        reason: telemetryCheck.reason,
+        telemetryCheck,
+        regimeVerdict: null,
+        sizingResult: null,
+        lockResult: null,
+        portfolioCorrelationResult: null,
+        approvedNotionalUsd: 0,
+        reasons: [
+          telemetryCheck.reason,
+          `Missing microstructure telemetry: ${telemetryCheck.missingFields.join(', ')}`,
+        ],
+      };
+    }
+
     const regimeVerdict = evaluateRegimeAndLiquidity(params.regimeAndLiquidity);
     const sizingResult = this.computeSettledCashTargetSize(params.sizing);
     const reasons: string[] = [
@@ -435,33 +591,137 @@ export class ExecutionVault {
       });
       return {
         approved: false,
+        reason: !sizingResult.approved ? 'SETTLED_CASH_CAP_BLOCKED' : 'REGIME_OR_LIQUIDITY_BLOCKED',
+        telemetryCheck,
         regimeVerdict,
         sizingResult,
         lockResult: null,
+        portfolioCorrelationResult: null,
+        approvedNotionalUsd: 0,
         reasons,
       };
     }
 
+    // Rule 2: Atomic Idempotency Hash Lock (symbol + side + strategy_id + time_bucket)
     const lockResult = this.acquireIdempotencyLock(params.idempotency);
     if (!lockResult.allowed) {
-      reasons.push(
-        `Duplicate order blocked within ${lockResult.cooldownSec}s cooldown bucket (remaining ${lockResult.remainingCooldownSec}s).`
-      );
+      const lockMsg = `Duplicate order blocked within ${lockResult.cooldownSec}s cooldown bucket (remaining ${lockResult.remainingCooldownSec}s).`;
+      reasons.push(lockMsg);
       return {
         approved: false,
+        reason: 'IDEMPOTENCY_LOCK_BLOCKED',
+        telemetryCheck,
         regimeVerdict,
         sizingResult,
         lockResult,
+        portfolioCorrelationResult: null,
+        approvedNotionalUsd: 0,
+        reasons,
+      };
+    }
+
+    // 2.6.0-PORTFOLIO-GUARD-CHAMPION: Call evaluatePortfolioCorrelationAndCap() immediately AFTER
+    // the atomic idempotency hash lock and BEFORE routing to mcp_server.py / exchange API
+    const requestedNotionalUsd =
+      params.portfolioCorrelation?.requestedNotionalUsd ?? sizingResult.estimatedNotionalUsd;
+    const portfolioCorrelationResult = evaluatePortfolioCorrelationAndCap({
+      settledCash: params.sizing.settledCashUsd,
+      activePositions: params.portfolioCorrelation?.activePositions || [],
+      candidate: {
+        symbol: params.idempotency.symbol,
+        requestedNotionalUsd,
+        ask: params.regimeAndLiquidity.askPriceUsd,
+        atrDollar: params.regimeAndLiquidity.atr14Usd,
+        lotSizeUsd: params.portfolioCorrelation?.lotSizeUsd,
+        exchangeLotSizeContracts: params.portfolioCorrelation?.exchangeLotSizeContracts,
+      },
+      correlationMatrix: params.portfolioCorrelation?.correlationMatrix || {},
+      lotSizeUsd: params.portfolioCorrelation?.lotSizeUsd,
+      unknownCorrelation: params.portfolioCorrelation?.unknownCorrelation,
+    });
+    this.pushAudit({
+      ts: new Date().toISOString(),
+      rule: 'PORTFOLIO_CORRELATION_GUARD',
+      symbol: params.idempotency.symbol,
+      outcome: portfolioCorrelationResult.allowed ? 'APPROVED' : 'REJECTED',
+      detail: `${portfolioCorrelationResult.reason} | approvedNotional=$${portfolioCorrelationResult.approvedNotionalUsd.toFixed(2)}, maxRho=${portfolioCorrelationResult.maxRho.toFixed(3)}, stress=${portfolioCorrelationResult.stressMultiplier.toFixed(3)}, adjustedRisk=$${portfolioCorrelationResult.adjustedRiskUsd.toFixed(4)}/max=$${portfolioCorrelationResult.maxRiskUsd.toFixed(4)}`,
+    });
+
+    if (!portfolioCorrelationResult.allowed) {
+      reasons.push(portfolioCorrelationResult.reason);
+      return {
+        approved: false,
+        reason: portfolioCorrelationResult.reason,
+        telemetryCheck,
+        regimeVerdict,
+        sizingResult,
+        lockResult,
+        portfolioCorrelationResult,
+        approvedNotionalUsd: 0,
         reasons,
       };
     }
 
     return {
       approved: true,
+      reason: 'APPROVED',
+      telemetryCheck,
       regimeVerdict,
       sizingResult,
       lockResult,
+      portfolioCorrelationResult,
+      approvedNotionalUsd: portfolioCorrelationResult.approvedNotionalUsd,
       reasons: [],
+    };
+  }
+
+  /**
+   * Executes an entry order through the full locked sequence:
+   * Telemetry Completeness Gate -> Regime/Sizing -> Atomic Idempotency Lock ->
+   * PortfolioCorrelationGuard -> Exchange API routing callback.
+   */
+  public async executeEntryWithPortfolioGuard<TExchangeResult>(params: {
+    regimeAndLiquidity: RegimeAndLiquidityInput;
+    sizing: SettledCashSizingInput;
+    idempotency: IdempotencyLockInput;
+    portfolioCorrelation?: {
+      activePositions?: ActiveRiskPosition[];
+      correlationMatrix?: CorrelationMatrix;
+      requestedNotionalUsd?: number;
+      lotSizeUsd?: number;
+      exchangeLotSizeContracts?: number;
+      unknownCorrelation?: number;
+    };
+    routeOrderToExchange: (approvedNotionalUsd: number) => Promise<TExchangeResult>;
+  }): Promise<{
+    approved: boolean;
+    reason?: string;
+    approvedNotionalUsd: number;
+    exchangeResult?: TExchangeResult;
+    validation: ReturnType<ExecutionVault['validateEntryOrder']>;
+  }> {
+    const validation = this.validateEntryOrder({
+      regimeAndLiquidity: params.regimeAndLiquidity,
+      sizing: params.sizing,
+      idempotency: params.idempotency,
+      portfolioCorrelation: params.portfolioCorrelation,
+    });
+    if (!validation.approved) {
+      return {
+        approved: false,
+        reason: validation.reason,
+        approvedNotionalUsd: 0,
+        validation,
+      };
+    }
+
+    const exchangeResult = await params.routeOrderToExchange(validation.approvedNotionalUsd);
+    return {
+      approved: true,
+      reason: 'EXECUTED',
+      approvedNotionalUsd: validation.approvedNotionalUsd,
+      exchangeResult,
+      validation,
     };
   }
 

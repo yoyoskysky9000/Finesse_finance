@@ -540,7 +540,9 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             sniper_action VARCHAR,
             gate_blocked_reason VARCHAR,
             realized_pnl_bps DOUBLE,
-            realized_outcome INTEGER
+            realized_outcome INTEGER,
+            is_synthetic BOOLEAN DEFAULT FALSE,
+            source VARCHAR DEFAULT 'LIVE_VENUE'
         );
         CREATE TABLE IF NOT EXISTS ml_meta_model_state (
             model_id VARCHAR PRIMARY KEY,
@@ -600,6 +602,8 @@ def get_db_connection() -> _LedgerConnectionWrapper:
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN l2_imbalance DOUBLE",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN pearson_corr_regime VARCHAR",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN realized_pnl_bps DOUBLE",
+        "ALTER TABLE ml_telemetry_ledger ADD COLUMN is_synthetic BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE ml_telemetry_ledger ADD COLUMN source VARCHAR DEFAULT 'LIVE_VENUE'",
         "ALTER TABLE ml_meta_model_state ADD COLUMN recommended_atr_stop_mult DOUBLE",
     ]:
         try:
@@ -1204,24 +1208,7 @@ INDICATOR_STRATEGY_CATALOG: List[Dict[str, Any]] = [
     },
 ]
 
-PORTFOLIO_SNAPSHOT = [
-    {"symbol": "BGIN", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "GLND", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "AIB", "type": "EQUITY", "qty": 0.00835, "val": 0.01, "pnl_pct": -50.11},
-    {"symbol": "XRPN", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "BZAI", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "SHMD", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "KOD", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "EGG", "type": "EQUITY", "qty": 1e-05, "val": 0.00, "pnl_pct": 0.0},
-    {"symbol": "KALSHI.KXALIENS-27-29.Y", "type": "EVENT", "qty": 21, "val": 4.20, "pnl_pct": -13.04},
-    {"symbol": "KALSHI.KXBTCMAX100-26-NOV.Y", "type": "EVENT", "qty": 10, "val": 1.40, "pnl_pct": -33.33},
-    {"symbol": "KALSHI.KXBTCPRICE-130000-27JUL08.Y", "type": "EVENT", "qty": 5, "val": 1.20, "pnl_pct": -22.58},
-    {"symbol": "KALSHI.KXBTCD-26OCT2317-T81499.99.Y", "type": "EVENT", "qty": 20, "val": 11.20, "pnl_pct": 3.70},
-    {"symbol": "QQQ", "type": "EQUITY", "qty": 0.0702, "val": 50.72, "pnl_pct": 1.43},
-    {"symbol": "SPY", "type": "EQUITY", "qty": 0.06493, "val": 49.92, "pnl_pct": -0.17},
-    {"symbol": "ACN", "type": "EQUITY", "qty": 0.219, "val": 50.83, "pnl_pct": -0.34},
-    {"symbol": "AISP", "type": "EQUITY", "qty": 9.41176, "val": 19.53, "pnl_pct": -12.62},
-]
+# Hardcoded PORTFOLIO_SNAPSHOT removed: all positions and balances are queried live from Kalshi V2 and Public.com v2 endpoints.
 
 
 # =====================================================================
@@ -1411,12 +1398,17 @@ def settle_and_log_ml_telemetry_row(
     l2_imbalance: float = 0.22,
     pearson_corr_regime: Optional[str] = None,
     realized_pnl_bps: Optional[float] = None,
+    is_synthetic: bool = False,
+    source: str = "LIVE_VENUE",
 ) -> None:
     """
-    Persists a telemetry feature vector row into `ml_telemetry_ledger` in DuckDB across all tracked tickers
-    (`NVDA`, `SPY`, `QQQ`, `TLT`, `AISP`, `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXDOGE15M`)
-    and automatically settles any previously logged rows whose 15-minute window has elapsed.
+    Persists a live venue telemetry feature vector row into `ml_telemetry_ledger` in DuckDB.
+    Refuses to persist synthetic telemetry rows (`is_synthetic=True` or `source != 'LIVE_VENUE'`) in live mode.
     """
+    norm_source = str(source or "LIVE_VENUE").strip().upper()
+    if bool(is_synthetic) or norm_source != "LIVE_VENUE":
+        return
+
     con = get_db_connection()
     try:
         now_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -1435,12 +1427,13 @@ def settle_and_log_ml_telemetry_row(
             else (round(float(net_edge_dollars) * 1000.0, 1) if realized_outcome == 1 else (-120.0 if realized_outcome == 0 else 0.0))
         )
 
-        # Settle any existing pending rows (realized_outcome IS NULL) older than their minutes_left horizon
+        # Settle any existing pending live rows (realized_outcome IS NULL) older than their minutes_left horizon
         pending_rows = con.execute(
             """
             SELECT rowid, timestamp_utc, strike, minutes_left, nd2_fair_prob, net_edge_dollars
             FROM ml_telemetry_ledger
-            WHERE realized_outcome IS NULL AND coinbase_spot > 0 AND symbol = ?
+            WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'
+              AND realized_outcome IS NULL AND coinbase_spot > 0 AND symbol = ?
             LIMIT 100
             """,
             [clean_sym],
@@ -1470,8 +1463,8 @@ def settle_and_log_ml_telemetry_row(
                 kalshi_spread_bps, nd2_fair_prob, net_edge_dollars, atr_pct,
                 atr_baseline_mult, rsi_14, ma_spread_short_pct, pearson_corr_regime,
                 market_regime, sniper_action, gate_blocked_reason,
-                realized_pnl_bps, realized_outcome
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                realized_pnl_bps, realized_outcome, is_synthetic, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 ts_str,
@@ -1498,6 +1491,8 @@ def settle_and_log_ml_telemetry_row(
                 gate_blocked_reason,
                 pnl_bps,
                 realized_outcome,
+                False,
+                "LIVE_VENUE",
             ],
         )
     finally:
@@ -1506,142 +1501,20 @@ def settle_and_log_ml_telemetry_row(
 
 async def bootstrap_ml_telemetry_from_live_candles(min_rows: int = 50) -> int:
     """
-    If `ml_telemetry_ledger` has fewer than `min_rows` settled rows, backfills historical 15m
-    windows from live Coinbase 5m OHLCV candles across all 10 tracked tickers
-    (`NVDA`, `SPY`, `QQQ`, `TLT`, `AISP`, `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXDOGE15M`)
-    so `train_and_optimize_meta_model` trains on real price trajectories and realized PnL bps.
+    Synthetic telemetry row generator is disabled in live production mode.
+    Returns only the existing count of settled live-venue rows (`WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'`).
     """
+    _ = min_rows
     con = get_db_connection()
     try:
+        # Purge any legacy synthetic or non-LIVE_VENUE rows
+        con.execute(
+            "DELETE FROM ml_telemetry_ledger WHERE COALESCE(is_synthetic, TRUE) = TRUE OR COALESCE(source, '') != 'LIVE_VENUE'"
+        )
         cnt_row = con.execute(
-            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE realized_outcome IS NOT NULL"
+            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL"
         ).fetchone()
-        existing_settled = int(cnt_row[0]) if cnt_row else 0
-        if existing_settled >= min_rows:
-            return existing_settled
-    finally:
-        con.close()
-
-    telemetry = await fetch_live_coinbase_candles_and_telemetry("BTC-USD", granularity=300, limit=120)
-    if not telemetry.get("ok") or len(telemetry.get("bars", [])) < 25:
-        return 0
-
-    bars = telemetry["bars"]
-    closes = [b["close"] for b in bars]
-    ema9_s = _compute_ema_series(closes, 9)
-    ema21_s = _compute_ema_series(closes, 21)
-    rsi_s = _compute_wilder_rsi_series(closes, 14)
-    atr_s = _compute_atr_series(bars, 14)
-    annual_vol = float(telemetry.get("realized_annual_vol") or 0.55)
-    ref_btc_spot = max(1000.0, float(closes[-1]))
-
-    con = get_db_connection()
-    inserted = 0
-    try:
-        for i in range(15, len(bars) - 3):
-            spec = TRACKED_UNIVERSE_SPECS[i % len(TRACKED_UNIVERSE_SPECS)]
-            sym_i = spec["symbol"]
-            venue_i = spec["venue"]
-            scale_ratio = float(spec["base_spot"]) / ref_btc_spot if sym_i != "KXBTC15M" else 1.0
-            spot_i = float(closes[i]) * scale_ratio
-            settled_spot = float(closes[i + 3]) * scale_ratio
-            step = float(spec["strike_step"])
-            strike_i = round(math.floor(spot_i / step) * step + (step * 0.5 if i % 2 == 0 else 0.0), 4)
-            minutes_left_i = float(6.0 + (i % 8))
-            t_years = minutes_left_i / (365.25 * 24 * 60)
-            sigma_t = max(1e-5, annual_vol * math.sqrt(t_years))
-            d2 = (math.log(max(1e-6, spot_i) / max(1e-6, strike_i)) - 0.5 * (annual_vol ** 2) * t_years) / sigma_t
-            nd2_prob = round(0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0))), 4)
-
-            atr_val = max(spot_i * 0.001, atr_s[i] * scale_ratio)
-            base_slice = [a * scale_ratio for a in atr_s[max(0, i - 15) : i + 1]]
-            base_atr = sum(base_slice) / max(1, len(base_slice))
-            atr_pct_i = round((atr_val / max(1e-6, spot_i)) * 100.0, 3)
-            atr_mult_i = round(max(0.4, min(3.5, atr_val / max(1e-6, base_atr))), 2)
-            rsi_i = round(rsi_s[i], 2)
-            ma_spread_i = round(((ema9_s[i] - ema21_s[i]) / max(1e-6, ema21_s[i])) * 100.0, 3)
-
-            if atr_mult_i >= 2.2:
-                regime_i = "HIGH_VOLATILITY_RANGE"
-            elif ma_spread_i > 0.15 and 50.0 <= rsi_i <= 74.0:
-                regime_i = "TRENDING_BULL"
-            elif ma_spread_i < -0.15 and 26.0 <= rsi_i < 50.0:
-                regime_i = "TRENDING_BEAR"
-            else:
-                regime_i = "LOW_VOLATILITY_COMPRESSION"
-
-            spread_dollars = 0.02 if atr_mult_i < 1.35 else 0.04
-            yes_ask_i = round(max(0.08, min(0.92, nd2_prob - 0.045 + (0.015 if i % 3 == 0 else -0.01))), 2)
-            no_ask_i = round(max(0.08, min(0.92, (1.0 - yes_ask_i) + spread_dollars)), 2)
-            yes_edge_i = nd2_prob - (yes_ask_i + 0.02)
-            no_edge_i = (1.0 - nd2_prob) - (no_ask_i + 0.02)
-            best_side_yes = yes_edge_i >= no_edge_i
-            best_ask_i = yes_ask_i if best_side_yes else no_ask_i
-            best_edge_i = max(yes_edge_i, no_edge_i)
-            l2_imb_i = round(0.18 + (0.14 if best_side_yes else -0.12) + (ma_spread_i * 0.2), 3)
-            corr_regime_i = f"{regime_i}_PEARSON_{0.18 + (i % 5) * 0.07:.2f}"
-
-            if best_ask_i < LEAD_LAG_ASK_MIN or best_ask_i > LEAD_LAG_ASK_MAX:
-                sniper_act = "HOLD"
-                blocked_reason = f"TWEAKED_ASK_GATE_OUTSIDE_{LEAD_LAG_ASK_MIN:.2f}_{LEAD_LAG_ASK_MAX:.2f} (ask=${best_ask_i:.2f})"
-            elif minutes_left_i < LEAD_LAG_WIN_MIN or minutes_left_i > LEAD_LAG_WIN_MAX:
-                sniper_act = "HOLD"
-                blocked_reason = f"TIME_WINDOW_GUARD_OUTSIDE_{LEAD_LAG_WIN_MIN:.1f}M_{LEAD_LAG_WIN_MAX:.1f}M (T={minutes_left_i:.1f}m)"
-            elif best_edge_i < LEAD_LAG_MIN_EDGE:
-                sniper_act = "HOLD"
-                blocked_reason = f"NET_EDGE_BELOW_{LEAD_LAG_MIN_EDGE:.3f}_MIN (edge=${best_edge_i:+.3f})"
-            else:
-                sniper_act = "EXECUTE"
-                blocked_reason = "PAPER_SHADOW_APPROVED_V3"
-
-            realized_yes_win = 1 if settled_spot >= strike_i else 0
-            favored_win = realized_yes_win if best_side_yes else (1 - realized_yes_win)
-            realized_pnl_bps_i = round(
-                (best_edge_i * 1350.0 if favored_win == 1 else -88.0 * atr_mult_i), 1
-            )
-            spot_to_strike_bps = round(((spot_i - strike_i) / max(1e-6, strike_i)) * 10000.0, 2)
-            kalshi_spread_bps = round(spread_dollars * 10000.0, 1)
-
-            con.execute(
-                """
-                INSERT INTO ml_telemetry_ledger (
-                    timestamp_utc, symbol, venue, spot_price, coinbase_spot, strike,
-                    spot_to_strike_bps, minutes_left, yes_ask, no_ask, l2_imbalance,
-                    kalshi_spread_bps, nd2_fair_prob, net_edge_dollars, atr_pct,
-                    atr_baseline_mult, rsi_14, ma_spread_short_pct, pearson_corr_regime,
-                    market_regime, sniper_action, gate_blocked_reason,
-                    realized_pnl_bps, realized_outcome
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    bars[i]["timestamp"],
-                    sym_i,
-                    venue_i,
-                    round(spot_i, 4),
-                    round(spot_i, 4),
-                    strike_i,
-                    spot_to_strike_bps,
-                    minutes_left_i,
-                    yes_ask_i,
-                    no_ask_i,
-                    l2_imb_i,
-                    kalshi_spread_bps,
-                    nd2_prob,
-                    round(best_edge_i, 4),
-                    atr_pct_i,
-                    atr_mult_i,
-                    rsi_i,
-                    ma_spread_i,
-                    corr_regime_i,
-                    regime_i,
-                    sniper_act,
-                    blocked_reason,
-                    realized_pnl_bps_i,
-                    realized_yes_win,
-                ],
-            )
-            inserted += 1
-        return existing_settled + inserted
+        return int(cnt_row[0]) if cnt_row else 0
     finally:
         con.close()
 
@@ -1944,28 +1817,68 @@ async def get_kalshi_live_balance(
     Asynchronously pulls authenticated Kalshi v2 cash balance, open contract positions,
     recent CLOB fills, WebSocket `seq`/`clock` telemetry, and `/account/limits` Read/Write
     token bucket state from `https://external-api.kalshi.com/trade-api/v2`.
+    Zero hardcoded fallbacks: if live fetch fails or times out, returns settledCash=0 and status="BALANCE_UNVERIFIED_BLOCK".
     """
     await KALSHI_RATE_GOVERNOR.sync_account_limits_if_needed()
     bal_res = await kalshi_signed_rest_request("GET", "/trade-api/v2/portfolio/balance", is_write=False)
-    cash_usd = 459.34
-    port_val_usd = 111.75
-    if bal_res.get("ok") and isinstance(bal_res.get("data"), dict):
-        bdata = bal_res["data"]
-        if bdata.get("balance_dollars") is not None:
-            cash_usd = round(float(bdata["balance_dollars"]), 4)
-        elif isinstance(bdata.get("balance"), (int, float)):
-            cash_usd = round(float(bdata["balance"]) / 100.0, 4)
-        if bdata.get("portfolio_value_dollars") is not None:
-            port_val_usd = round(float(bdata["portfolio_value_dollars"]), 2)
-        elif isinstance(bdata.get("portfolio_value"), (int, float)):
-            port_val_usd = round(float(bdata["portfolio_value"]) / 100.0, 2)
+    if not bal_res.get("ok") or not isinstance(bal_res.get("data"), dict):
+        return {
+            "ok": False,
+            "venue": "KALSHI_TRADE_API_V2_OCT2026",
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "hosts": KALSHI_OCT2026_HOSTS,
+            "authKeyType": detect_kalshi_private_key_type()[0],
+            "transport": "http",
+            "statelessHttp": True,
+            "settledCash": 0.0,
+            "cashBalanceUsd": 0.0,
+            "portfolioValueUsd": 0.0,
+            "totalKalshiEquityUsd": 0.0,
+            "rateGovernor": KALSHI_RATE_GOVERNOR.snapshot(),
+            "wsState": KALSHI_WS_ENGINE.snapshot(),
+            "includeFills": includeFills,
+            "forceRefresh": forceRefresh,
+            "dataQualityWarning": True,
+            "error": str(bal_res.get("error") or "Live Kalshi balance fetch failed or timed out."),
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Kalshi balance endpoint failed or credentials missing; settledCash forced to 0.00.",
+        }
+
+    bdata = bal_res["data"]
+    cash_usd: Optional[float] = None
+    port_val_usd: float = 0.0
+    if bdata.get("balance_dollars") is not None:
+        cash_usd = round(float(bdata["balance_dollars"]), 4)
+    elif isinstance(bdata.get("balance"), (int, float)):
+        cash_usd = round(float(bdata["balance"]) / 100.0, 4)
+    if bdata.get("portfolio_value_dollars") is not None:
+        port_val_usd = round(float(bdata["portfolio_value_dollars"]), 2)
+    elif isinstance(bdata.get("portfolio_value"), (int, float)):
+        port_val_usd = round(float(bdata["portfolio_value"]) / 100.0, 2)
+
+    if cash_usd is None or not math.isfinite(cash_usd):
+        return {
+            "ok": False,
+            "venue": "KALSHI_TRADE_API_V2_OCT2026",
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "settledCash": 0.0,
+            "cashBalanceUsd": 0.0,
+            "portfolioValueUsd": 0.0,
+            "totalKalshiEquityUsd": 0.0,
+            "dataQualityWarning": True,
+            "error": "Live Kalshi balance payload missing balance_dollars/balance field.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Kalshi balance payload missing settled cash field; settledCash forced to 0.00.",
+        }
+
     total_eq = round(cash_usd + port_val_usd, 2)
     return {
+        "ok": True,
         "venue": "KALSHI_TRADE_API_V2_OCT2026",
+        "status": "LIVE_VERIFIED",
         "hosts": KALSHI_OCT2026_HOSTS,
         "authKeyType": detect_kalshi_private_key_type()[0],
         "transport": "http",
         "statelessHttp": True,
+        "settledCash": cash_usd,
         "cashBalanceUsd": cash_usd,
         "portfolioValueUsd": port_val_usd,
         "totalKalshiEquityUsd": total_eq,
@@ -1974,7 +1887,7 @@ async def get_kalshi_live_balance(
         "includeFills": includeFills,
         "forceRefresh": forceRefresh,
         "dataQualityWarning": False,
-        "rationale": f"Kalshi Oct 2026 v2 equity ${total_eq:.2f} (${cash_usd:.2f} cash, ${port_val_usd:.2f} contracts) verified on external-api.kalshi.com.",
+        "rationale": f"Kalshi Oct 2026 v2 equity ${total_eq:.2f} (${cash_usd:.2f} settled cash, ${port_val_usd:.2f} contracts) verified on external-api.kalshi.com.",
     }
 
 
@@ -1982,19 +1895,124 @@ async def get_kalshi_live_balance(
 async def get_public_brokerage_portfolio(
     includePositions: bool = True,
 ) -> Dict[str, Any]:
-    """Asynchronously pulls live Public.com brokerage account (5OQ77709) equity, cash buying power, and holdings."""
-    await asyncio.sleep(0.005)
+    """
+    Asynchronously pulls live Public.com brokerage account equity, settled cash buying power, and holdings
+    directly from the authenticated Public.com API endpoint.
+    Zero hardcoded constants: if live fetch fails or times out, returns settledCash=0 and status="BALANCE_UNVERIFIED_BLOCK".
+    """
+    account_id = (os.environ.get("PUBLIC_ACCOUNT_ID") or "5OQ77709").strip()
+    bearer = await get_public_com_bearer_token()
+    if not bearer:
+        return {
+            "ok": False,
+            "venue": "PUBLIC_COM_API_V2",
+            "accountId": account_id,
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "transport": "http",
+            "settledCash": 0.0,
+            "totalEquityUsd": 0.0,
+            "cashBalanceUsd": 0.0,
+            "buyingPowerUsd": 0.0,
+            "positionsCount": 0,
+            "positions": [],
+            "dataQualityWarning": True,
+            "error": "PUBLIC_SECRET_KEY / bearer token unavailable for live Public.com portfolio verification.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Public.com bearer token missing; settledCash forced to 0.00.",
+        }
+
+    port_url = f"https://api.public.com/userapigateway/trading/{account_id}/portfolio/v2"
+    port_res = await async_http_json_request(
+        "GET",
+        port_url,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Accept": "application/json",
+        },
+        timeout_sec=5.0,
+    )
+    if not port_res.get("ok") or not isinstance(port_res.get("data"), dict):
+        return {
+            "ok": False,
+            "venue": "PUBLIC_COM_API_V2",
+            "accountId": account_id,
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "transport": "http",
+            "settledCash": 0.0,
+            "totalEquityUsd": 0.0,
+            "cashBalanceUsd": 0.0,
+            "buyingPowerUsd": 0.0,
+            "positionsCount": 0,
+            "positions": [],
+            "dataQualityWarning": True,
+            "error": str(port_res.get("error") or f"HTTP {port_res.get('status_code')} from Public.com portfolio v2"),
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Public.com portfolio request failed or timed out; settledCash forced to 0.00.",
+        }
+
+    pdata = port_res["data"]
+    bp_obj = pdata.get("buyingPower") if isinstance(pdata.get("buyingPower"), dict) else {}
+    raw_cash = (
+        bp_obj.get("cashOnlyBuyingPower")
+        if bp_obj.get("cashOnlyBuyingPower") is not None
+        else pdata.get("cashBalance")
+    )
+    if raw_cash is None:
+        return {
+            "ok": False,
+            "venue": "PUBLIC_COM_API_V2",
+            "accountId": account_id,
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "transport": "http",
+            "settledCash": 0.0,
+            "totalEquityUsd": 0.0,
+            "cashBalanceUsd": 0.0,
+            "buyingPowerUsd": 0.0,
+            "positionsCount": 0,
+            "positions": [],
+            "dataQualityWarning": True,
+            "error": "Public.com portfolio response missing cashOnlyBuyingPower / cashBalance.",
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Public.com settled cash missing in response; settledCash forced to 0.00.",
+        }
+
+    settled_cash = round(float(raw_cash), 2)
+    buying_power = round(float(bp_obj.get("buyingPower") or settled_cash), 2)
+    raw_positions = pdata.get("positions") if isinstance(pdata.get("positions"), list) else []
+    parsed_positions: List[Dict[str, Any]] = []
+    pos_equity_sum = 0.0
+    for p in raw_positions:
+        if not isinstance(p, dict):
+            continue
+        inst = p.get("instrument") if isinstance(p.get("instrument"), dict) else {}
+        sym = str(inst.get("symbol") or p.get("symbol") or "").strip().upper()
+        qty = float(p.get("quantity") or 0.0)
+        mkt_val = float(p.get("marketValue") or p.get("currentValue") or 0.0)
+        avg_px = float(p.get("averagePrice") or (mkt_val / qty if qty > 0 else 0.0))
+        cur_px = float(p.get("lastPrice") or (mkt_val / qty if qty > 0 else avg_px))
+        pos_equity_sum += mkt_val
+        parsed_positions.append({
+            "symbol": sym,
+            "name": str(inst.get("name") or sym),
+            "qty": round(qty, 6),
+            "avgPrice": round(avg_px, 4),
+            "currentPrice": round(cur_px, 4),
+            "equityUsd": round(mkt_val, 2),
+            "category": str(inst.get("type") or "EQUITY"),
+        })
+
+    total_eq = round(float(pdata.get("totalEquity") or (settled_cash + pos_equity_sum)), 2)
     return {
+        "ok": True,
         "venue": "PUBLIC_COM_API_V2",
-        "accountId": "5OQ77709",
+        "accountId": account_id,
+        "status": "LIVE_VERIFIED",
         "transport": "http",
-        "totalEquityUsd": 625.35,
-        "cashBalanceUsd": 435.08,
-        "buyingPowerUsd": 457.52,
-        "positionsCount": len(PORTFOLIO_SNAPSHOT),
-        "positions": PORTFOLIO_SNAPSHOT if includePositions else [],
+        "settledCash": settled_cash,
+        "totalEquityUsd": total_eq,
+        "cashBalanceUsd": settled_cash,
+        "buyingPowerUsd": buying_power,
+        "positionsCount": len(parsed_positions),
+        "positions": parsed_positions if includePositions else [],
         "dataQualityWarning": False,
-        "rationale": "Public.com equity $625.35 with $435.08 cash buying power across 16 tracked positions.",
+        "rationale": f"Public.com live equity ${total_eq:.2f} with ${settled_cash:.2f} settled cash across {len(parsed_positions)} live positions.",
     }
 
 
@@ -3529,14 +3547,17 @@ async def submit_kalshi_v2_events_order(
         )
 
     data = res.get("data") if isinstance(res.get("data"), dict) else {}
-    exch_order_id = str(data.get("order_id") or (data.get("order") or {}).get("order_id") or client_order_id)
+    order_obj = data.get("order") if isinstance(data.get("order"), dict) else {}
+    exch_order_id = str(data.get("order_id") or order_obj.get("order_id") or "").strip()
+    fill_status = str(order_obj.get("status") or data.get("status") or "").strip().upper()
+    live_ok = bool(res.get("ok") and exch_order_id)
 
     if con is not None:
         try:
             con.execute(
                 "UPDATE kalshi_client_order_ledger SET status = ?, exchange_order_id = ? WHERE client_order_id = ?",
                 [
-                    "SUBMITTED_V2_EVENTS_MAKER" if res.get("ok") else f"HTTP_{res.get('status_code')}",
+                    f"LIVE_{fill_status or 'SUBMITTED'}" if live_ok else f"FAILED_HTTP_{res.get('status_code')}",
                     exch_order_id,
                     client_order_id,
                 ],
@@ -3544,8 +3565,22 @@ async def submit_kalshi_v2_events_order(
         except Exception:
             pass
 
+    if not live_ok:
+        return {
+            "ok": False,
+            "status": "VENUE_EXECUTION_FAILED",
+            "status_code": res.get("status_code"),
+            "endpoint": f"{KALSHI_REST_BASE_URL}/portfolio/events/orders",
+            "ticker": active_ticker,
+            "client_order_id": client_order_id,
+            "exchange_order_id": None,
+            "error": str(res.get("error") or "Venue API failed or did not return an exchange-assigned order_id."),
+            "rawResponse": data,
+        }
+
     return {
-        "ok": bool(res.get("ok")),
+        "ok": True,
+        "status": fill_status or "RESTING",
         "status_code": res.get("status_code"),
         "endpoint": f"{KALSHI_REST_BASE_URL}/portfolio/events/orders",
         "ticker": active_ticker,
@@ -3735,7 +3770,7 @@ class KalshiSignalSchema(BaseModel):
         m_taker: Optional[float] = None,
         m_maker: Optional[float] = None,
         theta_min: Optional[float] = None,
-        bankroll_dollars: float = 459.34,
+        bankroll_dollars: float = 0.0,
         timestamp: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         **extra_kwargs: Any,
@@ -3825,7 +3860,7 @@ class KalshiSignalSchema(BaseModel):
         m_taker: Optional[float] = None,
         m_maker: Optional[float] = None,
         theta_min: Optional[float] = None,
-        bankroll_dollars: float = 459.34,
+        bankroll_dollars: float = 0.0,
         timestamp: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> "KalshiSignalSchema":
@@ -3858,7 +3893,7 @@ class KalshiSignalSchema(BaseModel):
         self.m_taker = float(m_taker if m_taker is not None else series_mults["m_taker"])
         self.m_maker = float(m_maker if m_maker is not None else series_mults["m_maker"])
         self.theta_min = float(theta_min if theta_min is not None else (0.015 if self.is_maker else 0.040))
-        self.bankroll_dollars = max(10.0, float(bankroll_dollars))
+        self.bankroll_dollars = max(0.0, float(bankroll_dollars))
         self.idempotency_key = idempotency_key or f"sig-{self.market_ticker}-{int(time.time() * 1000)}"
         return self
 
@@ -3881,7 +3916,7 @@ class KalshiSignalSchema(BaseModel):
             "m_taker": getattr(self, "m_taker", 1.0),
             "m_maker": getattr(self, "m_maker", 0.0),
             "theta_min": getattr(self, "theta_min", 0.015),
-            "bankroll_dollars": getattr(self, "bankroll_dollars", 459.34),
+            "bankroll_dollars": getattr(self, "bankroll_dollars", 0.0),
             "idempotency_key": getattr(self, "idempotency_key", f"sig-{self.market_ticker}"),
         }
 
@@ -4070,80 +4105,11 @@ def recompute_series_calibration(series_ticker: str, conn: Optional[sqlite3.Conn
 
 def ensure_brier_sqlite_seeded() -> None:
     """
-    Seeds initial historical settled predictions across active Kalshi 15m series (`KXBTC15M`,
-    `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXDOGE15M`) if `predictions` is empty so `series_calibration`
-    immediately provides real Brier Skill Score (`BSS`) and Reliability/Resolution/Uncertainty metrics.
+    Ensures the SQLite `predictions` and `series_calibration` tables exist without inserting
+    synthetic seed predictions in live mode.
     """
     conn = get_brier_sqlite_connection()
     try:
-        cnt = conn.execute("SELECT COUNT(*) AS c FROM predictions").fetchone()["c"]
-        if cnt and int(cnt) > 0:
-            return
-        now = datetime.datetime.now(datetime.timezone.utc)
-        seed_series = [
-            # (series, calibrated_f, kalshi_mid_r, outcome, conf_band, thesis)
-            ("KXBTC15M", 0.72, 0.58, 1, 0.08, "BTC 15m Micro-VWAP + L2 bid imbalance > +0.24 above strike"),
-            ("KXBTC15M", 0.68, 0.55, 1, 0.09, "BTC 15m N(d2)/ML ensemble 68% vs 55c Kalshi mid"),
-            ("KXBTC15M", 0.26, 0.41, 0, 0.08, "BTC 15m mean-reversion rejection below 9/21 EMA"),
-            ("KXBTC15M", 0.74, 0.60, 1, 0.07, "BTC 15m orderbook_delta bid accumulation +640 contracts"),
-            ("KXBTC15M", 0.31, 0.44, 0, 0.09, "BTC 15m negative MACD histogram impulse below strike"),
-            ("KXBTC15M", 0.66, 0.54, 1, 0.10, "BTC 15m gamma pin convergence T=7.5m"),
-            ("KXBTC15M", 0.71, 0.59, 1, 0.08, "BTC 15m Coinbase spot lead +18 bps over strike"),
-            ("KXBTC15M", 0.29, 0.42, 0, 0.09, "BTC 15m ask depth wall 2.1x bid depth"),
-            ("KXBTC15M", 0.64, 0.56, 0, 0.11, "BTC 15m late volatility whip invalidation"),
-            ("KXBTC15M", 0.75, 0.61, 1, 0.07, "BTC 15m RVOL 1.45x breakout above VWAP"),
-            ("KXBTC15M", 0.24, 0.39, 0, 0.08, "BTC 15m RSI exhaustion below strike"),
-            ("KXBTC15M", 0.70, 0.57, 1, 0.08, "BTC 15m passive maker bid edge +13.0c over mid"),
-            ("KXETH15M", 0.70, 0.56, 1, 0.09, "ETH 15m RSI(14) momentum + volume ratio > 1.25x"),
-            ("KXETH15M", 0.67, 0.54, 1, 0.08, "ETH 15m positive L2 depth imbalance +0.29"),
-            ("KXETH15M", 0.28, 0.42, 0, 0.09, "ETH 15m VWAP rejection below rolling strike"),
-            ("KXETH15M", 0.73, 0.59, 1, 0.08, "ETH 15m 9/21 EMA bullish spread +0.34%"),
-            ("KXETH15M", 0.32, 0.45, 0, 0.10, "ETH 15m upper Bollinger exhaustion snapback"),
-            ("KXETH15M", 0.69, 0.57, 1, 0.08, "ETH 15m orderbook_delta net YES bid flow"),
-            ("KXETH15M", 0.65, 0.55, 0, 0.11, "ETH 15m late candle mean reversion"),
-            ("KXETH15M", 0.74, 0.60, 1, 0.07, "ETH 15m cross-venue Coinbase spot lead"),
-            ("KXETH15M", 0.27, 0.40, 0, 0.08, "ETH 15m seller absorption at strike"),
-            ("KXETH15M", 0.71, 0.58, 1, 0.08, "ETH 15m gamma convergence T=6.2m"),
-        ]
-        for idx, (ser, f_prob, r_mid, out_val, c_band, thesis) in enumerate(seed_series):
-            ts_iso = (now - datetime.timedelta(minutes=(len(seed_series) - idx) * 15)).isoformat()
-            pred_id = f"seed-brier-{ser.lower()}-{idx + 1:03d}"
-            exec_px = round(r_mid - 0.01 if f_prob >= r_mid else r_mid + 0.01, 4)
-            edge_val = round(abs(f_prob - exec_px), 4)
-            p_hat = f_prob if f_prob >= exec_px else (1.0 - f_prob)
-            p_eff = exec_px if f_prob >= exec_px else (1.0 - exec_px)
-            f_star = round(max(0.0, 0.5 * ((p_hat - p_eff) / max(1e-6, 1.0 - p_eff))), 4)
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO predictions (
-                    prediction_id, market_ticker, series_ticker, timestamp,
-                    calibrated_yes_prob, kalshi_mid_prob, confidence_band,
-                    falsifiable_thesis, settled_outcome, execution_mode,
-                    execution_price, fee_per_contract, net_edge, kelly_f_star,
-                    contracts_sized, gate_status_json, settled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    pred_id,
-                    f"{ser}-26OCT28-SEED{idx + 1:02d}",
-                    ser,
-                    ts_iso,
-                    f_prob,
-                    r_mid,
-                    c_band,
-                    thesis,
-                    out_val,
-                    "LIVE_MAKER_EXECUTED",
-                    exec_px,
-                    0.0,
-                    edge_val,
-                    f_star,
-                    8,
-                    json.dumps({"allGatesPassed": True, "seeded": True}),
-                    ts_iso,
-                ),
-            )
-        conn.commit()
         for s_name in ("KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M"):
             recompute_series_calibration(s_name, conn)
     finally:
@@ -4396,19 +4362,9 @@ async def evaluate_5_gate_risk_engine_and_execute(
             execution_mode = "BLOCKED_GATE_4_HALF_KELLY_ZERO_SIZE"
             v2_order_result = None
         elif route_to_paper_only:
-            execution_mode = "PAPER_ONLY_CALIBRATION_GATE"
-            v2_order_result = {
-                "ok": True,
-                "paperOnly": True,
-                "status": "PAPER_LOGGED_BY_GATE_3",
-                "ticker": signal.market_ticker,
-                "side": order_side,
-                "contracts": contracts_sized,
-                "price_dollars": f"{signal.execution_price:.4f}",
-                "reason": gate3_detail["demotionReason"],
-            }
+            execution_mode = "BLOCKED_GATE_3_CALIBRATION_UNCERTAINTY"
+            v2_order_result = None
         else:
-            execution_mode = "LIVE_MAKER_EXECUTED"
             v2_order_result = await place_v2_maker_order(
                 ticker=signal.market_ticker,
                 idempotency_key=signal.idempotency_key,
@@ -4417,6 +4373,11 @@ async def evaluate_5_gate_risk_engine_and_execute(
                 desired_price_dollars=signal.execution_price,
                 cancel_order_on_pause=True,
                 con=con,
+            )
+            execution_mode = (
+                "LIVE_MAKER_EXECUTED"
+                if bool(v2_order_result and v2_order_result.get("ok"))
+                else "VENUE_EXECUTION_FAILED"
             )
 
         sqlite_conn.execute(
@@ -4452,7 +4413,7 @@ async def evaluate_5_gate_risk_engine_and_execute(
         sqlite_conn.commit()
 
         return {
-            "ok": execution_mode in ("LIVE_MAKER_EXECUTED", "PAPER_ONLY_CALIBRATION_GATE"),
+            "ok": execution_mode == "LIVE_MAKER_EXECUTED",
             "prediction_id": prediction_id,
             "execution_mode": execution_mode,
             "signal": signal.to_dict(),
@@ -4589,21 +4550,15 @@ async def submit_public_com_order_with_retry(
     max_retries: int = 3,
     base_delay_sec: float = 0.35,
     max_backoff_sec: float = 4.0,
-    simulated_transient_failures: int = 0,
     con: Optional[_LedgerConnectionWrapper] = None,
 ) -> Dict[str, Any]:
     """
-    Executes a Public.com order (`POST /userapigateway/trading/{accountId}/order`) with:
+    Executes a live Public.com order (`POST /userapigateway/trading/{accountId}/order`) with:
       1. Mandatory preflight quote hydration (`POST /userapigateway/trading/{accountId}/preflight/single-leg`).
       2. Deterministic UUIDv5 `orderId` derived from `idempotency_key` so retries never double-execute.
       3. Automatic `GTD` `expirationTime` (+2 hours ISO-8601) injection for `EVENTCONTRACT` orders.
-      4. Exponential backoff with bounded jitter and `Retry-After` header support for specific error codes:
-         - HTTP 429 (`TOO_MANY_REQUESTS` rate limiting)
-         - HTTP 408 / 425 / 500 / 502 / 503 / 504 (gateway / upstream timeouts & transient 5xx faults)
-         - HTTP 401 (expired Bearer token -> triggers automatic token refresh before retry)
-         - Gateway code `28000` (`No event contract quote found` -> triggers preflight re-hydration before retry)
-         - Gateway code `40` (`For GTD expirationTime is required` -> auto-injects ISO-8601 expirationTime)
-         - Transport / socket timeouts (`TimeoutError`, `ConnectionResetError`, `URLError`, `httpx.RequestError`)
+      4. Exponential backoff with bounded jitter and `Retry-After` header support.
+      5. 100% Live Execution Only: Never falls back to LOCAL_OCO_STAGED or fabricated order IDs when bearer token or venue API fails.
     """
     resolved_account = (account_id or PUBLIC_DEFAULT_ACCOUNT_ID or "5OQ77709").strip()
     clean_symbol = symbol.strip().upper()
@@ -4639,75 +4594,43 @@ async def submit_public_com_order_with_retry(
     preflight_url = f"{PUBLIC_API_BASE_URL}/userapigateway/trading/{resolved_account}/preflight/single-leg"
     order_url = f"{PUBLIC_API_BASE_URL}/userapigateway/trading/{resolved_account}/order"
 
+    if not bearer:
+        err_msg = "Public.com bearer token unavailable; live order execution aborted (mock/staged fills disabled)."
+        attempt_history.append({
+            "attempt": 1,
+            "httpStatus": 401,
+            "errorCode": "MISSING_BEARER_TOKEN",
+            "classification": "VENUE_AUTH_MISSING",
+            "errorMessage": err_msg,
+            "backoffDelayMs": 0.0,
+            "retrying": False,
+        })
+        return {
+            "ok": False,
+            "liveSubmitted": False,
+            "orderId": None,
+            "accountId": resolved_account,
+            "symbol": clean_symbol,
+            "instrumentType": instrument_type,
+            "orderSide": order_side,
+            "orderType": order_type,
+            "quantity": str(quantity),
+            "limitPrice": limit_price,
+            "attemptsUsed": 1,
+            "maxRetries": max_retries,
+            "totalBackoffMs": 0.0,
+            "recoveredAfterRetry": False,
+            "preflightHydrated": False,
+            "lastHttpStatus": 401,
+            "lastErrorCode": "MISSING_BEARER_TOKEN",
+            "lastErrorMessage": err_msg,
+            "failureClassification": "VENUE_AUTH_MISSING",
+            "attemptHistory": attempt_history,
+            "status": "VENUE_AUTH_MISSING_FAILED",
+        }
+
     for attempt in range(max_retries + 1):
         attempt_num = attempt + 1
-
-        # Optional deterministic simulation hook for verifying exponential backoff on transient 429/503/28000 errors
-        if simulated_transient_failures > 0 and attempt < simulated_transient_failures:
-            sim_status = 429 if attempt == 0 else 503
-            sim_code = 42900 if attempt == 0 else 28000
-            sim_reason = (
-                "Simulated HTTP 429 Rate-Limit Exceeded (Retry-After backoff triggered)"
-                if attempt == 0
-                else "Simulated HTTP 503 / Code 28000 Temporary Connection & Quote Hydration Fault"
-            )
-            backoff_ms = compute_exponential_backoff_ms(
-                attempt,
-                base_delay_sec=base_delay_sec,
-                max_backoff_sec=max_backoff_sec,
-                seed_key=idempotency_key,
-            )
-            total_backoff_ms = round(total_backoff_ms + backoff_ms, 1)
-            attempt_history.append({
-                "attempt": attempt_num,
-                "httpStatus": sim_status,
-                "errorCode": sim_code,
-                "classification": "HTTP_429_RATE_LIMITED" if sim_status == 429 else "HTTP_503_TRANSIENT_GATEWAY_ERROR",
-                "errorMessage": sim_reason,
-                "backoffDelayMs": backoff_ms,
-                "retrying": True,
-            })
-            if con is not None:
-                _log_public_order_retry_attempt(
-                    con, idempotency_key, deterministic_order_uuid, resolved_account,
-                    clean_symbol, instrument_type, order_side, order_type, str(quantity),
-                    limit_price, attempt_num, max_retries, sim_status, sim_code,
-                    sim_reason, backoff_ms, "RETRY_SCHEDULED",
-                )
-            await asyncio.sleep(backoff_ms / 1000.0)
-            continue
-
-        if not bearer:
-            # If no live Public.com token is configured in environment, record staged OCO state after retry check
-            staged_msg = "Public.com API token not present in environment; staged deterministic OCO order."
-            attempt_history.append({
-                "attempt": attempt_num,
-                "httpStatus": 200,
-                "errorCode": None,
-                "classification": "LOCAL_OCO_STAGED",
-                "errorMessage": staged_msg,
-                "backoffDelayMs": 0.0,
-                "retrying": False,
-            })
-            return {
-                "ok": True,
-                "liveSubmitted": False,
-                "orderId": deterministic_order_uuid,
-                "accountId": resolved_account,
-                "symbol": clean_symbol,
-                "instrumentType": instrument_type,
-                "orderSide": order_side,
-                "orderType": order_type,
-                "quantity": str(quantity),
-                "limitPrice": limit_price,
-                "attemptsUsed": attempt_num,
-                "maxRetries": max_retries,
-                "totalBackoffMs": total_backoff_ms,
-                "recoveredAfterRetry": attempt > 0,
-                "preflightHydrated": preflight_hydrated,
-                "attemptHistory": attempt_history,
-                "status": "RECOVERED_AFTER_RETRY" if attempt > 0 else "WORKING_OCO",
-            }
 
         headers = {
             "Authorization": f"Bearer {bearer}",
@@ -4724,9 +4647,34 @@ async def submit_public_com_order_with_retry(
         # Step 2: Submit order to /userapigateway/trading/{accountId}/order
         ord_res = await _http_post_public_json(order_url, headers, order_payload, timeout_sec=4.5)
         if ord_res.get("ok"):
-            ord_data = ord_res.get("data") or {}
-            returned_order_id = str(ord_data.get("orderId") or ord_data.get("id") or deterministic_order_uuid)
-            outcome_label = "RECOVERED_AFTER_RETRY" if attempt > 0 else "SUBMITTED_LIVE"
+            ord_data = ord_res.get("data") if isinstance(ord_res.get("data"), dict) else {}
+            returned_order_id = str(ord_data.get("orderId") or ord_data.get("id") or "").strip()
+            if not returned_order_id:
+                return {
+                    "ok": False,
+                    "liveSubmitted": False,
+                    "orderId": None,
+                    "accountId": resolved_account,
+                    "symbol": clean_symbol,
+                    "instrumentType": instrument_type,
+                    "orderSide": order_side,
+                    "orderType": order_type,
+                    "quantity": str(quantity),
+                    "limitPrice": limit_price,
+                    "attemptsUsed": attempt_num,
+                    "maxRetries": max_retries,
+                    "totalBackoffMs": total_backoff_ms,
+                    "recoveredAfterRetry": False,
+                    "preflightHydrated": preflight_hydrated,
+                    "lastHttpStatus": ord_res.get("status_code"),
+                    "lastErrorCode": "MISSING_EXCHANGE_ORDER_ID",
+                    "lastErrorMessage": "Public.com response did not include an exchange-assigned orderId.",
+                    "failureClassification": "MISSING_EXCHANGE_ORDER_ID",
+                    "attemptHistory": attempt_history,
+                    "status": "VENUE_EXECUTION_FAILED",
+                }
+            exchange_fill_state = str(ord_data.get("status") or ord_data.get("orderStatus") or "SUBMITTED_LIVE").strip().upper()
+            outcome_label = "RECOVERED_AFTER_RETRY" if attempt > 0 else exchange_fill_state
             attempt_history.append({
                 "attempt": attempt_num,
                 "httpStatus": ord_res.get("status_code", 200),
@@ -4747,6 +4695,7 @@ async def submit_public_com_order_with_retry(
                 "ok": True,
                 "liveSubmitted": True,
                 "orderId": returned_order_id,
+                "fillState": exchange_fill_state,
                 "accountId": resolved_account,
                 "symbol": clean_symbol,
                 "instrumentType": instrument_type,
@@ -4812,7 +4761,7 @@ async def submit_public_com_order_with_retry(
             return {
                 "ok": False,
                 "liveSubmitted": False,
-                "orderId": deterministic_order_uuid,
+                "orderId": None,
                 "accountId": resolved_account,
                 "symbol": clean_symbol,
                 "instrumentType": instrument_type,
@@ -4841,7 +4790,6 @@ async def submit_public_com_order_with_retry(
             preflight_payload["expiration"] = {"timeInForce": "GTD", "expirationTime": refreshed_exp}
             order_payload["expiration"] = {"timeInForce": "GTD", "expirationTime": refreshed_exp}
         elif str(err_code) == "28000" and instrument_type == "EVENTCONTRACT":
-            # Re-resolve the active 15m strike ticker from Kalshi v2 when a series ticker or rolled strike caused code 28000
             raw_parts = clean_symbol.replace("KALSHI.", "").split(".")
             base_ticker = raw_parts[0] if raw_parts else clean_symbol
             side_suffix = raw_parts[1] if len(raw_parts) > 1 else "Y"
@@ -4856,7 +4804,7 @@ async def submit_public_com_order_with_retry(
     return {
         "ok": False,
         "liveSubmitted": False,
-        "orderId": deterministic_order_uuid,
+        "orderId": None,
         "accountId": resolved_account,
         "symbol": clean_symbol,
         "instrumentType": instrument_type,
@@ -4874,6 +4822,135 @@ async def submit_public_com_order_with_retry(
     }
 
 
+def get_loss_fraction(ask: float, atr_dollar: float) -> float:
+    safe_ask = ask if (math.isfinite(ask) and ask > 0) else 0.01
+    safe_atr = atr_dollar if (math.isfinite(atr_dollar) and atr_dollar >= 0) else 0.0
+    stop_dist = max(0.07, 0.9 * safe_atr) + 0.12
+    return min(1.0, stop_dist / safe_ask)
+
+
+def evaluate_portfolio_correlation_and_cap(
+    settled_cash: float,
+    active_positions: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    correlation_matrix: Optional[Dict[str, Dict[str, float]]] = None,
+    unknown_correlation_default: float = 1.0,
+    exchange_lot_step_usd: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    2.6.0-PORTFOLIO-GUARD-CHAMPION (TASK-08) Portfolio Correlation & Drawdown Guard:
+      - Per-contract loss fraction: lossFraction = (max(0.07, 0.9 * atrDollar) + 0.12) / ask
+      - Stress multiplier: stressMultiplier = 1 + max(0, maxPairwiseRho) * (positionCount - 1)
+      - Hard 15m aggregate portfolio risk ceiling: maxRiskUsd = settledCash * 0.035
+      - Per-position settled-cash cap: settledCash * 0.03
+    """
+    if not math.isfinite(settled_cash) or settled_cash <= 0:
+        return {
+            "allowed": False,
+            "approvedNotionalUsd": 0.0,
+            "approvedContracts": 0,
+            "maxRho": 0.0,
+            "maxPairwiseRho": 0.0,
+            "stressMultiplier": 1.0,
+            "correlationPenalty": 1.0,
+            "existingRiskUsd": 0.0,
+            "maxRiskUsd": 0.0,
+            "availableCandidateRiskUsd": 0.0,
+            "candidateLossFraction": 1.0,
+            "reason": "SETTLED_CASH_UNAVAILABLE: settledCash must be strictly positive.",
+        }
+
+    cand_sym = str(candidate.get("symbol") or "").strip().upper()
+    cand_ask = float(candidate.get("ask") or 0.62)
+    cand_atr = float(candidate.get("atrDollar") if candidate.get("atrDollar") is not None else 0.0778)
+    req_notional = float(candidate.get("requestedNotionalUsd") or 0.0)
+    cand_loss_frac = get_loss_fraction(cand_ask, cand_atr)
+
+    for p in active_positions:
+        if str(p.get("symbol") or "").strip().upper() == cand_sym:
+            return {
+                "allowed": False,
+                "approvedNotionalUsd": 0.0,
+                "approvedContracts": 0,
+                "maxRho": 1.0,
+                "maxPairwiseRho": 1.0,
+                "stressMultiplier": 1.0,
+                "correlationPenalty": 1.0,
+                "existingRiskUsd": 0.0,
+                "maxRiskUsd": round(settled_cash * 0.035, 6),
+                "availableCandidateRiskUsd": 0.0,
+                "candidateLossFraction": round(cand_loss_frac, 6),
+                "reason": f"DUPLICATE_ACTIVE_SYMBOL: {cand_sym} is already in activePositions.",
+            }
+
+    all_symbols = [str(p.get("symbol") or "").strip().upper() for p in active_positions] + [cand_sym]
+    pos_count = len(all_symbols)
+    corr_map = correlation_matrix or {}
+    max_rho = 0.0
+    if pos_count > 1:
+        for i in range(len(all_symbols)):
+            for j in range(i + 1, len(all_symbols)):
+                s_a, s_b = all_symbols[i], all_symbols[j]
+                raw_rho = (corr_map.get(s_a) or {}).get(s_b)
+                if raw_rho is None:
+                    raw_rho = (corr_map.get(s_b) or {}).get(s_a)
+                resolved_rho = float(raw_rho) if (raw_rho is not None and math.isfinite(float(raw_rho))) else unknown_correlation_default
+                clamped_rho = max(0.0, min(1.0, resolved_rho))
+                if clamped_rho > max_rho:
+                    max_rho = clamped_rho
+
+    stress_mult = 1.0 + max(0.0, max_rho) * (pos_count - 1)
+    corr_penalty = 1.0 / stress_mult
+    existing_risk_usd = sum(
+        max(0.0, float(p.get("notionalUsd") or 0.0)) * get_loss_fraction(float(p.get("ask") or 0.62), float(p.get("atrDollar") or 0.0778))
+        for p in active_positions
+    )
+    max_risk_usd = settled_cash * 0.035
+    avail_cand_risk_usd = max(0.0, (max_risk_usd / stress_mult) - existing_risk_usd)
+    per_pos_cap_usd = settled_cash * 0.03
+    risk_capped_notional = avail_cand_risk_usd / cand_loss_frac if cand_loss_frac > 0 else 0.0
+    raw_approved = max(0.0, min(req_notional, per_pos_cap_usd, risk_capped_notional))
+    lot_step = exchange_lot_step_usd if (exchange_lot_step_usd is not None and exchange_lot_step_usd > 0) else cand_ask
+    if lot_step > 0:
+        approved_contracts = int(math.floor((raw_approved + 1e-9) / lot_step))
+        approved_notional = round(approved_contracts * lot_step, 4)
+    else:
+        approved_contracts = 0
+        approved_notional = 0.0
+
+    min_lot = max(lot_step, cand_ask)
+    if approved_notional < min_lot - 1e-9 or approved_contracts < 1:
+        return {
+            "allowed": False,
+            "approvedNotionalUsd": 0.0,
+            "approvedContracts": 0,
+            "maxRho": round(max_rho, 6),
+            "maxPairwiseRho": round(max_rho, 6),
+            "stressMultiplier": round(stress_mult, 6),
+            "correlationPenalty": round(corr_penalty, 6),
+            "existingRiskUsd": round(existing_risk_usd, 6),
+            "maxRiskUsd": round(max_risk_usd, 6),
+            "availableCandidateRiskUsd": round(avail_cand_risk_usd, 6),
+            "candidateLossFraction": round(cand_loss_frac, 6),
+            "reason": f"PORTFOLIO_RISK_CAP_EXCEEDED: approvedNotionalUsd (${raw_approved:.2f}) < 1 contract (${min_lot:.2f}).",
+        }
+
+    return {
+        "allowed": True,
+        "approvedNotionalUsd": approved_notional,
+        "approvedContracts": approved_contracts,
+        "maxRho": round(max_rho, 6),
+        "maxPairwiseRho": round(max_rho, 6),
+        "stressMultiplier": round(stress_mult, 6),
+        "correlationPenalty": round(corr_penalty, 6),
+        "existingRiskUsd": round(existing_risk_usd, 6),
+        "maxRiskUsd": round(max_risk_usd, 6),
+        "availableCandidateRiskUsd": round(avail_cand_risk_usd, 6),
+        "candidateLossFraction": round(cand_loss_frac, 6),
+        "reason": f"APPROVED_PORTFOLIO_GUARD: ${approved_notional:.2f} ({approved_contracts} contracts).",
+    }
+
+
 @mcp.tool()
 async def execute_kalshi_or_public_order(
     symbol: str,
@@ -4886,20 +4963,23 @@ async def execute_kalshi_or_public_order(
     coinbase_spot: Optional[float] = None,
     max_retries: int = 3,
     base_delay_sec: float = 0.35,
-    simulated_transient_failures: int = 0,
+    active_positions: Optional[List[Dict[str, Any]]] = None,
+    correlation_matrix: Optional[Dict[str, Dict[str, float]]] = None,
+    atr_dollar: float = 0.0778,
 ) -> Dict[str, Any]:
     """
-    Mutating Tool: Asynchronously routes an idempotent, risk-gated OCO/limit order to Kalshi v2 or Public.com
-    with exponential backoff auto-retry persistence (`max_retries=3`, `base_delay_sec=0.35`) for rate-limiting
-    (HTTP 429), temporary connection/gateway issues (HTTP 408, 425, 500, 502, 503, 504, socket timeouts),
-    token refresh (HTTP 401), and quote hydration (code 28000).
-    Never uses a hardcoded `82620.0` default: automatically fetches live BTC-USD spot from Coinbase's public
-    WebSocket (`wss://ws-feed.exchange.coinbase.com`, channel `ticker`) with automatic fallback to Coinbase's
-    public REST API (`https://api.exchange.coinbase.com/products/BTC-USD/ticker`) whenever live spot data is needed.
-    Automatically routes rejected or retry-exhausted orders to `route_to_dlq`.
+    Mutating Tool: 100% Live Execution Only.
+    1. Enforces deterministic idempotency replay check (`check_idempotent_replay`).
+    2. Queries live settled cash from the authenticated venue endpoint (`get_kalshi_live_balance` or `get_public_brokerage_portfolio`);
+       blocks immediately with `BALANCE_UNVERIFIED_BLOCK` (`settledCash = 0`) if live balance verification fails.
+    3. Enforces ExecutionVault Rule 1 (3% settled-cash cap) and TASK-08 `evaluate_portfolio_correlation_and_cap`
+       (3.5% 15m aggregate portfolio drawdown cap).
+    4. Routes exclusively through the live venue API and returns only real exchange-assigned `order_id` and fill states
+       (never fabricates order IDs or mock fills).
     """
     if not idempotency_key or not idempotency_key.strip():
         return {
+            "ok": False,
             "status": "REJECTED",
             "dataQualityWarning": True,
             "rationale": "Missing required idempotency_key on execute_kalshi_or_public_order; order blocked.",
@@ -4912,21 +4992,85 @@ async def execute_kalshi_or_public_order(
             return replay
 
         is_kalshi_15m = symbol.upper().startswith("KX") or "KALSHI" in symbol.upper()
+        # Step 1: Verify live settled cash directly from the authenticated venue endpoint
+        if is_kalshi_15m:
+            live_bal = await get_kalshi_live_balance(forceRefresh=True)
+        else:
+            live_bal = await get_public_brokerage_portfolio(includePositions=True)
+
+        settled_cash = float(live_bal.get("settledCash") or 0.0)
+        if not live_bal.get("ok") or live_bal.get("status") == "BALANCE_UNVERIFIED_BLOCK" or settled_cash <= 0:
+            block_payload = {
+                "ok": False,
+                "status": "BALANCE_UNVERIFIED_BLOCK",
+                "settledCash": 0.0,
+                "symbol": symbol,
+                "idempotencyKey": idempotency_key,
+                "venueBalanceState": live_bal,
+                "idempotentReplay": False,
+                "dataQualityWarning": True,
+                "rationale": str(live_bal.get("rationale") or "BALANCE_UNVERIFIED_BLOCK: Live settled cash unverified; trade blocked."),
+            }
+            save_idempotent_result(
+                con,
+                idempotency_key,
+                "execute_kalshi_or_public_order",
+                {"symbol": symbol, "side": side, "notionalUsd": notionalUsd},
+                block_payload,
+            )
+            return block_payload
+
+        # Step 2: Enforce ExecutionVault Rule 1 (3% settled-cash cap) & TASK-08 PortfolioCorrelationGuard (3.5% 15m cap)
+        corr_guard = evaluate_portfolio_correlation_and_cap(
+            settled_cash=settled_cash,
+            active_positions=active_positions or [],
+            candidate={
+                "symbol": symbol.upper().strip(),
+                "requestedNotionalUsd": notionalUsd,
+                "ask": ask_price,
+                "atrDollar": atr_dollar,
+            },
+            correlation_matrix=correlation_matrix,
+        )
+        if not corr_guard.get("allowed"):
+            guard_reject = {
+                "ok": False,
+                "status": "PORTFOLIO_CORRELATION_BLOCKED",
+                "symbol": symbol,
+                "idempotencyKey": idempotency_key,
+                "settledCash": settled_cash,
+                "portfolioCorrelationGuard": corr_guard,
+                "idempotentReplay": False,
+                "dataQualityWarning": False,
+                "rationale": str(corr_guard.get("reason")),
+            }
+            save_idempotent_result(
+                con,
+                idempotency_key,
+                "execute_kalshi_or_public_order",
+                {"symbol": symbol, "side": side, "notionalUsd": notionalUsd},
+                guard_reject,
+            )
+            return guard_reject
+
+        capped_notional = float(corr_guard["approvedNotionalUsd"])
+        contracts = int(corr_guard["approvedContracts"])
+
         product_id = resolve_coinbase_product_id(symbol)
         spot_source = "EXPLICIT_CALLER_SPOT"
 
-        # Always fetch live Coinbase spot when coinbase_spot is not explicitly supplied
         if coinbase_spot is None or coinbase_spot <= 0:
             spot_res = await fetch_live_coinbase_spot(product_id)
             if not spot_res.get("ok") or not spot_res.get("price"):
                 dlq_res = await route_to_dlq(
                     idempotency_key=f"{idempotency_key}-dlq-telemetry",
                     failed_tool="execute_kalshi_or_public_order",
-                    payload_json=json.dumps({"symbol": symbol, "side": side, "ask_price": ask_price, "notionalUsd": notionalUsd}),
+                    payload_json=json.dumps({"symbol": symbol, "side": side, "ask_price": ask_price, "notionalUsd": capped_notional}),
                     error_reason=spot_res.get("error", "DATA_UNAVAILABLE: Live Coinbase spot feed unreachable"),
                     severity="CRITICAL",
                 )
                 abort_payload = {
+                    "ok": False,
                     "status": "DATA_UNAVAILABLE",
                     "symbol": symbol,
                     "idempotencyKey": idempotency_key,
@@ -4939,7 +5083,7 @@ async def execute_kalshi_or_public_order(
                     con,
                     idempotency_key,
                     "execute_kalshi_or_public_order",
-                    {"symbol": symbol, "side": side, "notionalUsd": notionalUsd},
+                    {"symbol": symbol, "side": side, "notionalUsd": capped_notional},
                     abort_payload,
                 )
                 return abort_payload
@@ -4947,8 +5091,8 @@ async def execute_kalshi_or_public_order(
             coinbase_spot = float(spot_res["price"])
             spot_source = str(spot_res["source"])
 
+        clean_upper = symbol.upper().strip()
         if is_kalshi_15m:
-            # Derive active rolling ATM strike from live Coinbase spot if caller did not specify strike
             resolved_strike = float(strike) if (strike is not None and strike > 0) else round(coinbase_spot * 0.9987, 2)
             gate = compute_btc_lead_lag_gate(
                 coinbase_spot=coinbase_spot,
@@ -4962,20 +5106,19 @@ async def execute_kalshi_or_public_order(
                 dlq_res = await route_to_dlq(
                     idempotency_key=f"{idempotency_key}-dlq",
                     failed_tool="execute_kalshi_or_public_order",
-                    payload_json=json.dumps(
-                        {
-                            "symbol": symbol,
-                            "side": side,
-                            "ask_price": ask_price,
-                            "notionalUsd": notionalUsd,
-                            "live_coinbase_spot": coinbase_spot,
-                            "strike": resolved_strike,
-                        }
-                    ),
+                    payload_json=json.dumps({
+                        "symbol": symbol,
+                        "side": side,
+                        "ask_price": ask_price,
+                        "notionalUsd": capped_notional,
+                        "live_coinbase_spot": coinbase_spot,
+                        "strike": resolved_strike,
+                    }),
                     error_reason=gate["rationale"],
                     severity="WARNING",
                 )
                 rejected_payload = {
+                    "ok": False,
                     "status": "ROUTED_TO_DLQ",
                     "symbol": symbol,
                     "idempotencyKey": idempotency_key,
@@ -4991,61 +5134,13 @@ async def execute_kalshi_or_public_order(
                     con,
                     idempotency_key,
                     "execute_kalshi_or_public_order",
-                    {"symbol": symbol, "side": side, "notionalUsd": notionalUsd, "ask_price": ask_price},
+                    {"symbol": symbol, "side": side, "notionalUsd": capped_notional, "ask_price": ask_price},
                     rejected_payload,
                 )
                 return rejected_payload
 
-        else:
-            resolved_strike = float(strike) if (strike is not None and strike > 0) else round(coinbase_spot * 0.9987, 2)
-            settle_and_log_ml_telemetry_row(
-                symbol=symbol.upper(),
-                coinbase_spot=coinbase_spot,
-                strike=resolved_strike,
-                minutes_left=minutes_left,
-                yes_ask=ask_price,
-                no_ask=round(max(0.01, 1.0 - ask_price), 2),
-                nd2_fair_prob=0.58,
-                net_edge_dollars=0.05,
-                atr_pct=0.16,
-                atr_baseline_mult=0.95,
-                rsi_14=52.0,
-                ma_spread_short_pct=0.04,
-                market_regime="LOW_VOLATILITY_COMPRESSION",
-                sniper_action="EXECUTE",
-                gate_blocked_reason="NONE_APPROVED_DIRECT_ORDER",
-                realized_outcome=None,
-            )
-
-        capped_notional = min(3.0, max(1.5, notionalUsd))
-        contracts = min(4, max(1, int(capped_notional // (ask_price + 0.02))))
-
-        clean_upper = symbol.upper().strip()
-        if is_kalshi_15m:
             raw_kalshi_sym = clean_upper.replace("KALSHI.", "").split(".")[0]
             active_kalshi_ticker = await resolve_active_kalshi_contract_ticker(raw_kalshi_sym)
-            pub_ev_symbol = (
-                clean_upper
-                if (clean_upper.startswith("KALSHI.") and "-" in clean_upper)
-                else f"KALSHI.{active_kalshi_ticker}.{'N' if side == 'BUY_NO' else 'Y'}"
-            )
-            inst_type: Literal["EQUITY", "EVENTCONTRACT", "CRYPTO"] = "EVENTCONTRACT"
-            ord_type: Literal["LIMIT", "MARKET"] = "LIMIT"
-            qty_str = str(contracts)
-            lim_px_str: Optional[str] = f"{ask_price:.2f}"
-        else:
-            pub_ev_symbol = clean_upper.replace("-USD", "")
-            inst_type = "CRYPTO" if clean_upper.endswith("-USD") else "EQUITY"
-            ord_type = "LIMIT" if ask_price > 0 else "MARKET"
-            qty_val = max(1, int(capped_notional // max(0.01, ask_price))) if ask_price < 10 else round(capped_notional / max(0.01, ask_price), 2)
-            qty_str = str(qty_val)
-            lim_px_str = f"{ask_price:.2f}" if ord_type == "LIMIT" else None
-
-        # If prediction market order, evaluate `KalshiSignalSchema` through the Sequential 5-Gate Pre-Trade Firewall
-        # before invoking `place_v2_maker_order` (`POST /portfolio/events/orders`)
-        kalshi_v2_order_result: Optional[Dict[str, Any]] = None
-        five_gate_result: Optional[Dict[str, Any]] = None
-        if is_kalshi_15m:
             series_code = active_kalshi_ticker.split("-")[0] if "-" in active_kalshi_ticker else active_kalshi_ticker
             cal_yes_p = float(gate.get("fairYesProb") or 0.68)
             mid_p = round(max(0.05, min(0.95, ask_price - 0.01)), 4)
@@ -5061,16 +5156,72 @@ async def execute_kalshi_or_public_order(
                 yes_bid_dollars=round(max(0.01, mid_p - 0.01), 4),
                 yes_ask_dollars=round(min(0.99, mid_p + 0.01), 4),
                 is_maker=True,
+                bankroll_dollars=settled_cash,
                 idempotency_key=idempotency_key,
             )
             five_gate_result = await evaluate_5_gate_risk_engine_and_execute(signal=sig_obj, con=con)
             kalshi_v2_order_result = five_gate_result.get("v2_maker_order")
-            sized_by_kelly = int((five_gate_result.get("gates", {}).get("gate4_half_kelly_sizing") or {}).get("contractsSized") or contracts)
-            if sized_by_kelly > 0:
-                contracts = sized_by_kelly
-                qty_str = str(contracts)
+            exchange_order_id = str((kalshi_v2_order_result or {}).get("exchange_order_id") or "").strip()
+            if not five_gate_result.get("ok") or not kalshi_v2_order_result or not kalshi_v2_order_result.get("ok") or not exchange_order_id:
+                err_payload = {
+                    "ok": False,
+                    "status": "VENUE_EXECUTION_FAILED",
+                    "orderId": None,
+                    "idempotencyKey": idempotency_key,
+                    "symbol": clean_upper,
+                    "settledCash": settled_cash,
+                    "portfolioCorrelationGuard": corr_guard,
+                    "fiveGateRiskEngine": five_gate_result,
+                    "kalshiV2Order": kalshi_v2_order_result,
+                    "idempotentReplay": False,
+                    "dataQualityWarning": True,
+                    "rationale": f"Live Kalshi V2 order execution failed or returned no exchange order_id (mode={five_gate_result.get('execution_mode')}).",
+                }
+                save_idempotent_result(
+                    con,
+                    idempotency_key,
+                    "execute_kalshi_or_public_order",
+                    {"symbol": symbol, "side": side, "notionalUsd": capped_notional, "ask_price": ask_price},
+                    err_payload,
+                )
+                return err_payload
 
-        # Execute Public.com order through the exponential-backoff auto-retry engine
+            response = {
+                "ok": True,
+                "status": str(kalshi_v2_order_result.get("status") or "RESTING"),
+                "orderId": exchange_order_id,
+                "idempotencyKey": idempotency_key,
+                "symbol": clean_upper,
+                "settledCash": settled_cash,
+                "portfolioCorrelationGuard": corr_guard,
+                "executionVenues": ["KALSHI_V2_EVENTS_ORDERS_MAKER"],
+                "kalshiV2Order": kalshi_v2_order_result,
+                "fiveGateRiskEngine": five_gate_result,
+                "side": side,
+                "contracts": contracts,
+                "fillPrice": float(kalshi_v2_order_result.get("price_dollars") or ask_price),
+                "liveCoinbaseSpot": round(coinbase_spot, 2),
+                "spotSource": spot_source,
+                "idempotentReplay": False,
+                "dataQualityWarning": False,
+                "rationale": f"Live Kalshi V2 order {exchange_order_id} placed for {contracts} {active_kalshi_ticker} @ ${kalshi_v2_order_result.get('price_dollars')}.",
+            }
+            save_idempotent_result(
+                con,
+                idempotency_key,
+                "execute_kalshi_or_public_order",
+                {"symbol": symbol, "side": side, "notionalUsd": capped_notional, "ask_price": ask_price},
+                response,
+            )
+            return response
+
+        # Public.com brokerage order path
+        pub_ev_symbol = clean_upper.replace("-USD", "")
+        inst_type: Literal["EQUITY", "EVENTCONTRACT", "CRYPTO"] = "CRYPTO" if clean_upper.endswith("-USD") else "EQUITY"
+        ord_type: Literal["LIMIT", "MARKET"] = "LIMIT" if ask_price > 0 else "MARKET"
+        qty_str = str(contracts)
+        lim_px_str: Optional[str] = f"{ask_price:.2f}" if ord_type == "LIMIT" else None
+
         public_retry_result = await submit_public_com_order_with_retry(
             symbol=pub_ev_symbol,
             idempotency_key=idempotency_key,
@@ -5081,11 +5232,11 @@ async def execute_kalshi_or_public_order(
             limit_price=lim_px_str,
             max_retries=max_retries,
             base_delay_sec=base_delay_sec,
-            simulated_transient_failures=simulated_transient_failures,
             con=con,
         )
 
-        if not public_retry_result.get("ok"):
+        exchange_order_id = str(public_retry_result.get("orderId") or "").strip()
+        if not public_retry_result.get("ok") or not public_retry_result.get("liveSubmitted") or not exchange_order_id:
             dlq_res = await route_to_dlq(
                 idempotency_key=f"{idempotency_key}-dlq-public-retry-exhausted",
                 failed_tool="execute_kalshi_or_public_order",
@@ -5096,75 +5247,58 @@ async def execute_kalshi_or_public_order(
                     "limit_price": lim_px_str,
                     "retry_telemetry": public_retry_result,
                 }),
-                error_reason=f"Public.com order failed after {public_retry_result.get('attemptsUsed')} attempts ({public_retry_result.get('failureClassification')}): {public_retry_result.get('lastErrorMessage')}",
+                error_reason=f"Public.com live order failed: {public_retry_result.get('lastErrorMessage')}",
                 severity="CRITICAL",
             )
             exhausted_payload = {
-                "status": "PUBLIC_ORDER_RETRY_EXHAUSTED_DLQ",
+                "ok": False,
+                "status": "VENUE_EXECUTION_FAILED",
+                "orderId": None,
                 "symbol": clean_upper,
                 "publicEventContractSymbol": pub_ev_symbol,
                 "idempotencyKey": idempotency_key,
-                "kalshiV2Order": kalshi_v2_order_result,
+                "settledCash": settled_cash,
+                "portfolioCorrelationGuard": corr_guard,
                 "retryTelemetry": public_retry_result,
                 "dlqRecord": dlq_res,
                 "idempotentReplay": False,
                 "dataQualityWarning": True,
-                "rationale": (
-                    f"Public.com order {pub_ev_symbol} exhausted {public_retry_result.get('attemptsUsed')} attempts "
-                    f"({public_retry_result.get('totalBackoffMs')}ms backoff; {public_retry_result.get('failureClassification')}); quarantined in DLQ."
-                ),
+                "rationale": f"Public.com live order {pub_ev_symbol} failed ({public_retry_result.get('failureClassification')}); no mock fill permitted.",
             }
             save_idempotent_result(
                 con,
                 idempotency_key,
                 "execute_kalshi_or_public_order",
-                {"symbol": symbol, "side": side, "notionalUsd": notionalUsd, "ask_price": ask_price},
+                {"symbol": symbol, "side": side, "notionalUsd": capped_notional, "ask_price": ask_price},
                 exhausted_payload,
             )
             return exhausted_payload
 
-        order_id = str(public_retry_result.get("orderId") or f"ord-{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:8]}")
-        attempts_used = int(public_retry_result.get("attemptsUsed", 1))
-        backoff_ms = float(public_retry_result.get("totalBackoffMs", 0.0))
-
         response = {
-            "status": "WORKING_OCO",
-            "orderId": order_id,
+            "ok": True,
+            "status": str(public_retry_result.get("fillState") or public_retry_result.get("status") or "SUBMITTED_LIVE"),
+            "orderId": exchange_order_id,
             "idempotencyKey": idempotency_key,
             "symbol": clean_upper,
             "publicEventContractSymbol": pub_ev_symbol,
-            "predictionMarketDataSource": "KALSHI_CLOB_V2_OCT2026_WS",
-            "executionVenues": ["KALSHI_V2_EVENTS_ORDERS_MAKER", "PUBLIC_COM_EVENTCONTRACT"] if is_kalshi_15m else ["PUBLIC_COM_BROKERAGE"],
-            "kalshiV2Order": kalshi_v2_order_result,
-            "fiveGateRiskEngine": five_gate_result,
+            "settledCash": settled_cash,
+            "portfolioCorrelationGuard": corr_guard,
+            "executionVenues": ["PUBLIC_COM_BROKERAGE"],
             "side": side,
             "contracts": contracts,
             "fillPrice": ask_price,
             "liveCoinbaseSpot": round(coinbase_spot, 2),
             "spotSource": spot_source,
-            "totalRiskUsd": round(contracts * (ask_price + 0.02), 2),
-            "retryTelemetry": {
-                "attemptsUsed": attempts_used,
-                "maxRetries": max_retries,
-                "totalBackoffMs": backoff_ms,
-                "recoveredAfterRetry": bool(public_retry_result.get("recoveredAfterRetry")),
-                "preflightHydrated": bool(public_retry_result.get("preflightHydrated")),
-                "attemptHistory": public_retry_result.get("attemptHistory", []),
-                "retryableHttpStatusCodes": sorted(PUBLIC_RETRYABLE_HTTP_STATUS_CODES),
-                "retryableGatewayCodes": sorted(PUBLIC_RETRYABLE_GATEWAY_ERROR_CODES),
-            },
+            "retryTelemetry": public_retry_result,
             "idempotentReplay": False,
             "dataQualityWarning": False,
-            "rationale": (
-                f"Executed {side} {contracts} {clean_upper} ({pub_ev_symbol}) @ ${ask_price:.2f} "
-                f"(attempt {attempts_used}/{max_retries + 1}, backoff {backoff_ms:.0f}ms, Spot ${coinbase_spot:,.2f}, key={idempotency_key[:10]})."
-            ),
+            "rationale": f"Live Public.com order {exchange_order_id} submitted for {contracts} {pub_ev_symbol} @ ${ask_price:.2f}.",
         }
         save_idempotent_result(
             con,
             idempotency_key,
             "execute_kalshi_or_public_order",
-            {"symbol": symbol, "side": side, "notionalUsd": notionalUsd, "ask_price": ask_price},
+            {"symbol": symbol, "side": side, "notionalUsd": capped_notional, "ask_price": ask_price},
             response,
         )
         return response
@@ -5185,17 +5319,29 @@ async def evaluate_5_gate_kalshi_signal(
     m_taker: float = 1.0,
     m_maker: float = 0.0,
     theta_min: Optional[float] = None,
-    bankroll_dollars: float = 459.34,
+    bankroll_dollars: Optional[float] = None,
     realized_daily_pnl_dollars: Optional[float] = None,
     unrealized_daily_pnl_dollars: Optional[float] = None,
     idempotency_key: str = "",
 ) -> Dict[str, Any]:
     """
     Evaluates a `KalshiSignalSchema` through the Sequential 5-Gate Pre-Trade Firewall
-    (Gate 1 Data Integrity, Gate 2 Quadratic Fee-Adjusted Edge, Gate 3 SQLite Brier Skill Score
-    & Confidence Band Gate, Gate 4 Fractional Half-Kelly Sizing, Gate 5 Daily Drawdown & Kill-Switch)
     and routes eligible trades to `place_v2_maker_order`.
+    Queries live Kalshi settled cash when `bankroll_dollars` is not provided; blocks if unverified.
     """
+    resolved_bankroll = bankroll_dollars
+    if resolved_bankroll is None or resolved_bankroll <= 0:
+        live_bal = await get_kalshi_live_balance(forceRefresh=True)
+        if not live_bal.get("ok") or live_bal.get("status") == "BALANCE_UNVERIFIED_BLOCK":
+            return {
+                "ok": False,
+                "status": "BALANCE_UNVERIFIED_BLOCK",
+                "settledCash": 0.0,
+                "execution_mode": "BALANCE_UNVERIFIED_BLOCK",
+                "venueBalanceState": live_bal,
+            }
+        resolved_bankroll = float(live_bal.get("settledCash") or 0.0)
+
     sig = KalshiSignalSchema(
         market_ticker=market_ticker,
         series_ticker=series_ticker,
@@ -5208,7 +5354,7 @@ async def evaluate_5_gate_kalshi_signal(
         m_taker=m_taker,
         m_maker=m_maker,
         theta_min=theta_min,
-        bankroll_dollars=bankroll_dollars,
+        bankroll_dollars=resolved_bankroll,
         idempotency_key=idempotency_key or f"5gate-{market_ticker}-{int(time.time() * 1000)}",
     )
     con = get_db_connection()
@@ -5332,18 +5478,6 @@ def build_historical_calibration_lessons_context(series_ticker: str) -> str:
 
 
 class KalshiGeminiContextCacheManager:
-    """
-    3. Explicit Context Caching (`client.aio.caches.create` / `types.CreateCachedContentConfig`):
-       - Implements tiered TTLs based on contract time-to-expiration:
-         * Far from expiration (`minutes_to_expiration >= 60`): `3600s` (60m TTL)
-         * Medium horizon (`15 <= minutes_to_expiration < 60`): `900s` (15m TTL)
-         * Near expiration (`minutes_to_expiration < 15`): `300s` (5m TTL)
-       - Bundles `system_instruction`, series settlement rules, and SQLite Brier calibration
-         lessons inside `types.CreateCachedContentConfig`.
-       - Subsequent `client.aio.models.generate_content` calls reference `cached_content=cache.name`
-         and strictly omit `system_instruction`, `tools`, and `tool_config` in `GenerateContentConfig`.
-    """
-
     def __init__(self) -> None:
         self._active_caches: Dict[str, Dict[str, Any]] = {}
         self._cache_hits: int = 0
@@ -5462,10 +5596,6 @@ GEMINI_CACHE_MANAGER = KalshiGeminiContextCacheManager()
 
 
 def get_unified_async_genai_client() -> Any:
-    """
-    Returns the unified `genai.Client` configured for non-blocking `client.aio.models.generate_content`
-    and `client.aio.caches.create` calls.
-    """
     api_key = os.environ.get("GEMINI_API_KEY", "")
     return genai.Client(
         api_key=api_key,
@@ -5488,19 +5618,9 @@ async def deliberate_kalshi_signal_async(
     model: str = DEFAULT_KALSHI_GEMINI_MODEL,
     calibrated_yes_prob_hint: Optional[float] = None,
     confidence_band_hint: Optional[float] = None,
-    bankroll_dollars: float = 459.34,
+    bankroll_dollars: float = 0.0,
     idempotency_key: Optional[str] = None,
 ) -> Tuple[KalshiSignalSchema, Dict[str, Any]]:
-    """
-    1. Non-blocking async inference via `await client.aio.models.generate_content(...)` so WebSocket
-       ping/pong frames and `orderbook_delta` updates are never blocked during model deliberation.
-    2. Uses `response_mime_type="application/json"` and `response_schema=KalshiSignalSchema` inside
-       `types.GenerateContentConfig`, plus `thinking_config=types.ThinkingConfig(thinking_level=...)`
-       (never the deprecated `thinkingBudget`), and extracts `response.parsed` directly.
-    3. References `cached_content=cache_entry["cache_name"]` created via `client.aio.caches.create`
-       (`CreateCachedContentConfig` with tiered TTLs) and strictly omits `system_instruction`,
-       `tools`, and `tool_config` in `GenerateContentConfig`.
-    """
     t0 = time.perf_counter()
     clean_ticker = (market_ticker or "KXBTC15M-26OCT29-ACTIVE").strip().upper()
     clean_series = (
@@ -5514,7 +5634,6 @@ async def deliberate_kalshi_signal_async(
 
     client = get_unified_async_genai_client()
 
-    # Step 1: Resolve or create tiered explicit context cache (`client.aio.caches.create`)
     cache_entry = await GEMINI_CACHE_MANAGER.get_or_create_series_cache(
         client=client,
         model=model,
@@ -5539,8 +5658,6 @@ async def deliberate_kalshi_signal_async(
         "confidence_band_hint": confidence_band_hint,
     }
 
-    # Step 2: Build `GenerateContentConfig` referencing `cached_content` WITHOUT
-    # `system_instruction`, `tools`, or `tool_config` to prevent SDK validation errors.
     gen_config = types.GenerateContentConfig(
         cached_content=cache_entry["cache_name"],
         response_mime_type="application/json",
@@ -5549,14 +5666,12 @@ async def deliberate_kalshi_signal_async(
         temperature=0.1,
     )
 
-    # Step 3: Non-blocking async inference via `client.aio.models.generate_content`
     response = await client.aio.models.generate_content(
         model=model,
         contents=json.dumps(live_prompt_payload),
         config=gen_config,
     )
 
-    # Step 4: Extract structured Pydantic output directly via `response.parsed`
     parsed_signal = getattr(response, "parsed", None)
     if not isinstance(parsed_signal, KalshiSignalSchema):
         if isinstance(parsed_signal, dict):
@@ -5605,15 +5720,26 @@ async def deliberate_kalshi_signal_with_gemini(
     thinking_level: Literal["LOW", "MEDIUM", "HIGH"] = "MEDIUM",
     calibrated_yes_prob_hint: Optional[float] = None,
     confidence_band_hint: Optional[float] = None,
-    bankroll_dollars: float = 459.34,
+    bankroll_dollars: Optional[float] = None,
     idempotency_key: str = "",
 ) -> Dict[str, Any]:
     """
-    Runs non-blocking async Gemini deliberation (`client.aio.caches.create` +
-    `client.aio.models.generate_content` with `response_schema=KalshiSignalSchema`,
-    `thinkingLevel`, and `response.parsed`) and pipes the resulting `KalshiSignalSchema`
+    Runs non-blocking async Gemini deliberation and pipes the resulting `KalshiSignalSchema`
     directly through the Deterministic 5-Gate Pre-Trade Firewall into `place_v2_maker_order`.
+    Queries live Kalshi settled cash when `bankroll_dollars` is not provided; blocks if unverified.
     """
+    resolved_bankroll = bankroll_dollars
+    if resolved_bankroll is None or resolved_bankroll <= 0:
+        live_bal = await get_kalshi_live_balance(forceRefresh=True)
+        if not live_bal.get("ok") or live_bal.get("status") == "BALANCE_UNVERIFIED_BLOCK":
+            return {
+                "ok": False,
+                "status": "BALANCE_UNVERIFIED_BLOCK",
+                "settledCash": 0.0,
+                "venueBalanceState": live_bal,
+            }
+        resolved_bankroll = float(live_bal.get("settledCash") or 0.0)
+
     signal_obj, gemini_telemetry = await deliberate_kalshi_signal_async(
         market_ticker=market_ticker,
         series_ticker=series_ticker,
@@ -5625,7 +5751,7 @@ async def deliberate_kalshi_signal_with_gemini(
         thinking_level=thinking_level,
         calibrated_yes_prob_hint=calibrated_yes_prob_hint,
         confidence_band_hint=confidence_band_hint,
-        bankroll_dollars=bankroll_dollars,
+        bankroll_dollars=resolved_bankroll,
         idempotency_key=idempotency_key or f"gemini-5gate-{market_ticker}-{int(time.time() * 1000)}",
     )
     con = get_db_connection()
@@ -5653,20 +5779,20 @@ async def deliberate_kalshi_signal_with_gemini(
         con.close()
 
 
-
-
 @mcp.tool()
 async def run_portfolio_cleaner(
     idempotency_key: str,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Mutating Tool: Asynchronously sweeps 8 fractional equity dust lots (<$1.00, HIGHEST_COST lot)
-    and trims 3 stale Kalshi event contracts (<-12% unrealized loss) with idempotency protection.
+    Mutating Tool: 100% Live Execution Only.
+    Queries real open orders and positions from Kalshi V2 and Public.com, executes the Rule 3
+    `CancelAllOpenOrders` pre-exit sweep, awaits balance/collateral release confirmation,
+    and submits live close orders (reporting actual venue cancellation/close statuses).
     """
-    await asyncio.sleep(0.005)
     if not idempotency_key or not idempotency_key.strip():
         return {
+            "ok": False,
             "status": "REJECTED",
             "dataQualityWarning": True,
             "rationale": "Missing required idempotency_key on run_portfolio_cleaner; sweep aborted.",
@@ -5678,44 +5804,171 @@ async def run_portfolio_cleaner(
         if replay:
             return replay
 
-        mode = "DRY_RUN" if dry_run else "LIVE_EXECUTED"
+        kalshi_bal = await get_kalshi_live_balance(forceRefresh=True)
+        pub_port = await get_public_brokerage_portfolio(includePositions=True)
+
+        if not kalshi_bal.get("ok") and not pub_port.get("ok"):
+            block_res = {
+                "ok": False,
+                "status": "BALANCE_UNVERIFIED_BLOCK",
+                "settledCash": 0.0,
+                "idempotencyKey": idempotency_key,
+                "kalshiStatus": kalshi_bal.get("status"),
+                "publicStatus": pub_port.get("status"),
+                "idempotentReplay": False,
+                "dataQualityWarning": True,
+                "rationale": "BALANCE_UNVERIFIED_BLOCK: Both Kalshi V2 and Public.com live portfolio endpoints failed verification; cleaner aborted.",
+            }
+            save_idempotent_result(con, idempotency_key, "run_portfolio_cleaner", {"dry_run": dry_run}, block_res)
+            return block_res
+
+        # Step 1 (Rule 3): CancelAllOpenOrders pre-exit sweep on Kalshi V2
+        cancel_sweep_res = await cancel_all_kalshi_v2_orders(
+            reason=f"Rule 3 pre-exit CancelAllOpenOrders sweep ({idempotency_key})"
+        )
+        # Step 2 (Rule 3): Await and confirm open-order & collateral release on Kalshi V2
+        open_orders_check = await kalshi_signed_rest_request(
+            "GET",
+            "/trade-api/v2/portfolio/orders?status=resting",
+            is_write=False,
+        )
+        resting_orders = (
+            (open_orders_check.get("data") or {}).get("orders")
+            if isinstance(open_orders_check.get("data"), dict)
+            else []
+        ) or []
+        balance_released_confirmed = bool(open_orders_check.get("ok") and len(resting_orders) == 0)
+        refreshed_kalshi_bal = await get_kalshi_live_balance(forceRefresh=True)
+
+        # Query real Kalshi V2 positions
+        kalshi_pos_res = await kalshi_signed_rest_request(
+            "GET",
+            "/trade-api/v2/portfolio/positions",
+            is_write=False,
+        )
+        kalshi_positions = (
+            (kalshi_pos_res.get("data") or {}).get("market_positions")
+            if isinstance(kalshi_pos_res.get("data"), dict)
+            else []
+        ) or []
+
+        public_positions = pub_port.get("positions") if isinstance(pub_port.get("positions"), list) else []
+
         swept_dust = 0
         trimmed_events = 0
         net_cash_freed = 0.0
         now_utc = datetime.datetime.now(datetime.timezone.utc)
+        venue_actions: List[Dict[str, Any]] = []
 
-        for pos in PORTFOLIO_SNAPSHOT:
-            sym, ptype, qty, val, pnl = pos["symbol"], pos["type"], pos["qty"], pos["val"], pos["pnl_pct"]
-            if ptype == "EQUITY" and val < 1.00:
-                action = "SWEEP_EQUITY_DUST (HIGHEST_COST LOT)"
-                fee = 0.00
-                net_freed = val
-                swept_dust += 1
-            elif ptype == "EVENT" and pnl < -12.0:
-                action = "TRIM_STALE_EVENT_CONTRACT"
-                fee = round(qty * 0.02, 2)
-                net_freed = round(max(0.0, val - fee), 2)
-                trimmed_events += 1
-            else:
-                action = "KEEP_PROTECTED"
-                fee = 0.00
-                net_freed = 0.00
+        # Process real Kalshi positions with < -12% unrealized loss
+        for kpos in kalshi_positions:
+            if not isinstance(kpos, dict):
+                continue
+            tkr = str(kpos.get("ticker") or "").strip().upper()
+            pos_qty = int(float(kpos.get("position") or 0))
+            if not tkr or pos_qty == 0:
+                continue
+            exposure_cents = float(kpos.get("market_exposure") or 0.0)
+            val_usd = round(exposure_cents / 100.0, 2) if exposure_cents > 5 else round(abs(pos_qty) * 0.50, 2)
+            realized_pnl_cents = float(kpos.get("realized_pnl") or 0.0)
+            pnl_pct = (realized_pnl_cents / max(1.0, exposure_cents)) * 100.0 if exposure_cents > 0 else 0.0
+            if pnl_pct < -12.0:
+                if dry_run:
+                    close_status = "DRY_RUN_CANDIDATE"
+                    close_order_id = None
+                elif not balance_released_confirmed:
+                    close_status = "BLOCKED_COLLATERAL_NOT_RELEASED"
+                    close_order_id = None
+                else:
+                    close_side: Literal["BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO"] = "SELL_YES" if pos_qty > 0 else "SELL_NO"
+                    close_res = await submit_kalshi_v2_events_order(
+                        ticker=tkr,
+                        idempotency_key=f"{idempotency_key}-close-{tkr}",
+                        side=close_side,
+                        contracts=abs(pos_qty),
+                        desired_price_dollars=0.01,
+                        post_only=False,
+                        reduce_only=True,
+                        time_in_force="immediate_or_cancel",
+                        con=con,
+                    )
+                    close_status = str(close_res.get("status") or "VENUE_EXECUTION_FAILED")
+                    close_order_id = close_res.get("exchange_order_id")
+                    if close_res.get("ok") and close_order_id:
+                        trimmed_events += 1
+                        net_cash_freed = round(net_cash_freed + val_usd, 2)
+                venue_actions.append({
+                    "venue": "KALSHI_V2",
+                    "symbol": tkr,
+                    "qty": abs(pos_qty),
+                    "status": close_status,
+                    "exchangeOrderId": close_order_id,
+                })
+                con.execute(
+                    "INSERT INTO cleanup_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [now_utc, idempotency_key, tkr, "EVENT", abs(pos_qty), val_usd, close_status, 0.0, val_usd if close_order_id else 0.0, close_status],
+                )
 
-            net_cash_freed = round(net_cash_freed + net_freed, 2)
-            con.execute(
-                "INSERT INTO cleanup_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [now_utc, idempotency_key, sym, ptype, qty, val, action, fee, net_freed, mode],
-            )
+        # Process real Public.com dust equity positions (< $1.00)
+        for ppos in public_positions:
+            if not isinstance(ppos, dict):
+                continue
+            sym = str(ppos.get("symbol") or "").strip().upper()
+            qty = float(ppos.get("qty") or 0.0)
+            val_usd = float(ppos.get("equityUsd") or 0.0)
+            cat = str(ppos.get("category") or "EQUITY").upper()
+            if cat == "EQUITY" and 0 < val_usd < 1.00 and qty > 0:
+                if dry_run:
+                    close_status = "DRY_RUN_CANDIDATE"
+                    close_order_id = None
+                else:
+                    pub_close = await submit_public_com_order_with_retry(
+                        symbol=sym,
+                        idempotency_key=f"{idempotency_key}-dust-{sym}",
+                        instrument_type="EQUITY",
+                        order_side="SELL",
+                        order_type="MARKET",
+                        quantity=str(qty),
+                        con=con,
+                    )
+                    close_status = str(pub_close.get("status") or "VENUE_EXECUTION_FAILED")
+                    close_order_id = pub_close.get("orderId")
+                    if pub_close.get("ok") and close_order_id:
+                        swept_dust += 1
+                        net_cash_freed = round(net_cash_freed + val_usd, 2)
+                venue_actions.append({
+                    "venue": "PUBLIC_COM",
+                    "symbol": sym,
+                    "qty": qty,
+                    "status": close_status,
+                    "exchangeOrderId": close_order_id,
+                })
+                con.execute(
+                    "INSERT INTO cleanup_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [now_utc, idempotency_key, sym, "EQUITY", qty, val_usd, close_status, 0.0, val_usd if close_order_id else 0.0, close_status],
+                )
 
+        final_status = "DRY_RUN_VERIFIED" if dry_run else "LIVE_SWEEP_COMPLETED"
         response = {
-            "status": mode,
+            "ok": True,
+            "status": final_status,
             "idempotencyKey": idempotency_key,
+            "rule3CancelSweep": cancel_sweep_res,
+            "balanceReleaseConfirmed": balance_released_confirmed,
+            "remainingOpenOrdersCount": len(resting_orders),
+            "refreshedKalshiSettledCash": refreshed_kalshi_bal.get("settledCash", 0.0),
+            "publicSettledCash": pub_port.get("settledCash", 0.0),
             "sweptEquityDustCount": swept_dust,
             "trimmedStaleContractsCount": trimmed_events,
             "netCashFreedUsd": net_cash_freed,
+            "venueActions": venue_actions,
             "idempotentReplay": False,
             "dataQualityWarning": False,
-            "rationale": f"Swept {swept_dust} dust equities ($0 fee) and trimmed {trimmed_events} stale contracts, freeing +${net_cash_freed:.2f} net cash.",
+            "rationale": (
+                f"Rule 3 pre-exit sweep complete (balanceReleaseConfirmed={balance_released_confirmed}, "
+                f"remainingOpenOrders={len(resting_orders)}): swept {swept_dust} live dust equities and "
+                f"trimmed {trimmed_events} live contracts (+${net_cash_freed:.2f} freed)."
+            ),
         }
         save_idempotent_result(
             con,
@@ -5789,11 +6042,10 @@ async def train_and_optimize_meta_model(
     target_metric: str = "brier_score",
 ) -> Dict[str, Any]:
     """
-    MCP Tool #9: Queries `ml_telemetry_ledger` in DuckDB (filtered by `symbol` or across `"ALL"` 10 tracked tickers),
-    trains an in-memory Gradient Boosted Decision Stump + L2-Ridge/Logistic probability calibrator to output
-    `ml_calibrated_prob` (blended 30/70 with Black-Scholes N(d2): `0.70 * nd2_fair_prob + 0.30 * ml_calibrated_prob`),
-    and dynamically recommends optimal ATR stop-loss multipliers (`recommended_atr_stop_mult`) and Kalshi net-edge
-    thresholds (`recommended_min_net_edge`) based on realized win rates and `realized_pnl_bps`.
+    MCP Tool #9: Queries `ml_telemetry_ledger` in DuckDB strictly filtering for non-synthetic live venue rows
+    (`WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL`),
+    trains an in-memory Gradient Boosted Decision Stump + L2-Ridge/Logistic probability calibrator,
+    and persists `ml_meta_model_state` using explicit column names and parameterized bindings.
     """
     await bootstrap_ml_telemetry_from_live_candles(min_rows=max(50, min_samples))
 
@@ -5807,7 +6059,7 @@ async def train_and_optimize_meta_model(
                        kalshi_spread_bps, minutes_left, yes_ask, no_ask, net_edge_dollars,
                        sniper_action, realized_outcome, COALESCE(realized_pnl_bps, 0.0)
                 FROM ml_telemetry_ledger
-                WHERE realized_outcome IS NOT NULL AND UPPER(symbol) = ?
+                WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL AND UPPER(symbol) = ?
                 ORDER BY timestamp_utc DESC
                 LIMIT 500
                 """,
@@ -5823,13 +6075,15 @@ async def train_and_optimize_meta_model(
                        kalshi_spread_bps, minutes_left, yes_ask, no_ask, net_edge_dollars,
                        sniper_action, realized_outcome, COALESCE(realized_pnl_bps, 0.0)
                 FROM ml_telemetry_ledger
-                WHERE realized_outcome IS NOT NULL
+                WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' AND realized_outcome IS NOT NULL
                 ORDER BY timestamp_utc DESC
                 LIMIT 500
                 """
             ).fetchall()
 
-        total_rows_row = con.execute("SELECT COUNT(*) FROM ml_telemetry_ledger").fetchone()
+        total_rows_row = con.execute(
+            "SELECT COUNT(*) FROM ml_telemetry_ledger WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'"
+        ).fetchone()
         total_ledger_rows = int(total_rows_row[0]) if total_rows_row else len(rows)
 
         if len(rows) < max(5, min_samples):
@@ -5840,7 +6094,7 @@ async def train_and_optimize_meta_model(
                 "minSamplesRequired": min_samples,
                 "totalLedgerRows": total_ledger_rows,
                 "dataQualityWarning": True,
-                "rationale": f"Insufficient settled ML samples ({len(rows)} < {min_samples}) in ml_telemetry_ledger; holding prior calibration weights.",
+                "rationale": f"Insufficient live non-synthetic settled ML samples ({len(rows)} < {min_samples}) in ml_telemetry_ledger; holding prior calibration weights.",
             }
 
         X_raw: List[List[float]] = []
@@ -6036,7 +6290,23 @@ async def train_and_optimize_meta_model(
 
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         con.execute(
-            "INSERT OR REPLACE INTO ml_meta_model_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT OR REPLACE INTO ml_meta_model_state (
+                model_id,
+                trained_at,
+                target_metric,
+                samples_used,
+                brier_score_raw,
+                brier_score_calibrated,
+                log_loss_calibrated,
+                empirical_win_rate,
+                recommended_min_net_edge,
+                recommended_atr_stop_mult,
+                recommended_ask_min,
+                recommended_ask_max,
+                weights_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             [
                 trained_state["model_id"],
                 now_iso,
@@ -6094,7 +6364,7 @@ async def train_and_optimize_meta_model(
 
 
 def export_ml_telemetry_store(limit: int = 500) -> Dict[str, Any]:
-    """Exports all `ml_telemetry_ledger` rows and `ml_meta_model_state` for Google Drive Vault backup."""
+    """Exports all non-synthetic `ml_telemetry_ledger` rows and `ml_meta_model_state` for Google Drive Vault backup."""
     con = get_db_connection()
     try:
         cols = [
@@ -6103,10 +6373,10 @@ def export_ml_telemetry_store(limit: int = 500) -> Dict[str, Any]:
             "kalshi_spread_bps", "nd2_fair_prob", "net_edge_dollars", "atr_pct",
             "atr_baseline_mult", "rsi_14", "ma_spread_short_pct", "pearson_corr_regime",
             "market_regime", "sniper_action", "gate_blocked_reason",
-            "realized_pnl_bps", "realized_outcome",
+            "realized_pnl_bps", "realized_outcome", "is_synthetic", "source",
         ]
         raw_rows = con.execute(
-            f"SELECT {', '.join(cols)} FROM ml_telemetry_ledger ORDER BY timestamp_utc DESC LIMIT ?",
+            f"SELECT {', '.join(cols)} FROM ml_telemetry_ledger WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE' ORDER BY timestamp_utc DESC LIMIT ?",
             [limit],
         ).fetchall()
         records = [dict(zip(cols, r)) for r in raw_rows]
@@ -6125,12 +6395,14 @@ def export_ml_telemetry_store(limit: int = 500) -> Dict[str, Any]:
 
 
 def import_ml_telemetry_store(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Restores `ml_telemetry_ledger` rows and `ml_meta_model_state` from a Google Drive Vault snapshot."""
+    """Restores verified live `ml_telemetry_ledger` rows from a Google Drive Vault snapshot."""
     rows = payload.get("rows", [])
     con = get_db_connection()
     inserted = 0
     try:
         for r in rows:
+            if bool(r.get("is_synthetic", False)) or str(r.get("source", "LIVE_VENUE")) != "LIVE_VENUE":
+                continue
             sym = str(r.get("symbol", "KXBTC15M")).upper()
             spot = float(r.get("spot_price") or r.get("coinbase_spot") or 0.0)
             con.execute(
@@ -6141,8 +6413,8 @@ def import_ml_telemetry_store(payload: Dict[str, Any]) -> Dict[str, Any]:
                     kalshi_spread_bps, nd2_fair_prob, net_edge_dollars, atr_pct,
                     atr_baseline_mult, rsi_14, ma_spread_short_pct, pearson_corr_regime,
                     market_regime, sniper_action, gate_blocked_reason,
-                    realized_pnl_bps, realized_outcome
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    realized_pnl_bps, realized_outcome, is_synthetic, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     r.get("timestamp_utc"),
@@ -6169,6 +6441,8 @@ def import_ml_telemetry_store(payload: Dict[str, Any]) -> Dict[str, Any]:
                     r.get("gate_blocked_reason", "RESTORED_FROM_DRIVE"),
                     r.get("realized_pnl_bps", 0.0),
                     r.get("realized_outcome"),
+                    False,
+                    "LIVE_VENUE",
                 ],
             )
             inserted += 1
@@ -6207,26 +6481,53 @@ AUTHORIZED_POSTGRES_TABLES: Dict[str, set] = {
 @mcp.tool()
 async def get_portfolio_state(forceRefresh: bool = False) -> Dict[str, Any]:
     """
-    Phase 1 Initialization MCP tool. Hydrates multi-venue net liquidation value (Coinbase, Kalshi, Polymarket),
-    active venue balances, single-asset NLV exposure %, and intraday drawdown in basis points.
+    Phase 1 Initialization MCP tool. Hydrates live multi-venue net liquidation value and settled cash
+    directly from Kalshi V2 and Public.com v2 endpoints.
+    Zero hardcoded constants: if live venue balance fetches fail, returns settledCash=0 and status="BALANCE_UNVERIFIED_BLOCK".
     """
     kalshi_state = await get_kalshi_live_balance(forceRefresh=forceRefresh, includeFills=True)
     pub_state = await get_public_brokerage_portfolio(includePositions=True)
-    combined_nlv = float(pub_state.get("combinedMultiVenueEquityUsd") or 555.81)
-    single_asset_exp_pct = round((58.0 / max(1.0, combined_nlv)) * 100.0, 2)
-    drawdown_bps = 18
+    kalshi_ok = bool(kalshi_state.get("ok"))
+    pub_ok = bool(pub_state.get("ok"))
+    if not kalshi_ok and not pub_ok:
+        return {
+            "ok": False,
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "settledCash": 0.0,
+            "combinedNlvUsd": 0.0,
+            "kalshiCashBalanceUsd": 0.0,
+            "publicTotalEquityUsd": 0.0,
+            "singleAssetExposurePct": 0.0,
+            "portfolioDrawdownBps": 0,
+            "riskStatus": "CRITICAL_BREACH",
+            "dataQualityWarning": True,
+            "rationale": "BALANCE_UNVERIFIED_BLOCK: Live Kalshi and Public.com balance endpoints failed verification; settledCash forced to 0.00.",
+        }
+
+    kalshi_cash = float(kalshi_state.get("settledCash") or 0.0) if kalshi_ok else 0.0
+    kalshi_eq = float(kalshi_state.get("totalKalshiEquityUsd") or 0.0) if kalshi_ok else 0.0
+    pub_cash = float(pub_state.get("settledCash") or 0.0) if pub_ok else 0.0
+    pub_eq = float(pub_state.get("totalEquityUsd") or 0.0) if pub_ok else 0.0
+    combined_settled_cash = round(kalshi_cash + pub_cash, 2)
+    combined_nlv = round(kalshi_eq + pub_eq, 2)
+    pub_positions = pub_state.get("positions") if isinstance(pub_state.get("positions"), list) else []
+    max_pos_usd = max([float(p.get("equityUsd") or 0.0) for p in pub_positions] + [0.0])
+    single_asset_exp_pct = round((max_pos_usd / max(1.0, combined_nlv)) * 100.0, 2) if combined_nlv > 0 else 0.0
+    drawdown_bps = 0
     return {
+        "ok": True,
         "status": "HYDRATED",
+        "settledCash": combined_settled_cash,
         "combinedNlvUsd": combined_nlv,
-        "kalshiCashBalanceUsd": kalshi_state.get("cashBalanceUsd", 199.26),
-        "publicTotalEquityUsd": pub_state.get("totalEquityUsd", 346.56),
+        "kalshiCashBalanceUsd": kalshi_cash,
+        "publicTotalEquityUsd": pub_eq,
         "singleAssetExposurePct": single_asset_exp_pct,
         "portfolioDrawdownBps": drawdown_bps,
         "riskStatus": "NOMINAL" if single_asset_exp_pct <= 12.0 and drawdown_bps < 250 else "CRITICAL_BREACH",
         "dataQualityWarning": False,
         "rationale": (
-            f"Hydrated multi-venue NLV ${combined_nlv:.2f}: max single-asset exposure "
-            f"{single_asset_exp_pct:.2f}% (<=12.0% cap), intraday drawdown {drawdown_bps} bps (<250 bps)."
+            f"Hydrated live multi-venue NLV ${combined_nlv:.2f} (settledCash=${combined_settled_cash:.2f}): "
+            f"max single-asset exposure {single_asset_exp_pct:.2f}% (<=12.0% cap)."
         ),
     }
 
@@ -6247,12 +6548,12 @@ async def check_mcp_venue_health(simulateSeqDesync: bool = False) -> Dict[str, A
         "websocketSeqSynchronized": not dq_warn,
         "clockDriftMs": drift_ms,
         "maxObservedLatencyMs": latency_ms,
-        "coinbaseSpotUsd": spot.get("price", 84250.0),
+        "coinbaseSpotUsd": spot.get("price", 0.0),
         "dataQualityWarning": dq_warn,
         "rationale": (
             f"WebSocket seq/clock desync (drift {drift_ms}ms, latency {latency_ms}ms > 3000ms); posture locked to ABORTED."
             if dq_warn
-            else f"All 3 venue feeds synchronized: Coinbase BTC-USD ${spot.get('price', 84250.0):,.2f} ({latency_ms}ms < 1500ms ceiling)."
+            else f"All 3 venue feeds synchronized: Coinbase BTC-USD ${spot.get('price', 0.0):,.2f} ({latency_ms}ms < 1500ms ceiling)."
         ),
     }
 
@@ -6369,40 +6670,109 @@ async def propose_or_execute_strategy(
     price_dollars: float = 0.58,
     p_true: float = 0.645,
     p_eff: float = 0.58,
+    active_positions: Optional[List[Dict[str, Any]]] = None,
+    correlation_matrix: Optional[Dict[str, Dict[str, float]]] = None,
+    atr_dollar: float = 0.0778,
 ) -> Dict[str, Any]:
     """
-    Phase 3 Mutating Execution MCP tool. Sizes positions via Fractional Half-Kelly
-    0.5 * ((p_true - p_eff) / (1 - p_eff)) strictly capped at 12% single-asset NLV.
+    Phase 3 Mutating Execution MCP tool (100% Live Execution Only).
+    Queries live Kalshi settled cash (`get_kalshi_live_balance`), enforces ExecutionVault Rule 1 (3% settled-cash cap)
+    and TASK-08 `evaluate_portfolio_correlation_and_cap` (3.5% 15m drawdown cap), and routes exclusively through the
+    live Kalshi V2 `/portfolio/events/orders` API.
     """
+    live_bal = await get_kalshi_live_balance(forceRefresh=True)
+    settled_cash = float(live_bal.get("settledCash") or 0.0)
+    if not live_bal.get("ok") or live_bal.get("status") == "BALANCE_UNVERIFIED_BLOCK" or settled_cash <= 0:
+        return {
+            "ok": False,
+            "status": "BALANCE_UNVERIFIED_BLOCK",
+            "settledCash": 0.0,
+            "idempotency_key": idempotency_key,
+            "ticker": ticker,
+            "dataQualityWarning": True,
+            "rationale": str(live_bal.get("rationale") or "BALANCE_UNVERIFIED_BLOCK: Live settled cash unverified; execution blocked."),
+        }
+
     raw_kelly = max(0.0, (p_true - p_eff) / max(0.01, 1.0 - p_eff))
     half_kelly = 0.5 * raw_kelly
-    applied_fraction = min(half_kelly, 0.12)
-    nlv_usd = 555.81
-    notional_usd = round(nlv_usd * applied_fraction, 2)
-    contracts = max(1, int(notional_usd / max(0.05, p_eff)))
+    applied_fraction = min(half_kelly, 0.03)
+    requested_notional_usd = round(settled_cash * applied_fraction, 2)
+    corr_guard = evaluate_portfolio_correlation_and_cap(
+        settled_cash=settled_cash,
+        active_positions=active_positions or [],
+        candidate={
+            "symbol": ticker.upper().strip(),
+            "requestedNotionalUsd": requested_notional_usd,
+            "ask": price_dollars,
+            "atrDollar": atr_dollar,
+        },
+        correlation_matrix=correlation_matrix,
+    )
+    if not corr_guard.get("allowed"):
+        return {
+            "ok": False,
+            "status": "PORTFOLIO_CORRELATION_BLOCKED",
+            "idempotency_key": idempotency_key,
+            "ticker": ticker,
+            "settledCash": settled_cash,
+            "portfolioCorrelationGuard": corr_guard,
+            "dataQualityWarning": False,
+            "rationale": str(corr_guard.get("reason")),
+        }
+
+    contracts = int(corr_guard["approvedContracts"])
+    notional_usd = float(corr_guard["approvedNotionalUsd"])
     is_post_only = conviction_tier == "MODERATE" or execution_mode == "MAKER_POST_ONLY"
+    con = get_db_connection()
+    try:
+        v2_res = await submit_kalshi_v2_events_order(
+            ticker=ticker,
+            idempotency_key=idempotency_key,
+            side="BUY_YES",
+            contracts=contracts,
+            desired_price_dollars=price_dollars,
+            post_only=is_post_only,
+            reduce_only=False,
+            time_in_force="good_till_canceled" if is_post_only else "immediate_or_cancel",
+            cancel_order_on_pause=True,
+            con=con,
+        )
+    finally:
+        con.close()
+
+    exchange_order_id = str(v2_res.get("exchange_order_id") or "").strip()
+    if not v2_res.get("ok") or not exchange_order_id:
+        return {
+            "ok": False,
+            "status": "VENUE_EXECUTION_FAILED",
+            "idempotency_key": idempotency_key,
+            "client_order_id": v2_res.get("client_order_id"),
+            "exchange_order_id": None,
+            "ticker": ticker,
+            "settledCash": settled_cash,
+            "portfolioCorrelationGuard": corr_guard,
+            "dataQualityWarning": True,
+            "rationale": str(v2_res.get("error") or "Venue API failed; no mock fill permitted."),
+        }
+
     return {
-        "status": "EXECUTED_V2_STRATEGY",
+        "ok": True,
+        "status": str(v2_res.get("status") or "RESTING"),
         "idempotency_key": idempotency_key,
-        "client_order_id": client_order_id or f"v2-{idempotency_key[:12]}",
+        "client_order_id": v2_res.get("client_order_id"),
+        "exchange_order_id": exchange_order_id,
         "ticker": ticker,
+        "settledCash": settled_cash,
+        "portfolioCorrelationGuard": corr_guard,
         "conviction_tier": conviction_tier,
         "execution_mode": "MAKER_POST_ONLY" if is_post_only else "TAKER_LIMIT",
-        "v2_order_payload": {
-            "ticker": ticker,
-            "price_dollars": f"{price_dollars:.2f}",
-            "count": contracts,
-            "post_only": is_post_only,
-            "time_in_force": "good_till_canceled" if is_post_only else "immediate_or_cancel",
-            "cancel_order_on_pause": True,
-        },
         "half_kelly_fraction": round(half_kelly, 4),
         "applied_nlv_fraction": round(applied_fraction, 4),
         "recommended_notional_usd": notional_usd,
         "dataQualityWarning": False,
         "rationale": (
-            f"Routed {'MAKER_POST_ONLY' if is_post_only else 'TAKER_LIMIT'} on {ticker} "
-            f"({contracts} contracts @ ${price_dollars:.2f}, Half-Kelly {applied_fraction * 100:.2f}% NLV <= 12.0% cap)."
+            f"Live order {exchange_order_id} placed on {ticker} "
+            f"({contracts} contracts @ ${price_dollars:.2f}, approvedNotional=${notional_usd:.2f} <= 3.0% settled cash)."
         ),
     }
 
@@ -6415,18 +6785,22 @@ async def execute_risk_mitigation(
     cancel_all_orders: bool = True,
 ) -> Dict[str, Any]:
     """
-    Phase 3 Mutating Capital Preservation MCP tool. Immediately invoked on CRITICAL RISK BREACH
-    (>12% single-asset NLV or >=250 bps intraday drawdown) to execute Kalshi V2 Cancel All Orders and reduce_only scaling.
+    Phase 3 Mutating Capital Preservation MCP tool (100% Live Execution Only).
+    Executes live Kalshi V2 `cancel_all_kalshi_v2_orders` pre-exit sweep and confirms resting order status.
     """
+    cancel_res = await cancel_all_kalshi_v2_orders(reason=f"{breach_reason} ({idempotency_key})") if cancel_all_orders else None
+    live_bal = await get_kalshi_live_balance(forceRefresh=True)
     return {
-        "status": "RISK_MITIGATION_EXECUTED",
+        "ok": bool(cancel_res and cancel_res.get("ok")),
+        "status": "RISK_MITIGATION_EXECUTED" if (cancel_res and cancel_res.get("ok")) else "VENUE_CANCEL_SWEEP_ATTEMPTED",
         "idempotency_key": idempotency_key,
         "breach_reason": breach_reason,
         "reduce_only": reduce_only,
         "cancel_all_orders": cancel_all_orders,
-        "post_mitigation_nlv_pct": 11.5,
-        "dataQualityWarning": False,
-        "rationale": "Executed Kalshi V2 Cancel All Orders and reduce_only position scaling to 11.5% NLV (<=12.0% cap).",
+        "cancelAllResult": cancel_res,
+        "settledCash": float(live_bal.get("settledCash") or 0.0),
+        "dataQualityWarning": not bool(live_bal.get("ok")),
+        "rationale": f"Executed live Kalshi V2 Cancel All Orders sweep for breach: {breach_reason}.",
     }
 
 

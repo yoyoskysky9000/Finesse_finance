@@ -385,15 +385,28 @@ async function runSmokeSuite() {
     );
 
     // -------------------------------------------------------------------------
-    // TASK-04 Smoke Test (f): Champion Config 2.5.0-UNIFIED-CHAMPION thresholds (consolidated from strategy_params.json)
+    // TASK-04 / TASK-08 Smoke Test (f): Champion Config 2.6.0-PORTFOLIO-GUARD-CHAMPION thresholds
     // -------------------------------------------------------------------------
     const {
       executionVault,
+      evaluatePortfolioCorrelationAndCap,
+      getLossFraction,
       evaluateRegimeAndLiquidity,
       evaluateChampionExitSignal,
       CHAMPION_CONFIG,
     } = await import('../server');
-    assert.equal(CHAMPION_CONFIG.champion_id, '2.5.0-UNIFIED-CHAMPION');
+    assert.equal(CHAMPION_CONFIG.champion_id, '2.6.0-PORTFOLIO-GUARD-CHAMPION');
+    assert.equal(CHAMPION_CONFIG.portfolio_correlation_rules.per_position_settled_cash_cap_pct, 0.03);
+    assert.equal(CHAMPION_CONFIG.portfolio_correlation_rules.max_aggregate_drawdown_pct_15m, 0.035);
+    assert.equal(
+      CHAMPION_CONFIG.portfolio_correlation_rules.max_aggregate_notional_pct_at_reference,
+      0.1105263158
+    );
+    assert.equal(
+      CHAMPION_CONFIG.portfolio_correlation_rules.correlation_stress_model,
+      'MAX_PAIRWISE_LINEAR'
+    );
+    assert.equal(CHAMPION_CONFIG.portfolio_correlation_rules.unknown_correlation_default, 1.0);
     assert.equal(CHAMPION_CONFIG.active_strategy.entry.drag_floor_usd, 0.12);
     assert.equal(
       CHAMPION_CONFIG.active_strategy.entry.min_edge_floor_usd,
@@ -624,7 +637,7 @@ async function runSmokeSuite() {
     assert.equal(forcedFlat.reason, 'FORCED_FLAT_T_MINUS_90S');
 
     console.log(
-      'PASS [TASK-04 Tests (f)-(j)]: Champion 2.5.0 config, Regime/LHS filter, ExecutionVault Rules 1-3, and Champion exits passed.'
+      'PASS [TASK-04 Tests (f)-(j)]: Champion 2.6.0 config, Regime/LHS filter, ExecutionVault Rules 1-3, and Champion exits passed.'
     );
 
     // -------------------------------------------------------------------------
@@ -826,7 +839,319 @@ async function runSmokeSuite() {
       'PASS [Fix D]: Deterministic SHA-256 fallback deduplicates keyless calls and both idempotency stores survive simulated restarts.'
     );
 
-    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) PASSED.');
+    // -------------------------------------------------------------------------
+    // TASK-08 / 2.6.0-PORTFOLIO-GUARD-CHAMPION Tests:
+    //   1. PortfolioCorrelationGuard (lossFraction, duplicate symbol, negative/missing rho,
+    //      stressMultiplier, 3.5% aggregate cap, lot rounding)
+    //   2. Telemetry Completeness Gate (UNVERIFIED_MICROSTRUCTURE_TELEMETRY)
+    //   3. Post-lock -> Pre-exchange execution ordering in ExecutionVault + /api/agents/execute-trade
+    // -------------------------------------------------------------------------
+    // (1) Exact lossFraction formula
+    assert(
+      Math.abs(getLossFraction(0.60, 0.05) - (0.07 + 0.12) / 0.60) < 1e-12,
+      'lossFraction floor should use max(0.07, 0.9*atr) + 0.12'
+    );
+    assert(
+      Math.abs(getLossFraction(0.60, 0.10) - (0.09 + 0.12) / 0.60) < 1e-12,
+      'lossFraction ATR branch should use 0.9*atr + 0.12'
+    );
+
+    // (2) Immediate rejection if candidate.symbol already exists in activePositions
+    const dupSymbolGuard = evaluatePortfolioCorrelationAndCap({
+      settledCash: 1000,
+      activePositions: [{ symbol: 'kxbtc15m', notionalUsd: 10, ask: 0.60, atrDollar: 0.05 }],
+      candidate: { symbol: 'KXBTC15M', requestedNotionalUsd: 10, ask: 0.60, atrDollar: 0.05 },
+      correlationMatrix: {},
+    });
+    assert.equal(dupSymbolGuard.allowed, false);
+    assert(dupSymbolGuard.reason.startsWith('DUPLICATE_ACTIVE_SYMBOL'));
+
+    // (3) Negative correlation clamped to 0; allows up to min(requested, 3% settledCash, remaining risk)
+    const negCorrGuard = evaluatePortfolioCorrelationAndCap({
+      settledCash: 1000, // 3% cap = 30, 3.5% maxRisk = 35
+      activePositions: [{ symbol: 'KXBTC15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 }], // existingRisk = 30 * (0.19/0.60) = 9.50
+      candidate: { symbol: 'KXSOL15M', requestedNotionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+      correlationMatrix: { KXBTC15M: { KXSOL15M: -0.45 } },
+      lotSizeUsd: 0.60,
+    });
+    assert.equal(negCorrGuard.allowed, true);
+    assert.equal(negCorrGuard.maxRho, 0);
+    assert.equal(negCorrGuard.stressMultiplier, 1);
+    assert.equal(negCorrGuard.correlationPenalty, 1);
+    assert.equal(negCorrGuard.approvedNotionalUsd, 30);
+
+    // (4) Missing correlation pair defaults to 1.0 -> doubles stressMultiplier for 2 positions & enforces lot floor
+    const missingCorrGuard = evaluatePortfolioCorrelationAndCap({
+      settledCash: 1000, // maxRisk = 35; with stress=2 -> 35/2 = 17.50
+      activePositions: [{ symbol: 'KXBTC15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 }], // existingRisk = 9.50
+      candidate: { symbol: 'KXETH15M', requestedNotionalUsd: 30, ask: 0.60, atrDollar: 0.05 }, // availableRisk = 8.00 -> raw = 25.263 -> floor to $0.60 lot = $25.20
+      correlationMatrix: {},
+      lotSizeUsd: 0.60,
+    });
+    assert.equal(missingCorrGuard.allowed, true);
+    assert.equal(missingCorrGuard.maxRho, 1.0);
+    assert.equal(missingCorrGuard.stressMultiplier, 2.0);
+    assert.equal(missingCorrGuard.correlationPenalty, 0.5);
+    assert.equal(missingCorrGuard.approvedNotionalUsd, 25.2);
+    assert.equal(missingCorrGuard.approvedContracts, 42);
+    assert(missingCorrGuard.adjustedRiskUsd <= missingCorrGuard.maxRiskUsd);
+
+    // (5) High correlation + already exhausted risk budget -> blocked (approvedNotionalUsd <= 0)
+    const blockedCorrGuard = evaluatePortfolioCorrelationAndCap({
+      settledCash: 1000, // maxRisk = 35
+      activePositions: [
+        { symbol: 'KXBTC15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+        { symbol: 'KXETH15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+      ], // existingRisk = 19.00; with 3 positions & rho=0.8 -> stress = 1 + 0.8*2 = 2.6 -> 35/2.6 = 13.46 < 19.00
+      candidate: { symbol: 'KXSOL15M', requestedNotionalUsd: 10, ask: 0.60, atrDollar: 0.05 },
+      correlationMatrix: {
+        KXBTC15M: { KXETH15M: 0.8, KXSOL15M: 0.7 },
+        KXETH15M: { KXSOL15M: 0.6 },
+      },
+    });
+    assert.equal(blockedCorrGuard.allowed, false);
+    assert.equal(blockedCorrGuard.approvedNotionalUsd, 0);
+
+    // (6) Telemetry Completeness Gate: 24h snapshot or missing CHOP/ADX/LHS blocks with UNVERIFIED_MICROSTRUCTURE_TELEMETRY
+    executionVault.clearLocksForTests();
+    let routeCallbackCount = 0;
+    const unverified24h = await executionVault.executeEntryWithPortfolioGuard({
+      regimeAndLiquidity: {
+        timeframe: '15m',
+        askPriceUsd: 0.58,
+        bestBidUsd: 0.56,
+        bestAskUsd: 0.58,
+        fairValueUsd: 0.90,
+        atr14Usd: 0.04,
+        minutesRemaining: 8.5,
+        bboDepthUsd: 6200,
+        obiSamples: healthyObi,
+        nowMs,
+        is24hTickerSnapshot: true,
+        metricsOverride: {
+          chop14: 44.2,
+          adx: 29.5,
+          kaufmanEr10: 0.42,
+          bbwPercentile125: 0.45,
+          atrRatioPercentile125: 0.38,
+          garmanKlassVrpPercentile: 0.62,
+        },
+      },
+      sizing: { riskAmountUsd: 10, stopLossDistanceUsd: 0.1, settledCashUsd: 1000, unitPriceUsd: 0.58 },
+      idempotency: {
+        symbol: 'KXBTC15M-TELEM',
+        side: 'BUY_YES',
+        strategyId: 'BTC_LEAD_LAG_SNIPER',
+        timeframe: '15m',
+        timestampMs: nowMs,
+      },
+      routeOrderToExchange: async () => {
+        routeCallbackCount += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(unverified24h.approved, false);
+    assert.equal(unverified24h.reason, 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY');
+    assert.equal(routeCallbackCount, 0);
+
+    const missingChopOrLhs = executionVault.verifyMicrostructureTelemetry({
+      timeframe: '15m',
+      askPriceUsd: 0.58,
+      bestBidUsd: 0.56,
+      bestAskUsd: 0.58,
+      fairValueUsd: 0.90,
+      atr14Usd: 0.04,
+      minutesRemaining: 8.5,
+      bboDepthUsd: 6200,
+      obiSamples: [], // Missing live OBI/LHS samples
+      nowMs,
+    });
+    assert.equal(missingChopOrLhs.verified, false);
+    assert.equal(missingChopOrLhs.reason, 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY');
+
+    // (7) Post-lock, pre-exchange execution ordering in ExecutionVault
+    executionVault.clearLocksForTests();
+    const lockedThenBlocked = await executionVault.executeEntryWithPortfolioGuard({
+      regimeAndLiquidity: {
+        timeframe: '15m',
+        askPriceUsd: 0.58,
+        bestBidUsd: 0.56,
+        bestAskUsd: 0.58,
+        fairValueUsd: 0.90,
+        atr14Usd: 0.04,
+        minutesRemaining: 8.5,
+        bboDepthUsd: 6200,
+        obiSamples: healthyObi,
+        nowMs,
+        metricsOverride: {
+          chop14: 44.2,
+          adx: 29.5,
+          kaufmanEr10: 0.42,
+          bbwPercentile125: 0.45,
+          atrRatioPercentile125: 0.38,
+          garmanKlassVrpPercentile: 0.62,
+        },
+      },
+      sizing: { riskAmountUsd: 15, stopLossDistanceUsd: 0.5, settledCashUsd: 1000, unitPriceUsd: 0.58 },
+      idempotency: {
+        symbol: 'KXSOL15M-LOCKFIRST',
+        side: 'BUY_YES',
+        strategyId: 'BTC_LEAD_LAG_SNIPER',
+        timeframe: '15m',
+        timestampMs: nowMs,
+      },
+      portfolioCorrelation: {
+        activePositions: [
+          { symbol: 'KXBTC15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+          { symbol: 'KXETH15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+        ],
+        correlationMatrix: {
+          KXBTC15M: { KXETH15M: 0.9, 'KXSOL15M-LOCKFIRST': 0.9 },
+          KXETH15M: { 'KXSOL15M-LOCKFIRST': 0.9 },
+        },
+        requestedNotionalUsd: 17.4,
+      },
+      routeOrderToExchange: async () => {
+        routeCallbackCount += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(lockedThenBlocked.approved, false);
+    assert.equal(routeCallbackCount, 0, 'Exchange callback must NOT be invoked when correlation guard blocks');
+    assert.equal(lockedThenBlocked.validation.lockResult?.allowed, true, 'Idempotency lock must execute before correlation guard');
+    const recentVaultAudit = executionVault.getAuditLog();
+    assert.equal(recentVaultAudit[0].rule, 'PORTFOLIO_CORRELATION_GUARD');
+    assert.equal(recentVaultAudit[0].outcome, 'REJECTED');
+    assert.equal(recentVaultAudit[1].rule, 'RULE_2_IDEMPOTENCY_LOCK');
+    assert.equal(recentVaultAudit[1].outcome, 'APPROVED');
+
+    // (8) Approved execution forwards correlation-capped notional to exchange callback
+    executionVault.clearLocksForTests();
+    let forwardedNotional = 0;
+    const approvedEntry = await executionVault.executeEntryWithPortfolioGuard({
+      regimeAndLiquidity: {
+        timeframe: '15m',
+        askPriceUsd: 0.60,
+        bestBidUsd: 0.58,
+        bestAskUsd: 0.60,
+        fairValueUsd: 0.92,
+        atr14Usd: 0.04,
+        minutesRemaining: 8.5,
+        bboDepthUsd: 6200,
+        obiSamples: healthyObi,
+        nowMs,
+        metricsOverride: {
+          chop14: 44.2,
+          adx: 29.5,
+          kaufmanEr10: 0.42,
+          bbwPercentile125: 0.45,
+          atrRatioPercentile125: 0.38,
+          garmanKlassVrpPercentile: 0.62,
+        },
+      },
+      sizing: { riskAmountUsd: 18, stopLossDistanceUsd: 0.6, settledCashUsd: 1000, unitPriceUsd: 0.60 },
+      idempotency: {
+        symbol: 'KXETH15M-APPROVED',
+        side: 'BUY_YES',
+        strategyId: 'BTC_LEAD_LAG_SNIPER',
+        timeframe: '15m',
+        timestampMs: nowMs,
+      },
+      portfolioCorrelation: {
+        activePositions: [{ symbol: 'KXBTC15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 }],
+        correlationMatrix: {}, // Unknown rho=1.0 -> stress=2.0 -> cap $25.20 @ $0.60 lot
+        requestedNotionalUsd: 30,
+        lotSizeUsd: 0.60,
+      },
+      routeOrderToExchange: async (approvedUsd) => {
+        routeCallbackCount += 1;
+        forwardedNotional = approvedUsd;
+        return { orderId: 'ord-guard-approved-1' };
+      },
+    });
+    assert.equal(approvedEntry.approved, true);
+    assert.equal(routeCallbackCount, 1);
+    assert.equal(forwardedNotional, 25.2);
+
+    // (9) HTTP /api/agents/execute-trade Telemetry + PortfolioCorrelationGuard pre-venue rejection
+    setTestLiveCashBalances({
+      kalshiCashUsd: 1000,
+      publicCashUsd: 1000,
+      publicBuyingPowerUsd: 1000,
+      publicCashOnlyBuyingPowerUsd: 1000,
+    });
+    targetAgent.riskGovernance.maxPositionNotionalUsd = 100;
+    resetVenueOrderSubmissionCount();
+
+    const httpTelemetryBlockRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: targetAgent.id,
+        idempotencyKey: 'smoke-260-telem-block-001',
+        notionalUsd: 10,
+        enforceTelemetryGate: true,
+        is24hTickerSnapshot: true,
+      }),
+    });
+    assert.equal(httpTelemetryBlockRes.status, 400);
+    const httpTelemetryBody = (await httpTelemetryBlockRes.json()) as Record<string, any>;
+    assert.equal(httpTelemetryBody.code, 'UNVERIFIED_MICROSTRUCTURE_TELEMETRY');
+    assert.equal(serverMod.venueOrderSubmissionCount, 0);
+
+    const httpCorrBlockRes = await fetch(`${baseUrl}/api/agents/execute-trade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer valid-test-operator-token',
+      },
+      body: JSON.stringify({
+        agentId: targetAgent.id,
+        idempotencyKey: 'smoke-260-corr-block-001',
+        notionalUsd: 15,
+        enforcePortfolioCorrelationGuard: true,
+        activePositions: [
+          { symbol: 'KXETH15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+          { symbol: 'KXSOL15M', notionalUsd: 30, ask: 0.60, atrDollar: 0.05 },
+        ],
+      }),
+    });
+    assert.equal(httpCorrBlockRes.status, 400);
+    const httpCorrBody = (await httpCorrBlockRes.json()) as Record<string, any>;
+    assert.equal(httpCorrBody.code, 'PORTFOLIO_CORRELATION_BLOCKED');
+    assert.equal(serverMod.venueOrderSubmissionCount, 0);
+    assert.equal(blockedCorrGuard.maxPairwiseRho, 0.8);
+
+    // (10) Verify mcp_server.py 100% live-production wiring invariants (Part 1 & Part 2)
+    const mcpSource = fs.readFileSync(path.resolve(process.cwd(), 'mcp_server.py'), 'utf-8');
+    assert(!mcpSource.includes('625.35'), 'mcp_server.py must not contain hardcoded $625.35 balance');
+    assert(!mcpSource.includes('435.08'), 'mcp_server.py must not contain hardcoded $435.08 cash');
+    assert(!mcpSource.includes('459.34'), 'mcp_server.py must not contain hardcoded $459.34 cash');
+    assert(!mcpSource.includes('555.81'), 'mcp_server.py must not contain hardcoded $555.81 NLV');
+    assert(!mcpSource.includes('PORTFOLIO_SNAPSHOT: List'), 'mcp_server.py must not contain hardcoded PORTFOLIO_SNAPSHOT');
+    assert(!mcpSource.includes('PAPER_LOGGED_BY_GATE_3'), 'mcp_server.py must not contain simulated PAPER_LOGGED_BY_GATE_3 state');
+    assert(mcpSource.includes('BALANCE_UNVERIFIED_BLOCK'), 'mcp_server.py must return BALANCE_UNVERIFIED_BLOCK when live balance verification fails');
+    assert(
+      mcpSource.includes('INSERT OR REPLACE INTO ml_meta_model_state (\n                model_id,'),
+      'mcp_server.py must use explicit column names on INSERT INTO ml_meta_model_state'
+    );
+    assert(
+      mcpSource.includes("WHERE is_synthetic = FALSE AND source = 'LIVE_VENUE'"),
+      'mcp_server.py must filter ML training queries with WHERE is_synthetic = FALSE AND source = \'LIVE_VENUE\''
+    );
+    assert(
+      mcpSource.includes('def evaluate_portfolio_correlation_and_cap('),
+      'mcp_server.py must enforce evaluate_portfolio_correlation_and_cap'
+    );
+
+    console.log(
+      'PASS [TASK-08 / 2.6.0-PORTFOLIO-GUARD-CHAMPION]: PortfolioCorrelationGuard, Telemetry Completeness Gate, mcp_server.py 100% live wiring, and post-lock pre-exchange ordering passed.'
+    );
+
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + MCP LIVE WIRING PASSED.');
   } finally {
     setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);

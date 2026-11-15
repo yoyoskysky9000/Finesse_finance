@@ -1,18 +1,20 @@
 {
-  "schema_version": "2.5.0",
-  "champion_id": "2.5.0-UNIFIED-CHAMPION",
-  "updated_at": "2026-11-13T18:30:00-08:00",
+  "schema_version": "2.6.0",
+  "champion_id": "2.6.0-PORTFOLIO-GUARD-CHAMPION",
+  "updated_at": "2026-11-14T12:24:12-08:00",
   "updated_by": "agent-06-lead-builder",
   "source_params_file": "strategy_params.json",
   "lineage": [
     "TASK-02: Agent 01 Deep Research on Regime & Liquidity Filters",
     "TASK-03A: Agent 03 Muse/Brill Calibration",
     "TASK-03B: Agent 04 2x Fee/Slippage Stress Test",
-    "TASK-04: Agent 06 Champion Config Promotion & Execution Vault Upgrade"
+    "TASK-04: Agent 06 Champion Config Promotion & Execution Vault Upgrade",
+    "TASK-08: Agent 04 Multi-Position Correlation & Portfolio Drawdown Stress-Test + Live OKX Telemetry Gate",
+    "TASK-09: Agent 06 2.6.0-PORTFOLIO-GUARD-CHAMPION Upgrade"
   ],
   "active_strategy": {
     "id": "BTC_LEAD_LAG_SNIPER",
-    "label": "2.5.0 Unified Champion · Regime + LHS + Post-Mortem Vault",
+    "label": "2.6.0 Portfolio Guard Champion · Correlation Stress + Telemetry Gate + Vault",
     "timeframe": "15m",
     "execution_mode": "MAKER_POST_ONLY",
     "params_ref": "strategy_params.json#btcLeadLagSniper",
@@ -45,7 +47,6 @@
       "min_lhs_threshold": 0.65
     },
     "exit_rules": {
-      "take_profit_formula": "max(0.16, 2.5 * atr14_usd) OR (FV - bid <= 0.03)",
       "take_profit_floor_usd": 0.16,
       "take_profit_atr_mult": 2.5,
       "take_profit_fv_bid_gap_max_usd": 0.03,
@@ -58,8 +59,16 @@
       "stop_loss_consecutive_15s_confirmations": 2,
       "dead_trade_time_stop_minutes": 6.0,
       "dead_trade_min_pnl_atr_mult": 0.3,
-      "forced_flat_seconds_before_expiry": 90
+      "forced_flat_seconds_before_expiry": 90,
+      "take_profit_formula": "max(0.16, 2.5 * atr14_usd) OR (FV - bid <= 0.03)"
     }
+  },
+  "portfolio_correlation_rules": {
+    "per_position_settled_cash_cap_pct": 0.03,
+    "max_aggregate_drawdown_pct_15m": 0.035,
+    "max_aggregate_notional_pct_at_reference": 0.1105263158,
+    "correlation_stress_model": "MAX_PAIRWISE_LINEAR",
+    "unknown_correlation_default": 1.0
   },
   "risk_caps": {
     "sizing_basis": "SETTLED_AVAILABLE_CASH_ONLY",
