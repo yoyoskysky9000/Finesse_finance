@@ -31,6 +31,7 @@ export interface PortfolioCorrelationGuardResult {
   allowed: boolean;
   reason: string;
   approvedNotionalUsd: number;
+  capCeilingUsd: number;
   approvedContracts: number;
   requestedNotionalUsd: number;
   perPositionCapUsd: number;
@@ -164,6 +165,7 @@ export function evaluatePortfolioCorrelationAndCap(
       allowed: false,
       reason: `DUPLICATE_ACTIVE_SYMBOL: ${normCandidateSymbol} already exists in activePositions.`,
       approvedNotionalUsd: 0,
+      capCeilingUsd: 0,
       approvedContracts: 0,
       requestedNotionalUsd,
       perPositionCapUsd,
@@ -192,6 +194,7 @@ export function evaluatePortfolioCorrelationAndCap(
           ? 'INVALID_CANDIDATE_ASK_PRICE'
           : 'INVALID_REQUESTED_NOTIONAL',
       approvedNotionalUsd: 0,
+      capCeilingUsd: 0,
       approvedContracts: 0,
       requestedNotionalUsd,
       perPositionCapUsd,
@@ -248,14 +251,15 @@ export function evaluatePortfolioCorrelationAndCap(
     perPositionCapUsd,
     availableCandidateRiskUsd / candidateLossFraction
   );
+  const capCeilingUsd = Number(Math.max(0, rawApprovedNotionalUsd).toFixed(4));
 
   const lotStep = resolveExchangeLotStep(input);
   const roundedDownNotionalUsd = Number(
     (Math.floor(Math.max(0, rawApprovedNotionalUsd) / lotStep + 1e-9) * lotStep).toFixed(6)
   );
-  const approvedNotionalUsd = Number(Math.max(0, roundedDownNotionalUsd).toFixed(4));
   const approvedContracts =
-    candidate.ask > 0 ? Math.floor((approvedNotionalUsd + 1e-9) / candidate.ask) : 0;
+    candidate.ask > 0 ? Math.floor((Math.max(0, roundedDownNotionalUsd) + 1e-9) / candidate.ask) : 0;
+  const approvedNotionalUsd = Number((approvedContracts * candidate.ask).toFixed(4));
 
   const candidateRiskUsd = Number((approvedNotionalUsd * candidateLossFraction).toFixed(6));
   const adjustedRiskUsd = Number(((existingRiskUsd + candidateRiskUsd) * stressMultiplier).toFixed(6));
@@ -269,6 +273,7 @@ export function evaluatePortfolioCorrelationAndCap(
       allowed: false,
       reason,
       approvedNotionalUsd: 0,
+      capCeilingUsd,
       approvedContracts: 0,
       requestedNotionalUsd,
       perPositionCapUsd,
@@ -291,6 +296,7 @@ export function evaluatePortfolioCorrelationAndCap(
     allowed: true,
     reason: 'PORTFOLIO_CORRELATION_APPROVED',
     approvedNotionalUsd,
+    capCeilingUsd,
     approvedContracts,
     requestedNotionalUsd,
     perPositionCapUsd,

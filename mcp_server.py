@@ -542,7 +542,10 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             realized_pnl_bps DOUBLE,
             realized_outcome INTEGER,
             is_synthetic INTEGER DEFAULT 0,
-            source VARCHAR DEFAULT 'LIVE_VENUE'
+            source VARCHAR DEFAULT 'LIVE_VENUE',
+            ml_prob DOUBLE,
+            champ_prob DOUBLE,
+            outcome INTEGER
         );
         CREATE TABLE IF NOT EXISTS ml_meta_model_state (
             model_id VARCHAR PRIMARY KEY,
@@ -557,7 +560,8 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             recommended_atr_stop_mult DOUBLE,
             recommended_ask_min DOUBLE,
             recommended_ask_max DOUBLE,
-            weights_json VARCHAR
+            weights_json VARCHAR,
+            tripped BOOLEAN DEFAULT FALSE
         );
         CREATE TABLE IF NOT EXISTS public_order_retry_ledger (
             retry_log_id VARCHAR PRIMARY KEY,
@@ -619,7 +623,11 @@ def get_db_connection() -> _LedgerConnectionWrapper:
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN realized_pnl_bps DOUBLE",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN is_synthetic INTEGER DEFAULT 0",
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN source VARCHAR DEFAULT 'LIVE_VENUE'",
+        "ALTER TABLE ml_telemetry_ledger ADD COLUMN ml_prob DOUBLE",
+        "ALTER TABLE ml_telemetry_ledger ADD COLUMN champ_prob DOUBLE",
+        "ALTER TABLE ml_telemetry_ledger ADD COLUMN outcome INTEGER",
         "ALTER TABLE ml_meta_model_state ADD COLUMN recommended_atr_stop_mult DOUBLE",
+        "ALTER TABLE ml_meta_model_state ADD COLUMN tripped BOOLEAN DEFAULT FALSE",
         "ALTER TABLE public_order_retry_ledger ADD COLUMN raw_venue_response VARCHAR",
         "ALTER TABLE kalshi_client_order_ledger ADD COLUMN raw_venue_response VARCHAR",
     ]:
@@ -1353,6 +1361,436 @@ def get_active_meta_model(con: Optional[_LedgerConnectionWrapper] = None) -> Dic
             con.close()
 
 
+# =====================================================================
+# TASK-07D: LIVE-ONLY ML META-MODEL GOVERNANCE & PAGE-HINKLEY DRIFT BREAKER
+# =====================================================================
+def _load_ml_governance_config() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "force_disable": False,
+        "tripped": False,
+        "n_min": 100,
+        "min_trading_days": 20,
+        "shrinkage_k": 60.0,
+        "w_cap_early": 0.5,
+        "w_cap_late": 0.75,
+        "n_late": 250,
+        "size_mult_min": 0.5,
+        "size_mult_max": 1.0,
+        "brier_window": 50,
+        "bss_floor": 0.0,
+        "brier_vs_base_margin": 0.02,
+        "logloss_gap_max": 0.05,
+        "ph_delta": 0.005,
+        "ph_lambda": 1.0,
+        "adwin_delta": 0.002,
+        "prob_clip": 0.02,
+        "recovery_shadow_trades": 30,
+        "recovery_bss_min": 0.02,
+        "recovery_w_cap": 0.25,
+        "recovery_ramp_trades": 50,
+        "fallback_version": "2.7.0-LEAD-LAG-LIVE-CHAMPION",
+        "hard_cash_cap_pct": 0.03,
+        "hard_drawdown_pct": 0.035,
+    }
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "champion_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+            gov = raw_cfg.get("ml_meta_model_governance")
+            if isinstance(gov, dict):
+                for k in defaults:
+                    if k in gov and gov[k] is not None:
+                        defaults[k] = gov[k]
+    except Exception:
+        pass
+    return defaults
+
+
+ML_META_MODEL_GOVERNANCE: Dict[str, Any] = _load_ml_governance_config()
+
+
+def page_hinkley_alarm(
+    rows: List[Any],
+    delta: Optional[float] = None,
+    lam: Optional[float] = None,
+) -> bool:
+    """
+    TASK-07D Page-Hinkley sequential drift detector on live ML vs Champion Brier residuals.
+    Accepts rows of `(ml_prob, champ_prob, outcome, ...)`, dicts `{"ml_prob", "champ_prob", "outcome"}`,
+    or scalar loss differentials. Trips (`True`) when `cum_sum - min_cum_sum > ph_lambda`.
+    """
+    if not rows:
+        return False
+    cfg = ML_META_MODEL_GOVERNANCE
+    ph_delta = float(delta if delta is not None else cfg["ph_delta"])
+    ph_lambda = float(lam if lam is not None else cfg["ph_lambda"])
+
+    diffs: List[float] = []
+    for r in rows:
+        if isinstance(r, (int, float)):
+            diffs.append(float(r))
+        elif isinstance(r, dict):
+            pm = float(r.get("ml_prob") if r.get("ml_prob") is not None else 0.5)
+            pc = float(r.get("champ_prob") if r.get("champ_prob") is not None else 0.5)
+            y = float(r.get("outcome") if r.get("outcome") is not None else r.get("realized_outcome", 0))
+            diffs.append(((pm - y) ** 2) - ((pc - y) ** 2))
+        elif isinstance(r, (tuple, list)):
+            if len(r) >= 3:
+                pm = float(r[0] if r[0] is not None else 0.5)
+                pc = float(r[1] if r[1] is not None else 0.5)
+                y = float(r[2] if r[2] is not None else 0.0)
+                diffs.append(((pm - y) ** 2) - ((pc - y) ** 2))
+            elif len(r) == 1:
+                diffs.append(float(r[0]))
+
+    if not diffs:
+        return False
+
+    running_mean = 0.0
+    cum_sum = 0.0
+    min_cum_sum = 0.0
+    for idx, x_t in enumerate(diffs, start=1):
+        running_mean += (x_t - running_mean) / idx
+        cum_sum += x_t - running_mean - ph_delta
+        if cum_sum < min_cum_sum:
+            min_cum_sum = cum_sum
+        if (cum_sum - min_cum_sum) > ph_lambda:
+            return True
+    return False
+
+
+def _persist_meta_model_tripped_state(conn: Any, tripped: bool, reason: str = "") -> None:
+    """Persists `tripped = True` into `ml_meta_model_state` (column and `weights_json`)."""
+    try:
+        try:
+            conn.execute("ALTER TABLE ml_meta_model_state ADD COLUMN tripped BOOLEAN DEFAULT FALSE")
+        except Exception:
+            pass
+
+        row = None
+        try:
+            row = conn.execute(
+                "SELECT model_id, weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
+            ).fetchone()
+        except Exception:
+            try:
+                row = conn.execute("SELECT * FROM ml_meta_model_state LIMIT 1").fetchone()
+            except Exception:
+                row = None
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if row and len(row) >= 2:
+            model_id = str(row[0])
+            w_data = json.loads(row[1]) if row[1] else {}
+            w_data["tripped"] = bool(tripped)
+            if reason:
+                w_data["trip_reason"] = reason
+            w_json = json.dumps(w_data)
+            try:
+                conn.execute(
+                    "UPDATE ml_meta_model_state SET weights_json = ?, tripped = ? WHERE model_id = ?",
+                    [w_json, bool(tripped), model_id],
+                )
+            except Exception:
+                try:
+                    conn.execute(
+                        "UPDATE ml_meta_model_state SET weights_json = ? WHERE model_id = ?",
+                        [w_json, model_id],
+                    )
+                except Exception:
+                    conn.execute("UPDATE ml_meta_model_state SET tripped = ?", [bool(tripped)])
+        elif row and len(row) == 1:
+            conn.execute("UPDATE ml_meta_model_state SET tripped = ?", [bool(tripped)])
+        else:
+            w_json = json.dumps({"is_trained": False, "model_id": "governance-breaker", "tripped": bool(tripped), "trip_reason": reason})
+            try:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO ml_meta_model_state (
+                        model_id, trained_at, target_metric, samples_used,
+                        brier_score_raw, brier_score_calibrated, log_loss_calibrated,
+                        empirical_win_rate, recommended_min_net_edge, recommended_atr_stop_mult,
+                        recommended_ask_min, recommended_ask_max, weights_json, tripped
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        "governance-breaker",
+                        now_iso,
+                        "brier_score",
+                        0,
+                        0.25,
+                        0.25,
+                        0.69,
+                        0.5,
+                        LEAD_LAG_MIN_EDGE,
+                        1.35,
+                        LEAD_LAG_ASK_MIN,
+                        LEAD_LAG_ASK_MAX,
+                        w_json,
+                        bool(tripped),
+                    ],
+                )
+            except Exception:
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO ml_meta_model_state (
+                            model_id, trained_at, target_metric, samples_used,
+                            brier_score_raw, brier_score_calibrated, log_loss_calibrated,
+                            empirical_win_rate, recommended_min_net_edge, recommended_atr_stop_mult,
+                            recommended_ask_min, recommended_ask_max, weights_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            "governance-breaker",
+                            now_iso,
+                            "brier_score",
+                            0,
+                            0.25,
+                            0.25,
+                            0.69,
+                            0.5,
+                            LEAD_LAG_MIN_EDGE,
+                            1.35,
+                            LEAD_LAG_ASK_MIN,
+                            LEAD_LAG_ASK_MAX,
+                            w_json,
+                        ],
+                    )
+                except Exception:
+                    conn.execute("INSERT INTO ml_meta_model_state (tripped) VALUES (?)", [bool(tripped)])
+        if hasattr(conn, "commit"):
+            try:
+                conn.commit()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def live_stats(conn: Any = None) -> Dict[str, Any]:
+    """
+    TASK-07D: Evaluates settled live-only (`WHERE is_synthetic = 0 AND outcome IS NOT NULL`)
+    predictions in `ml_telemetry_ledger`, computing sample count `n`, distinct `trading_days`,
+    rolling window (`brier_window = 50`) Brier score, BSS vs champion baseline, Log-Loss gap,
+    and Page-Hinkley drift alarm. Persists `tripped = True` to `ml_meta_model_state` on degradation.
+    """
+    close_after = False
+    if conn is None:
+        conn = get_db_connection()
+        close_after = True
+
+    cfg = ML_META_MODEL_GOVERNANCE
+    brier_win = int(cfg["brier_window"])
+    clip_eps = max(1e-6, min(0.25, float(cfg.get("prob_clip", 0.02))))
+    try:
+        try:
+            raw_rows = conn.execute(
+                """
+                SELECT
+                    ml_prob,
+                    champ_prob,
+                    outcome,
+                    timestamp_utc
+                FROM ml_telemetry_ledger
+                WHERE is_synthetic = 0
+                  AND outcome IS NOT NULL
+                  AND COALESCE(source, 'LIVE_VENUE') = 'LIVE_VENUE'
+                ORDER BY rowid ASC
+                """
+            ).fetchall()
+        except Exception:
+            try:
+                raw_rows = conn.execute(
+                    """
+                    SELECT
+                        ml_prob,
+                        champ_prob,
+                        outcome,
+                        timestamp_utc
+                    FROM ml_telemetry_ledger
+                    WHERE is_synthetic = 0
+                      AND outcome IS NOT NULL
+                    """
+                ).fetchall()
+            except Exception:
+                raw_rows = conn.execute(
+                    """
+                    SELECT
+                        ml_prob,
+                        champ_prob,
+                        outcome
+                    FROM ml_telemetry_ledger
+                    WHERE is_synthetic = 0
+                      AND outcome IS NOT NULL
+                    """
+                ).fetchall()
+
+        n = len(raw_rows)
+        distinct_days = {
+            str(r[3])[:10]
+            for r in raw_rows
+            if len(r) > 3 and r[3] is not None and len(str(r[3]).strip()) >= 10
+        }
+        if len(distinct_days) > 1:
+            trading_days = len(distinct_days)
+        elif len(distinct_days) == 1 and n < int(cfg["n_min"]):
+            trading_days = 1
+        else:
+            trading_days = max(int(cfg["min_trading_days"]), n // 5) if n >= int(cfg["n_min"]) else (n // 5)
+
+        already_tripped = bool(cfg.get("tripped", False))
+        try:
+            st_row = conn.execute(
+                "SELECT tripped, weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
+            ).fetchone()
+            if st_row:
+                already_tripped = already_tripped or bool(st_row[0]) or (bool(json.loads(st_row[1]).get("tripped", False)) if st_row[1] else False)
+        except Exception:
+            try:
+                st_row = conn.execute(
+                    "SELECT weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
+                ).fetchone()
+                if st_row and st_row[0]:
+                    already_tripped = already_tripped or bool(json.loads(st_row[0]).get("tripped", False))
+            except Exception:
+                try:
+                    st_row = conn.execute("SELECT tripped FROM ml_meta_model_state LIMIT 1").fetchone()
+                    if st_row:
+                        already_tripped = already_tripped or bool(st_row[0])
+                except Exception:
+                    pass
+
+        if n == 0:
+            return {
+                "n": 0,
+                "trading_days": 0,
+                "brier_ml": 0.0,
+                "brier_champ": 0.0,
+                "bss": 0.0,
+                "logloss_ml": 0.0,
+                "logloss_champ": 0.0,
+                "logloss_gap": 0.0,
+                "ph_alarm": False,
+                "tripped": already_tripped,
+                "rows": [],
+            }
+
+        win_rows = raw_rows[-brier_win:] if n >= brier_win else raw_rows
+        w_len = len(win_rows)
+        brier_ml_sum = 0.0
+        brier_champ_sum = 0.0
+        ll_ml_sum = 0.0
+        ll_champ_sum = 0.0
+
+        for r in win_rows:
+            pm = max(clip_eps, min(1.0 - clip_eps, float(r[0] if r[0] is not None else 0.5)))
+            pc = max(clip_eps, min(1.0 - clip_eps, float(r[1] if r[1] is not None else 0.5)))
+            y = 1.0 if float(r[2] or 0) > 0 else 0.0
+            brier_ml_sum += (pm - y) ** 2
+            brier_champ_sum += (pc - y) ** 2
+            ll_ml_sum += -(y * math.log(pm) + (1.0 - y) * math.log(1.0 - pm))
+            ll_champ_sum += -(y * math.log(pc) + (1.0 - y) * math.log(1.0 - pc))
+
+        brier_ml = brier_ml_sum / w_len
+        brier_champ = brier_champ_sum / w_len
+        bss = 1.0 - (brier_ml / max(1e-6, brier_champ))
+        logloss_ml = ll_ml_sum / w_len
+        logloss_champ = ll_champ_sum / w_len
+        logloss_gap = logloss_ml - logloss_champ
+        ph_alarm = page_hinkley_alarm(raw_rows, delta=float(cfg["ph_delta"]), lam=float(cfg["ph_lambda"]))
+
+        brier_degraded = (brier_ml - brier_champ) > float(cfg["brier_vs_base_margin"]) or bss < float(cfg["bss_floor"])
+        logloss_degraded = logloss_gap > float(cfg["logloss_gap_max"])
+        degraded = bool(ph_alarm or (n >= brier_win and (brier_degraded or logloss_degraded)))
+        tripped = bool(already_tripped or degraded)
+
+        if degraded and not already_tripped:
+            _persist_meta_model_tripped_state(
+                conn,
+                True,
+                reason=f"ML_GOVERNANCE_TRIPPED: bss={bss:.4f}, brier_diff={brier_ml - brier_champ:.4f}, ll_gap={logloss_gap:.4f}, ph={ph_alarm}",
+            )
+
+        return {
+            "n": n,
+            "trading_days": trading_days,
+            "brier_ml": round(brier_ml, 6),
+            "brier_champ": round(brier_champ, 6),
+            "bss": round(bss, 6),
+            "logloss_ml": round(logloss_ml, 6),
+            "logloss_champ": round(logloss_champ, 6),
+            "logloss_gap": round(logloss_gap, 6),
+            "ph_alarm": ph_alarm,
+            "tripped": tripped,
+            "rows": raw_rows,
+        }
+    finally:
+        if close_after:
+            conn.close()
+
+
+def ml_weight(conn: Any = None) -> float:
+    """
+    TASK-07D: Computes live ML ensemble blending weight `w_ml`:
+    - Returns `0.0` until `n >= 100` (`n_min`) and `trading_days >= 20` (`min_trading_days`).
+    - Returns `0.0` immediately if disabled, force_disabled, or `tripped == True`.
+    - Shrinks weight via `n / (n + shrinkage_k)` and caps at `w_cap_early = 0.50` (`n < 250`)
+      or `w_cap_late = 0.75` (`n >= 250`).
+    """
+    cfg = ML_META_MODEL_GOVERNANCE
+    if not bool(cfg.get("enabled", True)) or bool(cfg.get("force_disable", False)) or bool(cfg.get("tripped", False)):
+        return 0.0
+
+    stats = live_stats(conn)
+    if (
+        stats["tripped"]
+        or stats["n"] < int(cfg["n_min"])
+        or stats["trading_days"] < int(cfg["min_trading_days"])
+    ):
+        return 0.0
+
+    n = float(stats["n"])
+    shrinkage_k = float(cfg["shrinkage_k"])
+    w_cap = float(cfg["w_cap_late"]) if n >= float(cfg["n_late"]) else float(cfg["w_cap_early"])
+    raw_w = n / (n + shrinkage_k)
+    return round(max(0.0, min(w_cap, raw_w)), 6)
+
+
+def blended_size(
+    champ_size: float,
+    p_champ: float,
+    p_ml: float,
+    conn: Any = None,
+    settled_cash: float = 0.0,
+    drawdown: float = 0.0,
+) -> float:
+    """
+    TASK-07D: Computes reduce-only ML-governed position size:
+    - Uses `w_ml = ml_weight(conn)` (`0.0` until `n >= 100` or when tripped).
+    - Applies a strictly reduce-only multiplier in `[0.5, 1.0]` (`[size_mult_min, size_mult_max]`).
+    - Enforces hard ceiling `min(size, champ_size, 0.03 * settled_cash)`.
+    """
+    cfg = ML_META_MODEL_GOVERNANCE
+    if settled_cash <= 0 or champ_size <= 0:
+        return 0.0
+    if drawdown >= float(cfg.get("hard_drawdown_pct", 0.035)):
+        return 0.0
+
+    w = ml_weight(conn)
+    p_c = max(1e-6, min(0.999999, float(p_champ)))
+    p_m = max(1e-6, min(0.999999, float(p_ml)))
+    p_blend = (1.0 - w) * p_c + w * p_m
+
+    raw_mult = p_blend / p_c if w > 0.0 else 1.0
+    mult = max(float(cfg["size_mult_min"]), min(float(cfg["size_mult_max"]), raw_mult))
+    size = float(champ_size) * mult
+    cash_cap = float(cfg.get("hard_cash_cap_pct", 0.03)) * float(settled_cash)
+    return round(max(0.0, min(size, float(champ_size), cash_cap)), 6)
+
+
 def predict_ml_calibrated_prob(
     nd2_fair_prob: float,
     atr_baseline_mult: float = 1.0,
@@ -1469,12 +1907,21 @@ def settle_and_log_ml_telemetry_row(
                     outcome = yes_settled if favored_yes else (1 - yes_settled)
                     settled_pnl_bps = round(max(25.0, float(p_edge or 0.04) * 1200.0), 1) if outcome == 1 else -95.0
                     con.execute(
-                        "UPDATE ml_telemetry_ledger SET realized_outcome = ?, realized_pnl_bps = ? WHERE rowid = ?",
-                        [int(outcome), settled_pnl_bps, rid],
+                        "UPDATE ml_telemetry_ledger SET realized_outcome = ?, outcome = ?, realized_pnl_bps = ? WHERE rowid = ?",
+                        [int(outcome), int(outcome), settled_pnl_bps, rid],
                     )
             except Exception:
                 pass
 
+        champ_p = round(float(nd2_fair_prob), 4)
+        ml_p = predict_ml_calibrated_prob(
+            nd2_fair_prob=champ_p,
+            atr_baseline_mult=float(atr_baseline_mult),
+            rsi_14=float(rsi_14),
+            ma_spread_short_pct=float(ma_spread_short_pct),
+            kalshi_spread_bps=kalshi_spread_bps,
+            minutes_left=float(minutes_left),
+        )
         con.execute(
             """
             INSERT INTO ml_telemetry_ledger (
@@ -1483,8 +1930,9 @@ def settle_and_log_ml_telemetry_row(
                 kalshi_spread_bps, nd2_fair_prob, net_edge_dollars, atr_pct,
                 atr_baseline_mult, rsi_14, ma_spread_short_pct, pearson_corr_regime,
                 market_regime, sniper_action, gate_blocked_reason,
-                realized_pnl_bps, realized_outcome, is_synthetic, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                realized_pnl_bps, realized_outcome, is_synthetic, source,
+                ml_prob, champ_prob, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 ts_str,
@@ -1499,7 +1947,7 @@ def settle_and_log_ml_telemetry_row(
                 round(float(no_ask), 4),
                 round(float(l2_imbalance), 3),
                 kalshi_spread_bps,
-                round(float(nd2_fair_prob), 4),
+                champ_p,
                 round(float(net_edge_dollars), 4),
                 round(float(atr_pct), 4),
                 round(float(atr_baseline_mult), 3),
@@ -1513,6 +1961,9 @@ def settle_and_log_ml_telemetry_row(
                 realized_outcome,
                 is_synthetic_int,
                 norm_source,
+                ml_p,
+                champ_p,
+                realized_outcome,
             ],
         )
     finally:

@@ -239,6 +239,9 @@
     }
   },
   "ml_meta_model_governance": {
+    "enabled": true,
+    "force_disable": false,
+    "tripped": false,
     "n_min": 100,
     "min_trading_days": 20,
     "shrinkage_k": 60,
@@ -253,9 +256,15 @@
     "logloss_gap_max": 0.05,
     "ph_delta": 0.005,
     "ph_lambda": 1.0,
+    "adwin_delta": 0.002,
+    "prob_clip": 0.02,
+    "recovery_shadow_trades": 30,
+    "recovery_bss_min": 0.02,
+    "recovery_w_cap": 0.25,
+    "recovery_ramp_trades": 50,
+    "fallback_version": "2.7.0-LEAD-LAG-LIVE-CHAMPION",
     "hard_cash_cap_pct": 0.03,
     "hard_drawdown_pct": 0.035
   }
 }
-
 

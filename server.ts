@@ -126,7 +126,14 @@ import {
   executionVault,
   evaluatePortfolioCorrelationAndCap,
   getLossFraction,
+  evaluateLeadLagAnomalyTriggers as evaluateLeadLagTriggers,
+  type LeadLagCombinedEvaluationResult,
+  type ActiveRiskPosition,
 } from './src/server/ExecutionVault.ts';
+import {
+  evaluateOrderFlowToxicityAndBasis,
+  type OrderFlowToxicityAndBasisVerdict,
+} from './src/strategies/LeadLagAnomalyTriggers.ts';
 
 dotenv.config();
 
@@ -5608,6 +5615,180 @@ async function fetchLiveCoinbaseSpotTick(productId = 'BTC-USD'): Promise<{
   };
 }
 
+interface LeadLagShadowTelemetryEntry {
+  evaluatedAt: string;
+  mode: string;
+  liveEnabled: false;
+  seriesTicker: string;
+  contractTicker: string;
+  spotPair: string;
+  spotPrice: number;
+  askDollars: number;
+  fairValueProb: number;
+  triggerEvaluation: LeadLagCombinedEvaluationResult;
+  toxicityAndBasisVerdict: OrderFlowToxicityAndBasisVerdict;
+  shadowWouldTrigger: boolean;
+  settledCashUsd: number;
+}
+
+const leadLagShadowEvaluationState = {
+  mode: String((CHAMPION_CONFIG as unknown as Record<string, any>).task07c?.mode ?? 'shadow'),
+  liveEnabled: false as const,
+  evaluationsCount: 0,
+  lastEvaluatedAt: null as string | null,
+  latestBySeries: {} as Record<string, LeadLagShadowTelemetryEntry>,
+  recentEvaluations: [] as LeadLagShadowTelemetryEntry[],
+};
+
+function runLeadLagShadowEvaluationTick(): typeof leadLagShadowEvaluationState {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const settledCashUsd =
+    typeof liveKalshiCashBalanceUsd === 'number' && Number.isFinite(liveKalshiCashBalanceUsd) && liveKalshiCashBalanceUsd > 0
+      ? liveKalshiCashBalanceUsd
+      : 0;
+  const activePositions: ActiveRiskPosition[] = liveKalshiPositions.map((p) => ({
+    symbol: p.ticker,
+    notionalUsd: Number(Math.max(0, p.marketExposureUsd || 0).toFixed(4)),
+    ask: Math.max(0.01, Math.min(0.99, p.currentPrice || 0.55)),
+    atrDollar: 0.05,
+  }));
+
+  const spotSymbolMap: Record<string, string> = {
+    KXBTC15M: 'BTC-USD',
+    KXETH15M: 'ETH-USD',
+    KXSOL15M: 'SOL-USD',
+    KXXRP15M: 'XRP-USD',
+    KXDOGE15M: 'DOGE-USD',
+  };
+
+  const predictionSeries = marketFeatures.filter((f) => f.is15MinPrediction);
+  for (const feature of predictionSeries) {
+    const spotPair = feature.underlyingSpotSymbol || spotSymbolMap[feature.symbol] || 'BTC-USD';
+    const matchedCrypto = marketFeatures.find((m) => m.symbol === spotPair);
+    const contractTicker = feature.activeContractTicker || feature.symbol;
+    const wsBook = kalshiWsState.books.get(contractTicker);
+
+    const askDollars = Number(
+      Math.max(
+        0.01,
+        Math.min(0.99, wsBook?.yesAskDollars ?? feature.leadLagSignal?.bestAsk ?? feature.price ?? 0.55)
+      ).toFixed(4)
+    );
+    const fairValueProb = Number(
+      Math.max(
+        0.01,
+        Math.min(0.99, feature.leadLagSignal?.fairYesProb ?? feature.predictionImpliedProb ?? feature.price ?? 0.55)
+      ).toFixed(4)
+    );
+    const spotPrice = feature.underlyingSpotPrice ?? matchedCrypto?.price ?? 0;
+    const minutesRemaining = Number(Math.max(0.1, (feature.secondsToExpiry ?? 480) / 60).toFixed(2));
+    const atrDollar = Number(Math.max(0.01, ((feature.atrPct || 5) / 100) * askDollars).toFixed(4));
+    const isTrending = (feature.lastAssessment?.market_regime || '').startsWith('TRENDING');
+    const chop14 = isTrending ? 41.5 : 54.0;
+    const adx14 = isTrending ? 29.5 : 19.5;
+    const lhs =
+      wsBook && wsBook.topOfBookDepthFp > 0
+        ? Number(Math.max(0.1, Math.min(0.95, 0.55 + (1 - Math.abs(wsBook.topOfBookImbalance)) * 0.35)).toFixed(3))
+        : Number(Math.max(0.1, Math.min(0.9, 0.7 - Math.abs(feature.orderbookImbalance || 0) * 0.15)).toFixed(3));
+
+    const fetchedAtMs = feature.fetchedAt ? Date.parse(feature.fetchedAt) : NaN;
+    const feedAgeMs = Number.isFinite(fetchedAtMs) ? Math.max(0, nowMs - fetchedAtMs) : 9999;
+    const shortSpreadPct = matchedCrypto?.maSpreadShortPct ?? feature.maSpreadShortPct ?? 0;
+    const zVelocityNow = Number((shortSpreadPct * 12).toFixed(3));
+    const zVelocityPrev = Number((zVelocityNow * 0.92).toFixed(3));
+    const rGkRatio = Number(Math.max(0.5, feature.atrBaselineMultiplier || 1.0).toFixed(3));
+    const side: 'BUY_YES' | 'BUY_NO' =
+      feature.leadLagSignal?.bestSide === 'BUY_NO' ? 'BUY_NO' : 'BUY_YES';
+
+    const triggerEvaluation = evaluateLeadLagTriggers({
+      envelope: {
+        symbol: feature.symbol,
+        side,
+        chop14,
+        adx14,
+        lhs,
+        ask: askDollars,
+        atrDollar,
+        settledCashUsd,
+        activePositions,
+        correlationMatrix: {},
+        timestampMs: nowMs,
+      },
+      svb60: {
+        zVelocityChecks5s: [zVelocityPrev, zVelocityNow],
+        coinbaseSpotUsd: spotPrice,
+        krakenSpotUsd: spotPrice,
+        kalshiAskMove10sDollars: 0,
+        fairValueProb,
+        kalshiAskDollars: askDollars,
+        minutesRemaining,
+        spotLatencyMs: feedAgeMs,
+        kalshiLatencyMs: feedAgeMs,
+        interVenueSkewMs: 0,
+      },
+      gkx5: {
+        rGkRatio,
+        zVelocity5m: zVelocityNow,
+        velocitySignStableAcrossCandle: true,
+        deltaFvProjDollars: Number(Math.max(0, fairValueProb - askDollars).toFixed(4)),
+        fairValueProb,
+        kalshiAskDollars: askDollars,
+        candleFinalizationLatencyMs: feedAgeMs,
+        kalshiLatencyMs: feedAgeMs,
+      },
+    });
+
+    const basisBp = Number(((matchedCrypto?.vwapSpreadPct ?? feature.vwapSpreadPct ?? 0) * 100).toFixed(2));
+    const proxyVpin = Number(
+      Math.max(0.05, Math.min(0.95, 0.35 + Math.abs(feature.orderbookImbalance || 0) * 0.25)).toFixed(3)
+    );
+    const toxicityAndBasisVerdict = evaluateOrderFlowToxicityAndBasis({
+      trigger: triggerEvaluation.activeTriggerId ?? 'SVB-60',
+      feedAgeMs,
+      fv: fairValueProb,
+      ask: askDollars,
+      feesPerShare: LEAD_LAG_PARAMS.feePerContract,
+      basisBp,
+      vpin: [proxyVpin, proxyVpin],
+      settledCash: settledCashUsd,
+    });
+
+    const entry: LeadLagShadowTelemetryEntry = {
+      evaluatedAt: nowIso,
+      mode: String((CHAMPION_CONFIG as unknown as Record<string, any>).task07c?.mode ?? 'shadow').toUpperCase(),
+      liveEnabled: false,
+      seriesTicker: feature.symbol,
+      contractTicker,
+      spotPair,
+      spotPrice,
+      askDollars,
+      fairValueProb,
+      triggerEvaluation,
+      toxicityAndBasisVerdict,
+      shadowWouldTrigger: triggerEvaluation.triggered && toxicityAndBasisVerdict.allowed,
+      settledCashUsd,
+    };
+
+    leadLagShadowEvaluationState.latestBySeries[feature.symbol] = entry;
+    leadLagShadowEvaluationState.recentEvaluations.unshift(entry);
+  }
+
+  if (leadLagShadowEvaluationState.recentEvaluations.length > 25) {
+    leadLagShadowEvaluationState.recentEvaluations.length = 25;
+  }
+  leadLagShadowEvaluationState.evaluationsCount += 1;
+  leadLagShadowEvaluationState.lastEvaluatedAt = nowIso;
+  return leadLagShadowEvaluationState;
+}
+
+function getLeadLagShadowEvaluationState(): typeof leadLagShadowEvaluationState {
+  if (leadLagShadowEvaluationState.evaluationsCount === 0) {
+    return runLeadLagShadowEvaluationTick();
+  }
+  return leadLagShadowEvaluationState;
+}
+
 // Fetch Real Intraday (5m) & Daily (1D) OHLCV Bars and Real Kalshi v2 CLOB Orderbook & Trade History
 async function syncRealMarketBarsAndKalshi(force = false): Promise<void> {
   const now = Date.now();
@@ -6099,6 +6280,9 @@ async function syncRealMarketBarsAndKalshi(force = false): Promise<void> {
 
   // 3. Pull Live Authenticated Kalshi v2 Portfolio Balance, Breakdown, Open Positions & Fills
   await syncLiveKalshiPortfolio(kalshiSuccessCount);
+
+  // 4. Shadow-mode Lead-Lag Trigger + Order-Flow Toxicity/Basis Evaluation (Zero live order routing)
+  runLeadLagShadowEvaluationTick();
 }
 
 export async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
@@ -7862,6 +8046,7 @@ app.get('/api/state', async (_req, res) => {
     exitMonitorEvaluationLog,
     championConfig: CHAMPION_CONFIG,
     executionVaultAudit: executionVault.getAuditLog(),
+    leadLagShadowEvaluation: getLeadLagShadowEvaluationState(),
     mcp: {
       servers: mcpServerConnections,
       tools: mcpToolDefinitions,
@@ -7880,6 +8065,7 @@ app.get('/api/vault/champion-status', (_req, res) => {
     auditLog: executionVault.getAuditLog(),
     orderRejectionLog,
     exitMonitorEvaluationLog,
+    leadLagShadowEvaluation: getLeadLagShadowEvaluationState(),
   });
 });
 
@@ -7904,6 +8090,7 @@ app.get('/api/playbook/state', (_req, res) => {
     test2Approved,
     bannedPennyTickers: ['RCT', 'XHG', 'BGIN', 'RADX', 'MMLP'],
     zeroHoldLeadLagState: buildZeroHoldLeadLagSystemState(),
+    leadLagShadowEvaluation: getLeadLagShadowEvaluationState(),
   });
 });
 
@@ -8081,8 +8268,11 @@ app.post('/api/playbook/evaluate-lead-lag', async (req, res) => {
     leadLagAgent.lastEvaluatedAt = new Date().toISOString();
   }
 
+  const leadLagShadowEvaluation = runLeadLagShadowEvaluationTick();
+
   res.json({
     evaluation,
+    leadLagShadowEvaluation,
     leadLagExecutionMode,
     leadLagPaperLedger,
     order: createdOrder,
@@ -15432,11 +15622,13 @@ app.get('/api/scanner/scan', async (_req, res) => {
   await syncRealMarketBarsAndKalshi(false);
   const opportunities = computeAlphaScannerOpportunities();
   const strategyTournament = computeStrategyTournament();
+  const leadLagShadowEvaluation = runLeadLagShadowEvaluationTick();
   res.json({
     scannedAt: new Date().toISOString(),
     totalMarketsScanned: opportunities.length,
     opportunities,
     strategyTournament,
+    leadLagShadowEvaluation,
   });
 });
 
@@ -21784,7 +21976,8 @@ async function runCloudAutonomousDaemonTick(options?: {
       applyYesterdayProfitableSetup: true,
     }).catch(() => null);
 
-    // 5. Autonomous Parallel Zero-Hold Lead-Lag Scalps across ALL Goldilocks [1.0x, 1.5x] ATR Bandit Winners (BTC, ETH, SOL <=250ms latency, 0 inventory held)
+    // 5. Shadow-mode Lead-Lag & Order-Flow Toxicity Evaluation + Autonomous Parallel Zero-Hold Lead-Lag Matrix
+    runLeadLagShadowEvaluationTick();
     const matrix = buildParallelFiveSeriesLeadLagMatrix();
     const goldilocksTargets = matrix.filter(
       (row) =>
@@ -22015,5 +22208,7 @@ export {
   evaluateRegimeAndLiquidity,
   evaluateChampionExitSignal,
   computeLiquidityHealthScore,
+  runLeadLagShadowEvaluationTick,
+  getLeadLagShadowEvaluationState,
   CHAMPION_CONFIG,
 };
