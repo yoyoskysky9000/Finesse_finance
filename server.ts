@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import crypto from 'crypto';
 import tls from 'tls';
+import { DatabaseSync } from 'node:sqlite';
 import type {
   AlphaOpportunity,
   AppBundleExportPayload,
@@ -127,12 +128,25 @@ import {
   evaluatePortfolioCorrelationAndCap,
   getLossFraction,
   evaluateLeadLagAnomalyTriggers as evaluateLeadLagTriggers,
+  evaluateSvb60Trigger as evaluateSvb60,
+  evaluateGkx5Trigger as evaluateGkx5,
+  evaluateXvdTrigger as evaluateXvd,
   type LeadLagCombinedEvaluationResult,
   type ActiveRiskPosition,
 } from './src/server/ExecutionVault.ts';
 import {
+  evaluateChampion260Envelope,
   evaluateOrderFlowToxicityAndBasis,
+  type Champion260EnvelopeValidation,
+  type Gkx5EvaluationResult,
+  type Gkx5TriggerInput,
+  type LeadLagTriggerId,
   type OrderFlowToxicityAndBasisVerdict,
+  type Snapshot as LeadLagToxicitySnapshot,
+  type Svb60EvaluationResult,
+  type Svb60TriggerInput,
+  type XvdEvaluationResult,
+  type XvdTriggerInput,
 } from './src/strategies/LeadLagAnomalyTriggers.ts';
 
 dotenv.config();
@@ -375,24 +389,30 @@ function loadMlStoreFromDiskOrInit(): void {
 }
 loadMlStoreFromDiskOrInit();
 
-function recordMlTelemetryRow(
-  row: Omit<
-    MlTelemetryLedgerRow,
-    'venue' | 'spot_price' | 'l2_imbalance' | 'pearson_corr_regime' | 'realized_pnl_bps'
-  > &
-    Partial<
-      Pick<
-        MlTelemetryLedgerRow,
-        'venue' | 'spot_price' | 'l2_imbalance' | 'pearson_corr_regime' | 'realized_pnl_bps'
-      >
+type ShadowAugmentedTelemetryInput = Omit<
+  MlTelemetryLedgerRow,
+  'venue' | 'spot_price' | 'l2_imbalance' | 'pearson_corr_regime' | 'realized_pnl_bps'
+> &
+  Partial<
+    Pick<
+      MlTelemetryLedgerRow,
+      'venue' | 'spot_price' | 'l2_imbalance' | 'pearson_corr_regime' | 'realized_pnl_bps'
     >
-): void {
+  > & {
+    is_synthetic?: number;
+    source?: string;
+    ml_prob?: number;
+    champ_prob?: number;
+    outcome?: number | null;
+  };
+
+function recordMlTelemetryRow(row: ShadowAugmentedTelemetryInput): void {
   const nowMs = Date.now();
   const cleanSym = (row.symbol || 'KXBTC15M').toUpperCase();
   const resolvedVenue =
     row.venue || (cleanSym.startsWith('KX') ? 'PREDICTION_MARKET' : 'PUBLIC_BROKERAGE');
   const spotPx = row.spot_price ?? row.coinbase_spot;
-  const fullRow: MlTelemetryLedgerRow = {
+  const fullRow = {
     ...row,
     symbol: cleanSym,
     venue: resolvedVenue,
@@ -411,7 +431,9 @@ function recordMlTelemetryRow(
           : 0.0)
       ).toFixed(1)
     ),
-  };
+    is_synthetic: row.is_synthetic ?? (row.source === 'SHADOW_DAEMON' ? 1 : 0),
+    source: row.source || 'LIVE_VENUE',
+  } as MlTelemetryLedgerRow;
 
   for (const existing of mlTelemetryLedger) {
     if (
@@ -5617,43 +5639,279 @@ async function fetchLiveCoinbaseSpotTick(productId = 'BTC-USD'): Promise<{
 
 interface LeadLagShadowTelemetryEntry {
   evaluatedAt: string;
-  mode: string;
+  mode: 'shadow';
   liveEnabled: false;
+  is_synthetic: 1;
+  source: 'SHADOW_DAEMON';
+  liveIdempotencyLocked: false;
   seriesTicker: string;
   contractTicker: string;
   spotPair: string;
   spotPrice: number;
   askDollars: number;
   fairValueProb: number;
+  svb60Result: Svb60EvaluationResult;
+  gkx5Result: Gkx5EvaluationResult;
+  xvdResult: XvdEvaluationResult;
+  envelopeEvaluation: Champion260EnvelopeValidation;
   triggerEvaluation: LeadLagCombinedEvaluationResult;
   toxicityAndBasisVerdict: OrderFlowToxicityAndBasisVerdict;
+  blockedReasons: string[];
   shadowWouldTrigger: boolean;
   settledCashUsd: number;
 }
 
+interface ShadowCandidateInput {
+  seriesTicker?: string;
+  contractTicker?: string;
+  spotPair?: string;
+  spotPrice?: number;
+  strike?: number;
+  minutesRemaining?: number;
+  askDollars?: number;
+  fairValueProb?: number;
+  side?: 'BUY_YES' | 'BUY_NO';
+  chop14?: number;
+  adx14?: number;
+  lhs?: number;
+  atrDollar?: number;
+  atrPct?: number;
+  atrBaselineMultiplier?: number;
+  rsi14?: number;
+  maSpreadShortPct?: number;
+  orderbookImbalance?: number;
+  marketRegime?: MarketRegime;
+  settledCashUsd?: number;
+  feedAgeMs?: number;
+  basisBp?: number;
+  vpin?: number | [number, number];
+  polymarketProb?: number;
+  svb60?: Partial<Svb60TriggerInput>;
+  gkx5?: Partial<Gkx5TriggerInput>;
+  xvd?: Partial<XvdTriggerInput>;
+  toxicitySnapshot?: Partial<LeadLagToxicitySnapshot>;
+  mode?: unknown;
+  liveEnabled?: unknown;
+}
+
+function getShadowTelemetrySqlitePath(): string {
+  const raw = process.env.QUANT_LEDGER_DB || path.join(__dirname, 'quant_ledger.duckdb');
+  return raw.endsWith('.sqlite') ? raw : `${raw}.sqlite`;
+}
+
+function persistShadowRowToSqliteMlLedger(row: {
+  timestamp_utc: string;
+  symbol: string;
+  venue: string;
+  spot_price: number;
+  coinbase_spot: number;
+  strike: number;
+  spot_to_strike_bps: number;
+  minutes_left: number;
+  yes_ask: number;
+  no_ask: number;
+  l2_imbalance: number;
+  kalshi_spread_bps: number;
+  nd2_fair_prob: number;
+  net_edge_dollars: number;
+  atr_pct: number;
+  atr_baseline_mult: number;
+  rsi_14: number;
+  ma_spread_short_pct: number;
+  pearson_corr_regime: string;
+  market_regime: string;
+  sniper_action: 'HOLD';
+  gate_blocked_reason: string;
+  realized_pnl_bps: number;
+  realized_outcome: number | null;
+  is_synthetic: 1;
+  source: 'SHADOW_DAEMON';
+  ml_prob: number | null;
+  champ_prob: number;
+  outcome: number | null;
+}): void {
+  const sqlitePath = getShadowTelemetrySqlitePath();
+  const dir = path.dirname(sqlitePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const db = new DatabaseSync(sqlitePath);
+  try {
+    db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;');
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ml_telemetry_ledger (
+        timestamp_utc TEXT,
+        symbol TEXT,
+        venue TEXT,
+        spot_price REAL,
+        coinbase_spot REAL,
+        strike REAL,
+        spot_to_strike_bps REAL,
+        minutes_left REAL,
+        yes_ask REAL,
+        no_ask REAL,
+        l2_imbalance REAL,
+        kalshi_spread_bps REAL,
+        nd2_fair_prob REAL,
+        net_edge_dollars REAL,
+        atr_pct REAL,
+        atr_baseline_mult REAL,
+        rsi_14 REAL,
+        ma_spread_short_pct REAL,
+        pearson_corr_regime TEXT,
+        market_regime TEXT,
+        sniper_action TEXT,
+        gate_blocked_reason TEXT,
+        realized_pnl_bps REAL,
+        realized_outcome INTEGER,
+        is_synthetic INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'LIVE_VENUE',
+        ml_prob REAL,
+        champ_prob REAL,
+        outcome INTEGER
+      );
+    `);
+    for (const alterSql of [
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN venue TEXT",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN spot_price REAL",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN l2_imbalance REAL",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN pearson_corr_regime TEXT",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN realized_pnl_bps REAL",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN is_synthetic INTEGER DEFAULT 0",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN source TEXT DEFAULT 'LIVE_VENUE'",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN ml_prob REAL",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN champ_prob REAL",
+      "ALTER TABLE ml_telemetry_ledger ADD COLUMN outcome INTEGER",
+    ]) {
+      try {
+        db.exec(alterSql);
+      } catch {
+        // Column already exists
+      }
+    }
+
+    db.prepare(`
+      INSERT INTO ml_telemetry_ledger (
+        timestamp_utc, symbol, venue, spot_price, coinbase_spot, strike,
+        spot_to_strike_bps, minutes_left, yes_ask, no_ask, l2_imbalance,
+        kalshi_spread_bps, nd2_fair_prob, net_edge_dollars, atr_pct,
+        atr_baseline_mult, rsi_14, ma_spread_short_pct, pearson_corr_regime,
+        market_regime, sniper_action, gate_blocked_reason, realized_pnl_bps,
+        realized_outcome, is_synthetic, source, ml_prob, champ_prob, outcome
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?
+      )
+    `).run(
+      row.timestamp_utc,
+      row.symbol,
+      row.venue,
+      row.spot_price,
+      row.coinbase_spot,
+      row.strike,
+      row.spot_to_strike_bps,
+      row.minutes_left,
+      row.yes_ask,
+      row.no_ask,
+      row.l2_imbalance,
+      row.kalshi_spread_bps,
+      row.nd2_fair_prob,
+      row.net_edge_dollars,
+      row.atr_pct,
+      row.atr_baseline_mult,
+      row.rsi_14,
+      row.ma_spread_short_pct,
+      row.pearson_corr_regime,
+      row.market_regime,
+      row.sniper_action,
+      row.gate_blocked_reason,
+      row.realized_pnl_bps,
+      row.realized_outcome,
+      1,
+      'SHADOW_DAEMON',
+      row.ml_prob,
+      row.champ_prob,
+      row.outcome
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function assertLeadLagShadowModeOnly(overrideCheck?: {
+  leadLagMode?: unknown;
+  task07cLiveEnabled?: unknown;
+}): {
+  leadLagMode: 'shadow';
+  task07cMode: 'shadow';
+  liveEnabled: false;
+} {
+  const cfgAny = CHAMPION_CONFIG as unknown as Record<string, any>;
+  const rawLeadLagMode =
+    overrideCheck?.leadLagMode !== undefined
+      ? overrideCheck.leadLagMode
+      : cfgAny.lead_lag_triggers?.mode;
+  const resolvedLeadLagMode = String(
+    rawLeadLagMode !== undefined ? rawLeadLagMode : cfgAny.task07c?.mode ?? ''
+  )
+    .trim()
+    .toLowerCase();
+  const resolvedTask07cMode = String(cfgAny.task07c?.mode ?? '')
+    .trim()
+    .toLowerCase();
+  const task07cLiveEnabled =
+    overrideCheck?.task07cLiveEnabled !== undefined
+      ? overrideCheck.task07cLiveEnabled
+      : cfgAny.task07c?.live_enabled;
+
+  if (
+    resolvedLeadLagMode !== 'shadow' ||
+    resolvedTask07cMode !== 'shadow' ||
+    task07cLiveEnabled !== false
+  ) {
+    throw new Error(
+      `SHADOW_MODE_HARD_ASSERTION_FAILED: require lead_lag_triggers.mode === "shadow" and task07c.live_enabled === false (got lead_lag_triggers.mode=${String(
+        rawLeadLagMode
+      )}, task07c.mode=${String(cfgAny.task07c?.mode)}, task07c.live_enabled=${String(
+        task07cLiveEnabled
+      )}).`
+    );
+  }
+
+  return {
+    leadLagMode: 'shadow',
+    task07cMode: 'shadow',
+    liveEnabled: false,
+  };
+}
+
 const leadLagShadowEvaluationState = {
-  mode: String((CHAMPION_CONFIG as unknown as Record<string, any>).task07c?.mode ?? 'shadow'),
+  mode: 'shadow' as const,
   liveEnabled: false as const,
+  is_synthetic: 1 as const,
+  source: 'SHADOW_DAEMON' as const,
+  liveIdempotencyLocked: false as const,
   evaluationsCount: 0,
   lastEvaluatedAt: null as string | null,
   latestBySeries: {} as Record<string, LeadLagShadowTelemetryEntry>,
   recentEvaluations: [] as LeadLagShadowTelemetryEntry[],
 };
 
-function runLeadLagShadowEvaluationTick(): typeof leadLagShadowEvaluationState {
-  const nowMs = Date.now();
-  const nowIso = new Date(nowMs).toISOString();
-  const settledCashUsd =
-    typeof liveKalshiCashBalanceUsd === 'number' && Number.isFinite(liveKalshiCashBalanceUsd) && liveKalshiCashBalanceUsd > 0
-      ? liveKalshiCashBalanceUsd
-      : 0;
-  const activePositions: ActiveRiskPosition[] = liveKalshiPositions.map((p) => ({
-    symbol: p.ticker,
-    notionalUsd: Number(Math.max(0, p.marketExposureUsd || 0).toFixed(4)),
-    ask: Math.max(0.01, Math.min(0.99, p.currentPrice || 0.55)),
-    atrDollar: 0.05,
-  }));
+function evaluateLeadLagShadowCandidate(
+  candidate: ShadowCandidateInput,
+  options?: { logToMlLedger?: boolean; nowMs?: number }
+): LeadLagShadowTelemetryEntry {
+  assertLeadLagShadowModeOnly({
+    leadLagMode: candidate.mode,
+    task07cLiveEnabled: candidate.liveEnabled,
+  });
 
+  const nowMs = options?.nowMs ?? Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   const spotSymbolMap: Record<string, string> = {
     KXBTC15M: 'BTC-USD',
     KXETH15M: 'ETH-USD',
@@ -5662,121 +5920,316 @@ function runLeadLagShadowEvaluationTick(): typeof leadLagShadowEvaluationState {
     KXDOGE15M: 'DOGE-USD',
   };
 
-  const predictionSeries = marketFeatures.filter((f) => f.is15MinPrediction);
-  for (const feature of predictionSeries) {
-    const spotPair = feature.underlyingSpotSymbol || spotSymbolMap[feature.symbol] || 'BTC-USD';
-    const matchedCrypto = marketFeatures.find((m) => m.symbol === spotPair);
-    const contractTicker = feature.activeContractTicker || feature.symbol;
-    const wsBook = kalshiWsState.books.get(contractTicker);
+  const seriesTicker = (candidate.seriesTicker || 'KXBTC15M').toUpperCase();
+  const feature = marketFeatures.find((f) => f.symbol === seriesTicker);
+  const spotPair = candidate.spotPair || feature?.underlyingSpotSymbol || spotSymbolMap[seriesTicker] || 'BTC-USD';
+  const matchedCrypto = marketFeatures.find((m) => m.symbol === spotPair);
+  const contractTicker = candidate.contractTicker || feature?.activeContractTicker || seriesTicker;
+  const wsBook = kalshiWsState.books.get(contractTicker);
 
-    const askDollars = Number(
-      Math.max(
-        0.01,
-        Math.min(0.99, wsBook?.yesAskDollars ?? feature.leadLagSignal?.bestAsk ?? feature.price ?? 0.55)
-      ).toFixed(4)
-    );
-    const fairValueProb = Number(
-      Math.max(
-        0.01,
-        Math.min(0.99, feature.leadLagSignal?.fairYesProb ?? feature.predictionImpliedProb ?? feature.price ?? 0.55)
-      ).toFixed(4)
-    );
-    const spotPrice = feature.underlyingSpotPrice ?? matchedCrypto?.price ?? 0;
-    const minutesRemaining = Number(Math.max(0.1, (feature.secondsToExpiry ?? 480) / 60).toFixed(2));
-    const atrDollar = Number(Math.max(0.01, ((feature.atrPct || 5) / 100) * askDollars).toFixed(4));
-    const isTrending = (feature.lastAssessment?.market_regime || '').startsWith('TRENDING');
-    const chop14 = isTrending ? 41.5 : 54.0;
-    const adx14 = isTrending ? 29.5 : 19.5;
-    const lhs =
-      wsBook && wsBook.topOfBookDepthFp > 0
-        ? Number(Math.max(0.1, Math.min(0.95, 0.55 + (1 - Math.abs(wsBook.topOfBookImbalance)) * 0.35)).toFixed(3))
-        : Number(Math.max(0.1, Math.min(0.9, 0.7 - Math.abs(feature.orderbookImbalance || 0) * 0.15)).toFixed(3));
+  const settledCashUsd =
+    typeof candidate.settledCashUsd === 'number' && Number.isFinite(candidate.settledCashUsd)
+      ? Math.max(0, candidate.settledCashUsd)
+      : typeof liveKalshiCashBalanceUsd === 'number' &&
+        Number.isFinite(liveKalshiCashBalanceUsd) &&
+        liveKalshiCashBalanceUsd > 0
+      ? liveKalshiCashBalanceUsd
+      : 0;
 
-    const fetchedAtMs = feature.fetchedAt ? Date.parse(feature.fetchedAt) : NaN;
-    const feedAgeMs = Number.isFinite(fetchedAtMs) ? Math.max(0, nowMs - fetchedAtMs) : 9999;
-    const shortSpreadPct = matchedCrypto?.maSpreadShortPct ?? feature.maSpreadShortPct ?? 0;
-    const zVelocityNow = Number((shortSpreadPct * 12).toFixed(3));
-    const zVelocityPrev = Number((zVelocityNow * 0.92).toFixed(3));
-    const rGkRatio = Number(Math.max(0.5, feature.atrBaselineMultiplier || 1.0).toFixed(3));
-    const side: 'BUY_YES' | 'BUY_NO' =
-      feature.leadLagSignal?.bestSide === 'BUY_NO' ? 'BUY_NO' : 'BUY_YES';
+  const activePositions: ActiveRiskPosition[] = liveKalshiPositions.map((p) => ({
+    symbol: p.ticker,
+    notionalUsd: Number(Math.max(0, p.marketExposureUsd || 0).toFixed(4)),
+    ask: Math.max(0.01, Math.min(0.99, p.currentPrice || 0.55)),
+    atrDollar: 0.05,
+  }));
 
-    const triggerEvaluation = evaluateLeadLagTriggers({
-      envelope: {
-        symbol: feature.symbol,
-        side,
-        chop14,
-        adx14,
-        lhs,
-        ask: askDollars,
-        atrDollar,
-        settledCashUsd,
-        activePositions,
-        correlationMatrix: {},
-        timestampMs: nowMs,
-      },
-      svb60: {
-        zVelocityChecks5s: [zVelocityPrev, zVelocityNow],
-        coinbaseSpotUsd: spotPrice,
-        krakenSpotUsd: spotPrice,
-        kalshiAskMove10sDollars: 0,
-        fairValueProb,
-        kalshiAskDollars: askDollars,
-        minutesRemaining,
-        spotLatencyMs: feedAgeMs,
-        kalshiLatencyMs: feedAgeMs,
-        interVenueSkewMs: 0,
-      },
-      gkx5: {
-        rGkRatio,
-        zVelocity5m: zVelocityNow,
-        velocitySignStableAcrossCandle: true,
-        deltaFvProjDollars: Number(Math.max(0, fairValueProb - askDollars).toFixed(4)),
-        fairValueProb,
-        kalshiAskDollars: askDollars,
-        candleFinalizationLatencyMs: feedAgeMs,
-        kalshiLatencyMs: feedAgeMs,
-      },
-    });
+  const askDollars = Number(
+    Math.max(
+      0.01,
+      Math.min(
+        0.99,
+        candidate.askDollars ?? wsBook?.yesAskDollars ?? feature?.leadLagSignal?.bestAsk ?? feature?.price ?? 0.55
+      )
+    ).toFixed(4)
+  );
+  const fairValueProb = Number(
+    Math.max(
+      0.01,
+      Math.min(
+        0.99,
+        candidate.fairValueProb ??
+          feature?.leadLagSignal?.fairYesProb ??
+          feature?.predictionImpliedProb ??
+          feature?.price ??
+          0.55
+      )
+    ).toFixed(4)
+  );
+  const spotPrice = candidate.spotPrice ?? feature?.underlyingSpotPrice ?? matchedCrypto?.price ?? 0;
+  const strike = candidate.strike ?? feature?.leadLagSignal?.strike ?? spotPrice;
+  const minutesRemaining = Number(
+    Math.max(0.1, candidate.minutesRemaining ?? (feature?.secondsToExpiry ?? 480) / 60).toFixed(2)
+  );
+  const atrDollar = Number(
+    Math.max(0.01, candidate.atrDollar ?? ((feature?.atrPct || 5) / 100) * askDollars).toFixed(4)
+  );
+  const marketRegime: MarketRegime =
+    candidate.marketRegime ?? feature?.lastAssessment?.market_regime ?? 'LOW_VOLATILITY_COMPRESSION';
+  const isTrending = marketRegime.startsWith('TRENDING');
+  const chop14 = candidate.chop14 ?? (isTrending ? 41.5 : 54.0);
+  const adx14 = candidate.adx14 ?? (isTrending ? 29.5 : 19.5);
+  const lhs =
+    candidate.lhs ??
+    (wsBook && wsBook.topOfBookDepthFp > 0
+      ? Number(Math.max(0.1, Math.min(0.95, 0.55 + (1 - Math.abs(wsBook.topOfBookImbalance)) * 0.35)).toFixed(3))
+      : Number(Math.max(0.1, Math.min(0.9, 0.7 - Math.abs(feature?.orderbookImbalance || 0) * 0.15)).toFixed(3)));
 
-    const basisBp = Number(((matchedCrypto?.vwapSpreadPct ?? feature.vwapSpreadPct ?? 0) * 100).toFixed(2));
-    const proxyVpin = Number(
-      Math.max(0.05, Math.min(0.95, 0.35 + Math.abs(feature.orderbookImbalance || 0) * 0.25)).toFixed(3)
-    );
-    const toxicityAndBasisVerdict = evaluateOrderFlowToxicityAndBasis({
-      trigger: triggerEvaluation.activeTriggerId ?? 'SVB-60',
-      feedAgeMs,
-      fv: fairValueProb,
+  const fetchedAtMs = feature?.fetchedAt ? Date.parse(feature.fetchedAt) : NaN;
+  const feedAgeMs = candidate.feedAgeMs ?? (Number.isFinite(fetchedAtMs) ? Math.max(0, nowMs - fetchedAtMs) : 9999);
+  const shortSpreadPct = candidate.maSpreadShortPct ?? matchedCrypto?.maSpreadShortPct ?? feature?.maSpreadShortPct ?? 0;
+  const zVelocityNow = Number((shortSpreadPct * 12).toFixed(3));
+  const zVelocityPrev = Number((zVelocityNow * 0.92).toFixed(3));
+  const rGkRatio = Number(
+    Math.max(0.5, candidate.atrBaselineMultiplier ?? feature?.atrBaselineMultiplier ?? 1.0).toFixed(3)
+  );
+  const side: 'BUY_YES' | 'BUY_NO' =
+    candidate.side ?? (feature?.leadLagSignal?.bestSide === 'BUY_NO' ? 'BUY_NO' : 'BUY_YES');
+
+  const svb60Input: Svb60TriggerInput = {
+    zVelocityChecks5s: [zVelocityPrev, zVelocityNow],
+    coinbaseSpotUsd: spotPrice,
+    krakenSpotUsd: spotPrice,
+    kalshiAskMove10sDollars: 0,
+    fairValueProb,
+    kalshiAskDollars: askDollars,
+    minutesRemaining,
+    spotLatencyMs: feedAgeMs,
+    kalshiLatencyMs: feedAgeMs,
+    interVenueSkewMs: 0,
+    ...candidate.svb60,
+  };
+
+  const gkx5Input: Gkx5TriggerInput = {
+    rGkRatio,
+    zVelocity5m: zVelocityNow,
+    velocitySignStableAcrossCandle: true,
+    deltaFvProjDollars: Number(Math.max(0, fairValueProb - askDollars).toFixed(4)),
+    fairValueProb,
+    kalshiAskDollars: askDollars,
+    candleFinalizationLatencyMs: feedAgeMs,
+    kalshiLatencyMs: feedAgeMs,
+    ...candidate.gkx5,
+  };
+
+  const polymarketProb = candidate.polymarketProb ?? fairValueProb;
+  const xvdInput: XvdTriggerInput = {
+    snapshots: [
+      { timestampMs: nowMs - 3200, kalshiProb: askDollars, polymarketProb },
+      { timestampMs: nowMs - 1600, kalshiProb: askDollars, polymarketProb },
+      { timestampMs: nowMs, kalshiProb: askDollars, polymarketProb },
+    ],
+    identicalSettlementSource: candidate.polymarketProb !== undefined,
+    spotFairValueProb: fairValueProb,
+    laggingVenueAskDollars: askDollars,
+    kalshiLatencyMs: feedAgeMs,
+    polymarketLatencyMs: candidate.polymarketProb !== undefined ? feedAgeMs : 9999,
+    spotLatencyMs: feedAgeMs,
+    interVenueSkewMs: 0,
+    ...candidate.xvd,
+  };
+
+  const svb60Result = evaluateSvb60(svb60Input);
+  const gkx5Result = evaluateGkx5(gkx5Input);
+  const xvdResult = evaluateXvd(xvdInput);
+
+  const triggeredIds: LeadLagTriggerId[] = [];
+  if (svb60Result.triggered) triggeredIds.push('SVB-60');
+  if (gkx5Result.triggered) triggeredIds.push('GKX-5');
+  if (xvdResult.triggered) triggeredIds.push('XVD');
+  const activeTriggerId: LeadLagTriggerId | null = triggeredIds.length > 0 ? triggeredIds[0] : null;
+  const settledCashCapFraction = activeTriggerId === 'XVD' ? 0.015 : 0.03;
+
+  // Shadow mode ONLY: evaluate 2.6.0 envelope math without ever calling executionVault.acquireIdempotencyLock()
+  const envelopeEvaluation = evaluateChampion260Envelope(
+    {
+      symbol: seriesTicker,
+      side,
+      chop14,
+      adx14,
+      lhs,
       ask: askDollars,
-      feesPerShare: LEAD_LAG_PARAMS.feePerContract,
-      basisBp,
-      vpin: [proxyVpin, proxyVpin],
-      settledCash: settledCashUsd,
-    });
-
-    const entry: LeadLagShadowTelemetryEntry = {
-      evaluatedAt: nowIso,
-      mode: String((CHAMPION_CONFIG as unknown as Record<string, any>).task07c?.mode ?? 'shadow').toUpperCase(),
-      liveEnabled: false,
-      seriesTicker: feature.symbol,
-      contractTicker,
-      spotPair,
-      spotPrice,
-      askDollars,
-      fairValueProb,
-      triggerEvaluation,
-      toxicityAndBasisVerdict,
-      shadowWouldTrigger: triggerEvaluation.triggered && toxicityAndBasisVerdict.allowed,
+      atrDollar,
       settledCashUsd,
-    };
+      activePositions,
+      correlationMatrix: {},
+      timestampMs: nowMs,
+    },
+    settledCashCapFraction,
+    activeTriggerId ?? 'SVB-60'
+  );
 
-    leadLagShadowEvaluationState.latestBySeries[feature.symbol] = entry;
-    leadLagShadowEvaluationState.recentEvaluations.unshift(entry);
+  const basisBp =
+    candidate.basisBp ??
+    Number(((matchedCrypto?.vwapSpreadPct ?? feature?.vwapSpreadPct ?? 0) * 100).toFixed(2));
+  const obImb = candidate.orderbookImbalance ?? feature?.orderbookImbalance ?? 0;
+  const proxyVpin = Number(Math.max(0.05, Math.min(0.95, 0.35 + Math.abs(obImb) * 0.25)).toFixed(3));
+  const toxicityAndBasisVerdict = evaluateOrderFlowToxicityAndBasis({
+    trigger: activeTriggerId ?? 'SVB-60',
+    feedAgeMs,
+    fv: fairValueProb,
+    ask: askDollars,
+    feesPerShare: LEAD_LAG_PARAMS.feePerContract,
+    basisBp,
+    vpin: candidate.vpin ?? [proxyVpin, proxyVpin],
+    settledCash: settledCashUsd,
+    ...candidate.toxicitySnapshot,
+  });
+
+  const anyTriggerPassed = activeTriggerId !== null;
+  const shadowWouldTrigger =
+    anyTriggerPassed && envelopeEvaluation.passed && toxicityAndBasisVerdict.allowed;
+
+  const blockedReasons: string[] = [];
+  if (!envelopeEvaluation.passed) {
+    blockedReasons.push(...envelopeEvaluation.blockedReasons);
+  }
+  if (!toxicityAndBasisVerdict.allowed) {
+    blockedReasons.push(`TOXICITY_BASIS_${toxicityAndBasisVerdict.code}`);
+  }
+  if (!svb60Result.triggered) {
+    blockedReasons.push(...svb60Result.blockedReasons);
+  }
+  if (!gkx5Result.triggered) {
+    blockedReasons.push(...gkx5Result.blockedReasons);
+  }
+  if (!xvdResult.triggered) {
+    blockedReasons.push(...xvdResult.blockedReasons);
   }
 
+  const triggerEvaluation: LeadLagCombinedEvaluationResult = {
+    version: '2.7.0-LEAD-LAG-LIVE-CHAMPION',
+    envelopeVersion: '2.6.0-PORTFOLIO-GUARD-CHAMPION',
+    triggered: anyTriggerPassed && envelopeEvaluation.passed,
+    activeTriggerId: anyTriggerPassed && envelopeEvaluation.passed ? activeTriggerId : null,
+    triggeredIds,
+    settledCashCapFraction,
+    approvedNotionalUsd: anyTriggerPassed && envelopeEvaluation.passed ? envelopeEvaluation.approvedNotionalUsd : 0,
+    approvedContracts: anyTriggerPassed && envelopeEvaluation.passed ? envelopeEvaluation.approvedContracts : 0,
+    idempotencyKey: envelopeEvaluation.idempotencyKey,
+    timeBucket900s: envelopeEvaluation.timeBucket,
+    envelopeEvaluation,
+    svb60Result,
+    gkx5Result,
+    xvdResult,
+    rationale: shadowWouldTrigger
+      ? `[SHADOW_DAEMON · ZERO LIVE ORDER] ${activeTriggerId} candidate would trigger ${envelopeEvaluation.approvedContracts}x ($${envelopeEvaluation.approvedNotionalUsd.toFixed(2)})`
+      : `[SHADOW_DAEMON · HOLD] Blocked: ${blockedReasons.slice(0, 4).join('; ') || 'NO_TRIGGER_FIRED'}`,
+  };
+
+  const entry: LeadLagShadowTelemetryEntry = {
+    evaluatedAt: nowIso,
+    mode: 'shadow',
+    liveEnabled: false,
+    is_synthetic: 1,
+    source: 'SHADOW_DAEMON',
+    liveIdempotencyLocked: false,
+    seriesTicker,
+    contractTicker,
+    spotPair,
+    spotPrice,
+    askDollars,
+    fairValueProb,
+    svb60Result,
+    gkx5Result,
+    xvdResult,
+    envelopeEvaluation,
+    triggerEvaluation,
+    toxicityAndBasisVerdict,
+    blockedReasons,
+    shadowWouldTrigger,
+    settledCashUsd,
+  };
+
+  if (options?.logToMlLedger !== false) {
+    const netEdgeDollars = Number((fairValueProb - askDollars - LEAD_LAG_PARAMS.feePerContract).toFixed(4));
+    const atrPct = Number((candidate.atrPct ?? feature?.atrPct ?? 0.5).toFixed(3));
+    const rsi14 = Number((candidate.rsi14 ?? feature?.rsi14 ?? 50.0).toFixed(2));
+    const spotToStrikeBps =
+      strike > 0 ? Number((((spotPrice - strike) / strike) * 10000).toFixed(2)) : 0;
+    const gateBlockedReason = JSON.stringify({
+      shadowWouldTrigger,
+      activeTriggerId,
+      triggeredIds,
+      toxicityCode: toxicityAndBasisVerdict.code,
+      blockedReasons,
+    });
+
+    const telemetryRow = {
+      timestamp_utc: nowIso,
+      symbol: seriesTicker,
+      venue: 'PREDICTION_MARKET',
+      spot_price: spotPrice,
+      coinbase_spot: spotPrice,
+      strike,
+      spot_to_strike_bps: spotToStrikeBps,
+      minutes_left: minutesRemaining,
+      yes_ask: askDollars,
+      no_ask: Number((1 - askDollars).toFixed(4)),
+      l2_imbalance: Number(obImb.toFixed(3)),
+      kalshi_spread_bps: Number((wsBook ? Math.abs(wsBook.yesAskDollars - wsBook.yesBidDollars) * 10000 : 200).toFixed(1)),
+      nd2_fair_prob: fairValueProb,
+      net_edge_dollars: netEdgeDollars,
+      atr_pct: atrPct,
+      atr_baseline_mult: rGkRatio,
+      rsi_14: rsi14,
+      ma_spread_short_pct: Number(shortSpreadPct.toFixed(3)),
+      pearson_corr_regime: `${marketRegime}_SHADOW_EVAL`,
+      market_regime: marketRegime,
+      sniper_action: 'HOLD' as const,
+      gate_blocked_reason: gateBlockedReason,
+      realized_pnl_bps: 0,
+      realized_outcome: null,
+      is_synthetic: 1 as const,
+      source: 'SHADOW_DAEMON' as const,
+      ml_prob: null,
+      champ_prob: fairValueProb,
+      outcome: null,
+    };
+
+    try {
+      persistShadowRowToSqliteMlLedger(telemetryRow);
+    } catch {
+      // Preserve in-memory mirror even if SQLite path is read-only
+    }
+    recordMlTelemetryRow(telemetryRow);
+  }
+
+  leadLagShadowEvaluationState.latestBySeries[seriesTicker] = entry;
+  leadLagShadowEvaluationState.recentEvaluations.unshift(entry);
   if (leadLagShadowEvaluationState.recentEvaluations.length > 25) {
     leadLagShadowEvaluationState.recentEvaluations.length = 25;
   }
+
+  return entry;
+}
+
+function runLeadLagShadowEvaluationTick(options?: {
+  logToMlLedger?: boolean;
+}): typeof leadLagShadowEvaluationState {
+  assertLeadLagShadowModeOnly();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const predictionSeries = marketFeatures.filter((f) => f.is15MinPrediction);
+  for (const feature of predictionSeries) {
+    evaluateLeadLagShadowCandidate(
+      {
+        seriesTicker: feature.symbol,
+        contractTicker: feature.activeContractTicker || feature.symbol,
+      },
+      { logToMlLedger: options?.logToMlLedger ?? true, nowMs }
+    );
+  }
+
   leadLagShadowEvaluationState.evaluationsCount += 1;
   leadLagShadowEvaluationState.lastEvaluatedAt = nowIso;
   return leadLagShadowEvaluationState;
@@ -5784,7 +6237,7 @@ function runLeadLagShadowEvaluationTick(): typeof leadLagShadowEvaluationState {
 
 function getLeadLagShadowEvaluationState(): typeof leadLagShadowEvaluationState {
   if (leadLagShadowEvaluationState.evaluationsCount === 0) {
-    return runLeadLagShadowEvaluationTick();
+    return runLeadLagShadowEvaluationTick({ logToMlLedger: false });
   }
   return leadLagShadowEvaluationState;
 }
@@ -6282,7 +6735,11 @@ async function syncRealMarketBarsAndKalshi(force = false): Promise<void> {
   await syncLiveKalshiPortfolio(kalshiSuccessCount);
 
   // 4. Shadow-mode Lead-Lag Trigger + Order-Flow Toxicity/Basis Evaluation (Zero live order routing)
-  runLeadLagShadowEvaluationTick();
+  try {
+    runLeadLagShadowEvaluationTick({ logToMlLedger: false });
+  } catch {
+    // Hard shadow assertion failed; never allow fallback to live order routing
+  }
 }
 
 export async function syncLiveKalshiPortfolio(kalshiMarketCount = 0): Promise<void> {
@@ -20199,6 +20656,79 @@ app.get('/api/lead-lag/zero-hold-state', (_req, res) => {
   res.json(buildZeroHoldLeadLagSystemState());
 });
 
+app.post('/api/lead-lag/shadow', (req, res) => {
+  try {
+    const body = (req.body || {}) as ShadowCandidateInput & {
+      candidates?: ShadowCandidateInput[];
+    };
+
+    assertLeadLagShadowModeOnly({
+      leadLagMode: body.mode,
+      task07cLiveEnabled: body.liveEnabled,
+    });
+
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    let evaluations: LeadLagShadowTelemetryEntry[] = [];
+
+    if (Array.isArray(body.candidates) && body.candidates.length > 0) {
+      evaluations = body.candidates.map((cand) =>
+        evaluateLeadLagShadowCandidate(cand, { logToMlLedger: true, nowMs })
+      );
+      leadLagShadowEvaluationState.evaluationsCount += 1;
+      leadLagShadowEvaluationState.lastEvaluatedAt = nowIso;
+    } else if (
+      body.seriesTicker ||
+      body.contractTicker ||
+      body.svb60 ||
+      body.gkx5 ||
+      body.xvd ||
+      body.toxicitySnapshot ||
+      body.askDollars !== undefined ||
+      body.fairValueProb !== undefined
+    ) {
+      const singleEval = evaluateLeadLagShadowCandidate(body, {
+        logToMlLedger: true,
+        nowMs,
+      });
+      leadLagShadowEvaluationState.evaluationsCount += 1;
+      leadLagShadowEvaluationState.lastEvaluatedAt = nowIso;
+      evaluations = [singleEval];
+    } else {
+      runLeadLagShadowEvaluationTick({ logToMlLedger: true });
+      evaluations = Object.values(leadLagShadowEvaluationState.latestBySeries);
+    }
+
+    const blockedReasons = evaluations.flatMap((ev) =>
+      ev.blockedReasons.map((reason) => `${ev.seriesTicker}: ${reason}`)
+    );
+
+    res.json({
+      ok: true,
+      mode: 'shadow',
+      liveEnabled: false,
+      is_synthetic: 1,
+      source: 'SHADOW_DAEMON',
+      liveIdempotencyLocked: false,
+      evaluatedAt: nowIso,
+      evaluationsCount: evaluations.length,
+      shadowWouldTriggerCount: evaluations.filter((e) => e.shadowWouldTrigger).length,
+      blockedReasons,
+      evaluation: evaluations.length === 1 ? evaluations[0] : undefined,
+      evaluations,
+      shadowState: leadLagShadowEvaluationState,
+    });
+  } catch (err: any) {
+    res.status(403).json({
+      ok: false,
+      mode: 'BLOCKED',
+      liveEnabled: false,
+      liveIdempotencyLocked: false,
+      error: err?.message || 'SHADOW_MODE_HARD_ASSERTION_FAILED',
+    });
+  }
+});
+
 app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
   const {
     seriesTicker = 'KXBTC15M',
@@ -21976,8 +22506,28 @@ async function runCloudAutonomousDaemonTick(options?: {
       applyYesterdayProfitableSetup: true,
     }).catch(() => null);
 
-    // 5. Shadow-mode Lead-Lag & Order-Flow Toxicity Evaluation + Autonomous Parallel Zero-Hold Lead-Lag Matrix
-    runLeadLagShadowEvaluationTick();
+    // 5. Shadow-mode Lead-Lag & Order-Flow Toxicity Evaluation (15s monitor tick, is_synthetic=1, source='SHADOW_DAEMON', zero live order_ledger locks)
+    try {
+      runLeadLagShadowEvaluationTick({ logToMlLedger: true });
+    } catch (shadowErr: any) {
+      riskEvents.unshift({
+        id: `shadow-assert-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        eventType: 'SPREAD_LIQUIDITY_GUARD',
+        severity: 'CRITICAL',
+        agentId: 'shadow-daemon',
+        agentName: 'Lead-Lag Shadow Daemon',
+        archetype: 'SHORT_AND_FAST',
+        symbol: 'GLOBAL',
+        venue: 'PREDICTION_MARKET',
+        triggerMetric: 'lead_lag_triggers.mode / task07c.live_enabled',
+        thresholdValue: 'mode="shadow", live_enabled=false',
+        observedValue: 'ASSERTION_VIOLATION',
+        actionTaken: shadowErr?.message || 'SHADOW_MODE_HARD_ASSERTION_FAILED',
+        cancelledOrderIds: [],
+        acknowledged: false,
+      });
+    }
     const matrix = buildParallelFiveSeriesLeadLagMatrix();
     const goldilocksTargets = matrix.filter(
       (row) =>
@@ -22210,5 +22760,7 @@ export {
   computeLiquidityHealthScore,
   runLeadLagShadowEvaluationTick,
   getLeadLagShadowEvaluationState,
+  assertLeadLagShadowModeOnly,
+  evaluateLeadLagShadowCandidate,
   CHAMPION_CONFIG,
 };

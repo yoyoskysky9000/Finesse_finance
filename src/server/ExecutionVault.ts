@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   CHAMPION_CONFIG,
   computeLiquidityHealthScore,
@@ -190,9 +191,12 @@ export class ExecutionVault {
   private readonly idempotencyLockLedger = new Map<string, IdempotencyLockRecord>();
   private readonly auditLog: VaultAuditEntry[] = [];
   private readonly customPersistencePath?: string;
+  private sqliteDb: DatabaseSync | null = null;
+  private sqliteDbPath: string | null = null;
 
   constructor(persistencePath?: string) {
     this.customPersistencePath = persistencePath;
+    this.ensureSqliteConnection();
     this.reloadFromDisk();
   }
 
@@ -204,8 +208,97 @@ export class ExecutionVault {
     );
   }
 
+  public getSqliteDbPath(): string {
+    if (!this.customPersistencePath && process.env.QUANTPULSE_VAULT_SQLITE_PATH) {
+      return process.env.QUANTPULSE_VAULT_SQLITE_PATH;
+    }
+    const jsonPath = this.getPersistencePath();
+    return jsonPath.endsWith('.json')
+      ? `${jsonPath.slice(0, -5)}.sqlite`
+      : `${jsonPath}.sqlite`;
+  }
+
+  private ensureSqliteConnection(): DatabaseSync {
+    const targetPath = this.getSqliteDbPath();
+    if (this.sqliteDb && this.sqliteDbPath === targetPath) {
+      return this.sqliteDb;
+    }
+    if (this.sqliteDb) {
+      try {
+        this.sqliteDb.close();
+      } catch {
+        // Ignore close failure
+      }
+      this.sqliteDb = null;
+    }
+    const dir = path.dirname(targetPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const db = new DatabaseSync(targetPath);
+    db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;');
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_ledger (
+        order_id TEXT PRIMARY KEY,
+        client_order_id TEXT,
+        idempotency_key TEXT NOT NULL,
+        venue TEXT,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity TEXT,
+        price TEXT,
+        status TEXT NOT NULL,
+        raw_venue_response TEXT,
+        raw_tuple TEXT,
+        strategy_id TEXT,
+        timeframe TEXT,
+        cooldown_sec INTEGER,
+        time_bucket INTEGER,
+        locked_at_ms INTEGER,
+        expires_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_order_ledger_idempotency_key
+        ON order_ledger(idempotency_key);
+    `);
+    this.sqliteDb = db;
+    this.sqliteDbPath = targetPath;
+    return db;
+  }
+
   public reloadFromDisk(nowMs = Date.now()): void {
     this.idempotencyLockLedger.clear();
+    try {
+      const db = this.ensureSqliteConnection();
+      const rows = db
+        .prepare(
+          `SELECT order_id, idempotency_key, raw_tuple, symbol, side, strategy_id,
+                  timeframe, cooldown_sec, time_bucket, locked_at_ms, expires_at_ms
+           FROM order_ledger
+           WHERE expires_at_ms > ?`
+        )
+        .all(nowMs) as Array<Record<string, unknown>>;
+      for (const row of rows) {
+        const hash = String(row.idempotency_key || '');
+        if (!hash) continue;
+        const ordId = String(row.order_id || '');
+        this.idempotencyLockLedger.set(hash, {
+          idempotencyHash: hash,
+          rawTuple: String(row.raw_tuple || ''),
+          symbol: String(row.symbol || ''),
+          side: String(row.side || ''),
+          strategyId: String(row.strategy_id || ''),
+          timeframe: (String(row.timeframe || '15m') as CooldownTimeframe),
+          cooldownSec: Number(row.cooldown_sec || 2700),
+          timeBucket: Number(row.time_bucket || 0),
+          lockedAtMs: Number(row.locked_at_ms || nowMs),
+          expiresAtMs: Number(row.expires_at_ms || 0),
+          orderId: ordId && !ordId.startsWith('LOCK:') ? ordId : undefined,
+        });
+      }
+    } catch {
+      // Fall back to JSON ledger if SQLite unavailable
+    }
     const filePath = this.getPersistencePath();
     try {
       if (!fs.existsSync(filePath)) return;
@@ -213,7 +306,7 @@ export class ExecutionVault {
       if (!raw.trim()) return;
       const parsed = JSON.parse(raw) as { records?: IdempotencyLockRecord[] };
       for (const rec of parsed.records || []) {
-        if (rec && typeof rec.idempotencyHash === 'string' && rec.expiresAtMs > nowMs) {
+        if (rec && typeof rec.idempotencyHash === 'string' && rec.expiresAtMs > nowMs && !this.idempotencyLockLedger.has(rec.idempotencyHash)) {
           this.idempotencyLockLedger.set(rec.idempotencyHash, rec);
         }
       }
@@ -257,6 +350,23 @@ export class ExecutionVault {
 
   public clearLocksForTests(): void {
     this.idempotencyLockLedger.clear();
+    try {
+      const db = this.ensureSqliteConnection();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.exec('DELETE FROM order_ledger');
+        db.exec('COMMIT');
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Ignore rollback failure
+        }
+        throw err;
+      }
+    } catch {
+      // Ignore test cleanup errors
+    }
     this.persistLedgerToDisk();
   }
 
@@ -391,12 +501,100 @@ export class ExecutionVault {
       .update(rawTuple)
       .digest('hex');
 
-    const existing = this.idempotencyLockLedger.get(idempotencyHash);
-    if (existing && nowMs < existing.expiresAtMs) {
-      const remainingCooldownSec = Math.max(
-        1,
-        Math.ceil((existing.expiresAtMs - nowMs) / 1000)
-      );
+    const expiresAtMs = nowMs + cooldownSec * 1000;
+    const db = this.ensureSqliteConnection();
+    let existingRecord: IdempotencyLockRecord | undefined;
+    let duplicateBlocked = false;
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        'DELETE FROM order_ledger WHERE idempotency_key = ? AND expires_at_ms <= ?'
+      ).run(idempotencyHash, nowMs);
+
+      const insertRes = db
+        .prepare(
+          `INSERT INTO order_ledger (
+            order_id, client_order_id, idempotency_key, venue, symbol, side,
+            quantity, price, status, raw_venue_response, raw_tuple, strategy_id,
+            timeframe, cooldown_sec, time_bucket, locked_at_ms, expires_at_ms, created_at
+          )
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (
+            SELECT 1 FROM order_ledger
+            WHERE idempotency_key = ?
+              AND expires_at_ms > ?
+          )`
+        )
+        .run(
+          `LOCK:${idempotencyHash}`,
+          idempotencyHash,
+          idempotencyHash,
+          'EXECUTION_VAULT',
+          normSymbol,
+          normSide,
+          '0',
+          '0',
+          'LOCKED_PRE_EXCHANGE',
+          '',
+          rawTuple,
+          normStrategy,
+          input.timeframe,
+          cooldownSec,
+          timeBucket,
+          nowMs,
+          expiresAtMs,
+          new Date(nowMs).toISOString(),
+          idempotencyHash,
+          nowMs
+        );
+
+      if (Number(insertRes.changes) === 0) {
+        duplicateBlocked = true;
+        const row = db
+          .prepare(
+            `SELECT order_id, idempotency_key, raw_tuple, symbol, side, strategy_id,
+                    timeframe, cooldown_sec, time_bucket, locked_at_ms, expires_at_ms
+             FROM order_ledger
+             WHERE idempotency_key = ? AND expires_at_ms > ?
+             LIMIT 1`
+          )
+          .get(idempotencyHash, nowMs) as Record<string, unknown> | undefined;
+        if (row) {
+          const ordId = String(row.order_id || '');
+          existingRecord = {
+            idempotencyHash: String(row.idempotency_key || idempotencyHash),
+            rawTuple: String(row.raw_tuple || rawTuple),
+            symbol: String(row.symbol || normSymbol),
+            side: String(row.side || normSide),
+            strategyId: String(row.strategy_id || normStrategy),
+            timeframe: String(row.timeframe || input.timeframe) as CooldownTimeframe,
+            cooldownSec: Number(row.cooldown_sec || cooldownSec),
+            timeBucket: Number(row.time_bucket || timeBucket),
+            lockedAtMs: Number(row.locked_at_ms || nowMs),
+            expiresAtMs: Number(row.expires_at_ms || expiresAtMs),
+            orderId: ordId && !ordId.startsWith('LOCK:') ? ordId : undefined,
+          };
+        }
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback failure
+      }
+      throw err;
+    }
+
+    if (duplicateBlocked) {
+      const activeExisting = existingRecord || this.idempotencyLockLedger.get(idempotencyHash);
+      if (activeExisting) {
+        this.idempotencyLockLedger.set(idempotencyHash, activeExisting);
+      }
+      const remainingCooldownSec = activeExisting
+        ? Math.max(1, Math.ceil((activeExisting.expiresAtMs - nowMs) / 1000))
+        : cooldownSec;
       this.pushAudit({
         ts: new Date(nowMs).toISOString(),
         rule: 'RULE_2_IDEMPOTENCY_LOCK',
@@ -412,7 +610,7 @@ export class ExecutionVault {
         timeBucket,
         cooldownSec,
         remainingCooldownSec,
-        existingRecord: existing,
+        existingRecord: activeExisting,
       };
     }
 
@@ -426,7 +624,7 @@ export class ExecutionVault {
       cooldownSec,
       timeBucket,
       lockedAtMs: nowMs,
-      expiresAtMs: nowMs + cooldownSec * 1000,
+      expiresAtMs,
     };
     this.idempotencyLockLedger.set(idempotencyHash, record);
     this.persistLedgerToDisk(nowMs);
@@ -455,6 +653,25 @@ export class ExecutionVault {
     if (rec) {
       rec.orderId = orderId;
       this.persistLedgerToDisk();
+    }
+    try {
+      const db = this.ensureSqliteConnection();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare(
+          "UPDATE order_ledger SET order_id = ?, status = 'ORDER_ATTACHED' WHERE idempotency_key = ?"
+        ).run(orderId, idempotencyHash);
+        db.exec('COMMIT');
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Ignore rollback failure
+        }
+        throw err;
+      }
+    } catch {
+      // Ignore sqlite update failure when no matching row exists
     }
   }
 

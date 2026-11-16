@@ -439,6 +439,13 @@ mcp = FastMCP(
 # =====================================================================
 # 1. DUCKDB / SQLITE TELEMETRY, IDEMPOTENCY LEDGER & DEAD-LETTER QUEUE
 # =====================================================================
+def _configure_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """Enforces WAL concurrency, NORMAL synchronous durability, and 5000ms busy timeout on SQLite connections."""
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+
+
 class _LedgerConnectionWrapper:
     """Unified connection wrapper supporting DuckDB (primary) or SQLite3 (stdlib fallback)."""
     def __init__(self, path: str) -> None:
@@ -447,7 +454,8 @@ class _LedgerConnectionWrapper:
             self._con = duckdb.connect(path)
         else:
             sqlite_path = path if path.endswith(".sqlite") else f"{path}.sqlite"
-            self._con = sqlite3.connect(sqlite_path)
+            self._con = sqlite3.connect(sqlite_path, timeout=5.0)
+            _configure_sqlite_pragmas(self._con)
 
     def execute_script(self, sql_script: str) -> None:
         if self._is_duckdb:
@@ -465,6 +473,124 @@ class _LedgerConnectionWrapper:
         if not self._is_duckdb:
             self._con.commit()
         return cur
+
+    def commit(self) -> None:
+        if not self._is_duckdb:
+            self._con.commit()
+
+    def acquire_rule2_idempotency_lock(
+        self,
+        idempotency_key: str,
+        venue: str,
+        symbol: str,
+        side: str,
+        quantity: Any,
+        price_dollars: Any,
+        client_order_id: str = "",
+        cooldown_sec: int = 900,
+        now_ms: Optional[int] = None,
+    ) -> bool:
+        """
+        Rule 2 atomic idempotency lock acquisition wrapped in an explicit `BEGIN IMMEDIATE` transaction
+        using `INSERT INTO order_ledger ... WHERE NOT EXISTS`.
+        """
+        ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        expires_at_ms = ts_ms + (max(1, int(cooldown_sec)) * 1000)
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        lock_order_id = f"LOCK:{idempotency_key}"
+
+        if not self._is_duckdb:
+            if getattr(self._con, "in_transaction", False):
+                self._con.commit()
+            self._con.execute("BEGIN IMMEDIATE")
+            try:
+                self._con.execute(
+                    "DELETE FROM order_ledger WHERE idempotency_key = ? AND expires_at_ms > 0 AND expires_at_ms <= ?",
+                    [idempotency_key, ts_ms],
+                )
+                cur = self._con.execute(
+                    """
+                    INSERT INTO order_ledger (
+                        order_id, client_order_id, idempotency_key, venue, symbol,
+                        side, quantity, price, price_dollars, status, raw_venue_response,
+                        expires_at_ms, created_at
+                    )
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM order_ledger
+                        WHERE idempotency_key = ?
+                          AND (expires_at_ms IS NULL OR expires_at_ms = 0 OR expires_at_ms > ?)
+                    )
+                    """,
+                    [
+                        lock_order_id,
+                        client_order_id,
+                        idempotency_key,
+                        venue,
+                        symbol,
+                        side,
+                        str(quantity),
+                        str(price_dollars),
+                        str(price_dollars),
+                        "LOCKED_PRE_EXCHANGE",
+                        "",
+                        expires_at_ms,
+                        now_iso,
+                        idempotency_key,
+                        ts_ms,
+                    ],
+                )
+                acquired = bool(cur.rowcount and cur.rowcount > 0)
+                self._con.commit()
+                return acquired
+            except Exception:
+                self._con.rollback()
+                raise
+
+        existing = self._con.execute(
+            """
+            SELECT 1 FROM order_ledger
+            WHERE idempotency_key = ?
+              AND (expires_at_ms IS NULL OR expires_at_ms = 0 OR expires_at_ms > ?)
+            LIMIT 1
+            """,
+            [idempotency_key, ts_ms],
+        ).fetchone()
+        if existing:
+            return False
+        self._con.execute(
+            """
+            INSERT INTO order_ledger (
+                order_id, client_order_id, idempotency_key, venue, symbol,
+                side, quantity, price, price_dollars, status, raw_venue_response,
+                expires_at_ms, created_at
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM order_ledger
+                WHERE idempotency_key = ?
+                  AND (expires_at_ms IS NULL OR expires_at_ms = 0 OR expires_at_ms > ?)
+            )
+            """,
+            [
+                lock_order_id,
+                client_order_id,
+                idempotency_key,
+                venue,
+                symbol,
+                side,
+                str(quantity),
+                str(price_dollars),
+                str(price_dollars),
+                "LOCKED_PRE_EXCHANGE",
+                "",
+                expires_at_ms,
+                now_iso,
+                idempotency_key,
+                ts_ms,
+            ],
+        )
+        return True
 
     def close(self) -> None:
         self._con.close()
@@ -561,7 +687,9 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             recommended_ask_min DOUBLE,
             recommended_ask_max DOUBLE,
             weights_json VARCHAR,
-            tripped BOOLEAN DEFAULT FALSE
+            tripped BOOLEAN DEFAULT FALSE,
+            tripped_at_ts VARCHAR,
+            recovery_stage VARCHAR DEFAULT 'LIVE'
         );
         CREATE TABLE IF NOT EXISTS public_order_retry_ledger (
             retry_log_id VARCHAR PRIMARY KEY,
@@ -609,10 +737,13 @@ def get_db_connection() -> _LedgerConnectionWrapper:
             side VARCHAR,
             quantity VARCHAR,
             price VARCHAR,
+            price_dollars VARCHAR,
             status VARCHAR,
             raw_venue_response VARCHAR,
+            expires_at_ms BIGINT DEFAULT 0,
             created_at TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_order_ledger_idempotency ON order_ledger(idempotency_key);
     """)
     # Safe schema migration for pre-existing DuckDB/SQLite files
     for alter_sql in [
@@ -628,14 +759,99 @@ def get_db_connection() -> _LedgerConnectionWrapper:
         "ALTER TABLE ml_telemetry_ledger ADD COLUMN outcome INTEGER",
         "ALTER TABLE ml_meta_model_state ADD COLUMN recommended_atr_stop_mult DOUBLE",
         "ALTER TABLE ml_meta_model_state ADD COLUMN tripped BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE ml_meta_model_state ADD COLUMN tripped_at_ts VARCHAR",
+        "ALTER TABLE ml_meta_model_state ADD COLUMN recovery_stage VARCHAR DEFAULT 'LIVE'",
         "ALTER TABLE public_order_retry_ledger ADD COLUMN raw_venue_response VARCHAR",
         "ALTER TABLE kalshi_client_order_ledger ADD COLUMN raw_venue_response VARCHAR",
+        "ALTER TABLE order_ledger ADD COLUMN price_dollars VARCHAR",
+        "ALTER TABLE order_ledger ADD COLUMN expires_at_ms BIGINT DEFAULT 0",
     ]:
         try:
             con.execute(alter_sql)
         except Exception:
             pass
     return con
+
+
+def acquire_rule2_idempotency_lock(
+    con: Any,
+    idempotency_key: str,
+    venue: str = "EXECUTION",
+    symbol: str = "",
+    side: str = "",
+    quantity: Any = 0,
+    price_dollars: Any = 0.0,
+    client_order_id: str = "",
+    cooldown_sec: int = 900,
+    now_ms: Optional[int] = None,
+) -> bool:
+    """Module-level Rule 2 atomic lock helper supporting both `_LedgerConnectionWrapper` and raw `sqlite3.Connection`."""
+    if hasattr(con, "acquire_rule2_idempotency_lock"):
+        return bool(
+            con.acquire_rule2_idempotency_lock(
+                idempotency_key=idempotency_key,
+                venue=venue,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price_dollars=price_dollars,
+                client_order_id=client_order_id,
+                cooldown_sec=cooldown_sec,
+                now_ms=now_ms,
+            )
+        )
+    if isinstance(con, sqlite3.Connection):
+        _configure_sqlite_pragmas(con)
+        ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        expires_at_ms = ts_ms + (max(1, int(cooldown_sec)) * 1000)
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if getattr(con, "in_transaction", False):
+            con.commit()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute(
+                "DELETE FROM order_ledger WHERE idempotency_key = ? AND expires_at_ms > 0 AND expires_at_ms <= ?",
+                [idempotency_key, ts_ms],
+            )
+            cur = con.execute(
+                """
+                INSERT INTO order_ledger (
+                    order_id, client_order_id, idempotency_key, venue, symbol,
+                    side, quantity, price, price_dollars, status, raw_venue_response,
+                    expires_at_ms, created_at
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM order_ledger
+                    WHERE idempotency_key = ?
+                      AND (expires_at_ms IS NULL OR expires_at_ms = 0 OR expires_at_ms > ?)
+                )
+                """,
+                [
+                    f"LOCK:{idempotency_key}",
+                    client_order_id,
+                    idempotency_key,
+                    venue,
+                    symbol,
+                    side,
+                    str(quantity),
+                    str(price_dollars),
+                    str(price_dollars),
+                    "LOCKED_PRE_EXCHANGE",
+                    "",
+                    expires_at_ms,
+                    now_iso,
+                    idempotency_key,
+                    ts_ms,
+                ],
+            )
+            acquired = bool(cur.rowcount and cur.rowcount > 0)
+            con.commit()
+            return acquired
+        except Exception:
+            con.rollback()
+            raise
+    return True
 
 
 def check_idempotent_replay(con: _LedgerConnectionWrapper, idempotency_key: str) -> Optional[Dict[str, Any]]:
@@ -1462,13 +1678,24 @@ def page_hinkley_alarm(
 
 
 def _persist_meta_model_tripped_state(conn: Any, tripped: bool, reason: str = "") -> None:
-    """Persists `tripped = True` into `ml_meta_model_state` (column and `weights_json`)."""
+    """
+    Persists `tripped = 1`, `tripped_at_ts`, and `recovery_stage = 'SHADOW_30'` into
+    `ml_meta_model_state` so restarts never silently re-enable a drifted ML model.
+    """
     try:
-        try:
-            conn.execute("ALTER TABLE ml_meta_model_state ADD COLUMN tripped BOOLEAN DEFAULT FALSE")
-        except Exception:
-            pass
+        if isinstance(conn, sqlite3.Connection):
+            _configure_sqlite_pragmas(conn)
+        for alter_col in [
+            "ALTER TABLE ml_meta_model_state ADD COLUMN tripped BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE ml_meta_model_state ADD COLUMN tripped_at_ts VARCHAR",
+            "ALTER TABLE ml_meta_model_state ADD COLUMN recovery_stage VARCHAR DEFAULT 'LIVE'",
+        ]:
+            try:
+                conn.execute(alter_col)
+            except Exception:
+                pass
 
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         row = None
         try:
             row = conn.execute(
@@ -1480,31 +1707,35 @@ def _persist_meta_model_tripped_state(conn: Any, tripped: bool, reason: str = ""
             except Exception:
                 row = None
 
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        if row and len(row) >= 2:
-            model_id = str(row[0])
-            w_data = json.loads(row[1]) if row[1] else {}
-            w_data["tripped"] = bool(tripped)
-            if reason:
-                w_data["trip_reason"] = reason
-            w_json = json.dumps(w_data)
-            try:
-                conn.execute(
-                    "UPDATE ml_meta_model_state SET weights_json = ?, tripped = ? WHERE model_id = ?",
-                    [w_json, bool(tripped), model_id],
-                )
-            except Exception:
+        if row:
+            conn.execute(
+                "UPDATE ml_meta_model_state SET tripped = 1, tripped_at_ts = ?, recovery_stage = 'SHADOW_30'",
+                [now_iso],
+            )
+            if len(row) >= 2:
                 try:
+                    model_id = str(row[0])
+                    w_data = json.loads(row[1]) if row[1] else {}
+                    w_data["tripped"] = bool(tripped)
+                    w_data["tripped_at_ts"] = now_iso
+                    w_data["recovery_stage"] = "SHADOW_30"
+                    if reason:
+                        w_data["trip_reason"] = reason
                     conn.execute(
                         "UPDATE ml_meta_model_state SET weights_json = ? WHERE model_id = ?",
-                        [w_json, model_id],
+                        [json.dumps(w_data), model_id],
                     )
                 except Exception:
-                    conn.execute("UPDATE ml_meta_model_state SET tripped = ?", [bool(tripped)])
-        elif row and len(row) == 1:
-            conn.execute("UPDATE ml_meta_model_state SET tripped = ?", [bool(tripped)])
+                    pass
         else:
-            w_json = json.dumps({"is_trained": False, "model_id": "governance-breaker", "tripped": bool(tripped), "trip_reason": reason})
+            w_json = json.dumps({
+                "is_trained": False,
+                "model_id": "governance-breaker",
+                "tripped": bool(tripped),
+                "tripped_at_ts": now_iso,
+                "recovery_stage": "SHADOW_30",
+                "trip_reason": reason,
+            })
             try:
                 conn.execute(
                     """
@@ -1512,8 +1743,9 @@ def _persist_meta_model_tripped_state(conn: Any, tripped: bool, reason: str = ""
                         model_id, trained_at, target_metric, samples_used,
                         brier_score_raw, brier_score_calibrated, log_loss_calibrated,
                         empirical_win_rate, recommended_min_net_edge, recommended_atr_stop_mult,
-                        recommended_ask_min, recommended_ask_max, weights_json, tripped
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        recommended_ask_min, recommended_ask_max, weights_json,
+                        tripped, tripped_at_ts, recovery_stage
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         "governance-breaker",
@@ -1529,38 +1761,16 @@ def _persist_meta_model_tripped_state(conn: Any, tripped: bool, reason: str = ""
                         LEAD_LAG_ASK_MIN,
                         LEAD_LAG_ASK_MAX,
                         w_json,
-                        bool(tripped),
+                        1,
+                        now_iso,
+                        "SHADOW_30",
                     ],
                 )
             except Exception:
-                try:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO ml_meta_model_state (
-                            model_id, trained_at, target_metric, samples_used,
-                            brier_score_raw, brier_score_calibrated, log_loss_calibrated,
-                            empirical_win_rate, recommended_min_net_edge, recommended_atr_stop_mult,
-                            recommended_ask_min, recommended_ask_max, weights_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            "governance-breaker",
-                            now_iso,
-                            "brier_score",
-                            0,
-                            0.25,
-                            0.25,
-                            0.69,
-                            0.5,
-                            LEAD_LAG_MIN_EDGE,
-                            1.35,
-                            LEAD_LAG_ASK_MIN,
-                            LEAD_LAG_ASK_MAX,
-                            w_json,
-                        ],
-                    )
-                except Exception:
-                    conn.execute("INSERT INTO ml_meta_model_state (tripped) VALUES (?)", [bool(tripped)])
+                conn.execute(
+                    "INSERT INTO ml_meta_model_state (tripped, tripped_at_ts, recovery_stage) VALUES (1, ?, 'SHADOW_30')",
+                    [now_iso],
+                )
         if hasattr(conn, "commit"):
             try:
                 conn.commit()
@@ -1641,27 +1851,43 @@ def live_stats(conn: Any = None) -> Dict[str, Any]:
         else:
             trading_days = max(int(cfg["min_trading_days"]), n // 5) if n >= int(cfg["n_min"]) else (n // 5)
 
+        if isinstance(conn, sqlite3.Connection):
+            _configure_sqlite_pragmas(conn)
+
         already_tripped = bool(cfg.get("tripped", False))
         try:
             st_row = conn.execute(
-                "SELECT tripped, weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
+                "SELECT tripped, weights_json, recovery_stage FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
             ).fetchone()
             if st_row:
-                already_tripped = already_tripped or bool(st_row[0]) or (bool(json.loads(st_row[1]).get("tripped", False)) if st_row[1] else False)
+                stage = str(st_row[2] or "").upper() if len(st_row) > 2 else ""
+                already_tripped = (
+                    already_tripped
+                    or bool(st_row[0])
+                    or stage.startswith("SHADOW")
+                    or (bool(json.loads(st_row[1]).get("tripped", False)) if st_row[1] else False)
+                )
         except Exception:
             try:
                 st_row = conn.execute(
-                    "SELECT weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
+                    "SELECT tripped, weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
                 ).fetchone()
-                if st_row and st_row[0]:
-                    already_tripped = already_tripped or bool(json.loads(st_row[0]).get("tripped", False))
+                if st_row:
+                    already_tripped = already_tripped or bool(st_row[0]) or (bool(json.loads(st_row[1]).get("tripped", False)) if st_row[1] else False)
             except Exception:
                 try:
-                    st_row = conn.execute("SELECT tripped FROM ml_meta_model_state LIMIT 1").fetchone()
-                    if st_row:
-                        already_tripped = already_tripped or bool(st_row[0])
+                    st_row = conn.execute(
+                        "SELECT weights_json FROM ml_meta_model_state ORDER BY trained_at DESC LIMIT 1"
+                    ).fetchone()
+                    if st_row and st_row[0]:
+                        already_tripped = already_tripped or bool(json.loads(st_row[0]).get("tripped", False))
                 except Exception:
-                    pass
+                    try:
+                        st_row = conn.execute("SELECT tripped FROM ml_meta_model_state LIMIT 1").fetchone()
+                        if st_row:
+                            already_tripped = already_tripped or bool(st_row[0])
+                    except Exception:
+                        pass
 
         if n == 0:
             return {
@@ -1734,29 +1960,51 @@ def live_stats(conn: Any = None) -> Dict[str, Any]:
 
 def ml_weight(conn: Any = None) -> float:
     """
-    TASK-07D: Computes live ML ensemble blending weight `w_ml`:
+    TASK-07D / Section 21.3: Computes live ML ensemble blending weight `w_ml`:
     - Returns `0.0` until `n >= 100` (`n_min`) and `trading_days >= 20` (`min_trading_days`).
-    - Returns `0.0` immediately if disabled, force_disabled, or `tripped == True`.
+    - Whenever a Brier, Log-Loss, or Page-Hinkley drift check trips (`G["tripped"] = True`),
+      persists immediately to disk via `UPDATE ml_meta_model_state SET tripped = 1, tripped_at_ts = ?, recovery_stage = 'SHADOW_30'`
+      so restarts never silently re-enable a drifted ML model.
     - Shrinks weight via `n / (n + shrinkage_k)` and caps at `w_cap_early = 0.50` (`n < 250`)
       or `w_cap_late = 0.75` (`n >= 250`).
     """
-    cfg = ML_META_MODEL_GOVERNANCE
-    if not bool(cfg.get("enabled", True)) or bool(cfg.get("force_disable", False)) or bool(cfg.get("tripped", False)):
+    G = ML_META_MODEL_GOVERNANCE
+    if not bool(G.get("enabled", True)) or bool(G.get("force_disable", False)) or bool(G.get("tripped", False)):
         return 0.0
 
-    stats = live_stats(conn)
-    if (
-        stats["tripped"]
-        or stats["n"] < int(cfg["n_min"])
-        or stats["trading_days"] < int(cfg["min_trading_days"])
-    ):
-        return 0.0
+    close_after = False
+    active_conn = conn
+    if active_conn is None:
+        active_conn = get_db_connection()
+        close_after = True
+    elif isinstance(active_conn, sqlite3.Connection):
+        _configure_sqlite_pragmas(active_conn)
 
-    n = float(stats["n"])
-    shrinkage_k = float(cfg["shrinkage_k"])
-    w_cap = float(cfg["w_cap_late"]) if n >= float(cfg["n_late"]) else float(cfg["w_cap_early"])
-    raw_w = n / (n + shrinkage_k)
-    return round(max(0.0, min(w_cap, raw_w)), 6)
+    try:
+        stats = live_stats(active_conn)
+        if stats["tripped"] or stats.get("ph_alarm"):
+            G["tripped"] = True
+            _persist_meta_model_tripped_state(
+                active_conn,
+                True,
+                reason=f"ML_GOVERNANCE_TRIPPED: ph={stats.get('ph_alarm')}, bss={stats.get('bss')}, ll_gap={stats.get('logloss_gap')}",
+            )
+            return 0.0
+
+        if (
+            stats["n"] < int(G["n_min"])
+            or stats["trading_days"] < int(G["min_trading_days"])
+        ):
+            return 0.0
+
+        n = float(stats["n"])
+        shrinkage_k = float(G["shrinkage_k"])
+        w_cap = float(G["w_cap_late"]) if n >= float(G["n_late"]) else float(G["w_cap_early"])
+        raw_w = n / (n + shrinkage_k)
+        return round(max(0.0, min(w_cap, raw_w)), 6)
+    finally:
+        if close_after:
+            active_conn.close()
 
 
 def blended_size(
@@ -4121,6 +4369,10 @@ async def submit_kalshi_v2_events_order(
             )
             if live_ok:
                 con.execute(
+                    "DELETE FROM order_ledger WHERE idempotency_key = ? AND order_id LIKE 'LOCK:%'",
+                    [idempotency_key],
+                )
+                con.execute(
                     """
                     INSERT OR REPLACE INTO order_ledger (
                         order_id, client_order_id, idempotency_key, venue, symbol,
@@ -4510,7 +4762,8 @@ def get_brier_sqlite_connection() -> sqlite3.Connection:
        Creates and returns a connection to the local SQLite database with tables
        `predictions` and `series_calibration`.
     """
-    conn = sqlite3.connect(KALSHI_BRIER_SQLITE_PATH)
+    conn = sqlite3.connect(KALSHI_BRIER_SQLITE_PATH, timeout=5.0)
+    _configure_sqlite_pragmas(conn)
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """
@@ -5285,6 +5538,10 @@ async def submit_public_com_order_with_retry(
                 )
                 try:
                     con.execute(
+                        "DELETE FROM order_ledger WHERE idempotency_key = ? AND order_id LIKE 'LOCK:%'",
+                        [idempotency_key],
+                    )
+                    con.execute(
                         """
                         INSERT OR REPLACE INTO order_ledger (
                             order_id, client_order_id, idempotency_key, venue, symbol,
@@ -5678,6 +5935,28 @@ async def execute_kalshi_or_public_order(
 
         capped_notional = float(corr_guard["approvedNotionalUsd"])
         contracts = int(corr_guard["approvedContracts"])
+
+        # Rule 2 Atomic Idempotency Lock via explicit BEGIN IMMEDIATE transaction before venue execution
+        lock_acquired = acquire_rule2_idempotency_lock(
+            con,
+            idempotency_key=idempotency_key,
+            venue="KALSHI_V2" if is_kalshi_15m else "PUBLIC_COM",
+            symbol=symbol.upper().strip(),
+            side=side,
+            quantity=contracts,
+            price_dollars=ask_price,
+        )
+        if not lock_acquired:
+            dup_block = {
+                "ok": False,
+                "status": "IDEMPOTENCY_LOCK_BLOCKED",
+                "symbol": symbol,
+                "idempotencyKey": idempotency_key,
+                "idempotentReplay": True,
+                "dataQualityWarning": False,
+                "rationale": f"Rule 2 BEGIN IMMEDIATE lock blocked duplicate order for idempotency_key='{idempotency_key}'.",
+            }
+            return dup_block
 
         product_id = resolve_coinbase_product_id(symbol)
         spot_source = "EXPLICIT_CALLER_SPOT"
