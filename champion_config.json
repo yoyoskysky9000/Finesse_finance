@@ -265,6 +265,47 @@
     "fallback_version": "2.7.0-LEAD-LAG-LIVE-CHAMPION",
     "hard_cash_cap_pct": 0.03,
     "hard_drawdown_pct": 0.035
+  },
+  "low_balance_kalshi_compounder": {
+    "enabled": true,
+    "tier_name": "MICRO_LOT_30",
+    "max_settled_cash_usd": 150.0,
+    "settled_cash_cap_fraction": 0.03,
+    "max_contracts_per_trade": 1,
+    "pre_entry_resting_order_check": {
+      "enabled": true,
+      "cancel_stale_resting_orders_first": true,
+      "confirm_zero_resting_orders_before_entry": true
+    },
+    "maker_first_entry": {
+      "post_only": true,
+      "time_in_force": "good_till_canceled",
+      "cancel_order_on_pause": true,
+      "allowed_triggers": ["SVB-60", "GKX-5"],
+      "min_fv_minus_entry_dollars": 0.18,
+      "chop14_max": 50.0,
+      "adx_min": 25.0,
+      "lhs_min": 0.65,
+      "price_band": [0.52, 0.74],
+      "price_formula": "min(best_ask - 0.01, best_bid + 0.01)",
+      "unfilled_auto_cancel_seconds": 12,
+      "never_chase_market_order": true
+    },
+    "zero_fee_settlement_hold_exemption": {
+      "enabled": true,
+      "max_contracts": 1,
+      "t_minus_seconds": 90,
+      "min_fv_nd2": 0.85,
+      "min_itm_sigma_sqrt_tau_mult": 0.25,
+      "settlement_fee_usd": 0.0
+    },
+    "tight_2eval_inversion_stop": {
+      "enabled": true,
+      "fv_minus_bid_threshold_usd": -0.04,
+      "consecutive_15s_checks": 2,
+      "max_unrealized_loss_usd": -0.06,
+      "trigger_rule3_pre_exit_sweep": true
+    }
   }
 }
 

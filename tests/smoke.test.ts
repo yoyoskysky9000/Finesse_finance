@@ -1285,7 +1285,199 @@ async function runSmokeSuite() {
       'PASS [TASK-06 & TASK-08 / 2.7.0-LEAD-LAG-LIVE-CHAMPION]: PortfolioCorrelationGuard, Telemetry Gate, mcp_server.py de-sim Gates (a)-(e), and LeadLagAnomalyTriggers (SVB-60, GKX-5, XVD) passed.'
     );
 
-    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION PASSED.');
+    // -------------------------------------------------------------------------
+    // LOW-BALANCE KALSHI COMPOUNDER TESTS ($32.99 MICRO_LOT_30 < $150 settled cash)
+    // -------------------------------------------------------------------------
+    const compVault = new ExecutionVault(path.join(tempLedgerDir, 'compounder-vault.json'));
+    compVault.clearLocksForTests();
+    assert.equal(compVault.isLowBalanceKalshiCompounderActive(32.99), true);
+    assert.equal(compVault.isLowBalanceKalshiCompounderActive(150.0), false);
+
+    // 1. MICRO_LOT_30 sizing: $32.99 * 0.03 = $0.9897 -> strictly 1 contract
+    const compSizing = compVault.computeLowBalanceCompounderSizing(32.99, 0.58);
+    assert.equal(compSizing.tier, 'MICRO_LOT_30');
+    assert.equal(compSizing.approvedContracts, 1);
+    assert.equal(compSizing.maxContracts, 1);
+    assert.ok(Math.abs(compSizing.cashCapUsd - 0.9897) < 0.001);
+
+    // 2. Price formula: min(best_ask - 0.01, best_bid + 0.01) inside [0.52, 0.74]
+    const compPx = compVault.computeCompounderMakerBuyPrice(0.57, 0.61);
+    assert.equal(compPx.ok, true);
+    assert.equal(compPx.priceUsd, 0.58);
+    const outOfBandPx = compVault.computeCompounderMakerBuyPrice(0.75, 0.80);
+    assert.equal(outOfBandPx.ok, false);
+
+    // 3. Pre-Entry Resting Order Check + Maker-First post_only 1-contract fill
+    let restingOrdersSim = [{ orderId: 'stale-ord-1', ticker: 'KXBTC15M-COMP', status: 'resting' }];
+    const cancelledOrdersLog: string[] = [];
+    let submittedOrderParams: Record<string, unknown> | null = null;
+    const compFilledRes = await compVault.executeLowBalanceCompounderEntry({
+      ticker: 'KXBTC15M-COMP',
+      side: 'BUY_YES',
+      triggerId: 'SVB-60',
+      settledCashUsd: 32.99,
+      bestBidUsd: 0.57,
+      bestAskUsd: 0.61,
+      fairValueUsd: 0.78, // 0.78 - 0.58 = 0.20 >= 0.18
+      chop14: 41.2,
+      adx: 29.5,
+      lhs: 0.78,
+      timestampMs: 1763290000000,
+      explicitClientKey: 'comp-fill-1',
+      fetchRestingOrdersForTicker: async () => [...restingOrdersSim],
+      cancelRestingOrder: async (oid) => {
+        cancelledOrdersLog.push(oid);
+        restingOrdersSim = restingOrdersSim.filter((o) => o.orderId !== oid);
+        return { ok: true };
+      },
+      submitPostOnlyLimitBuy: async (p) => {
+        submittedOrderParams = p as unknown as Record<string, unknown>;
+        return { ok: true, orderId: 'comp-live-1', status: 'FILLED' };
+      },
+      fetchOrderStatus: async () => ({ status: 'FILLED' }),
+    });
+    assert.equal(compFilledRes.ok, true);
+    assert.equal(compFilledRes.contracts, 1);
+    assert.equal(compFilledRes.limitPriceUsd, 0.58);
+    assert.equal(compFilledRes.postOnly, true);
+    assert.deepEqual(compFilledRes.staleRestingOrdersCancelled, ['stale-ord-1']);
+    assert.equal((submittedOrderParams as Record<string, unknown> | null)?.contracts, 1);
+    assert.equal((submittedOrderParams as Record<string, unknown> | null)?.postOnly, true);
+
+    // 4. 12-second unfilled auto-cancel (never chases market order)
+    let cancelled12s = false;
+    const compTimeoutRes = await compVault.executeLowBalanceCompounderEntry({
+      ticker: 'KXBTC15M-COMP2',
+      side: 'BUY_YES',
+      triggerId: 'GKX-5',
+      settledCashUsd: 32.99,
+      bestBidUsd: 0.56,
+      bestAskUsd: 0.60,
+      fairValueUsd: 0.77, // 0.77 - 0.57 = 0.20 >= 0.18
+      chop14: 39.0,
+      adx: 31.0,
+      lhs: 0.72,
+      timestampMs: 1763290000000,
+      explicitClientKey: 'comp-timeout-12s',
+      unfilledAutoCancelMs: 12000,
+      pollIntervalMs: 4000,
+      sleepMs: async () => {},
+      fetchRestingOrdersForTicker: async () => [],
+      cancelRestingOrder: async (oid) => {
+        if (oid === 'comp-rest-12s') cancelled12s = true;
+        return { ok: true };
+      },
+      submitPostOnlyLimitBuy: async () => ({ ok: true, orderId: 'comp-rest-12s', status: 'RESTING' }),
+      fetchOrderStatus: async () => ({ status: 'RESTING' }),
+    });
+    assert.equal(compTimeoutRes.ok, false);
+    assert.equal(compTimeoutRes.status, 'AUTO_CANCELLED_UNFILLED_12S');
+    assert.equal(compTimeoutRes.autoCancelledAfter12s, true);
+    assert.equal(compTimeoutRes.chasedWithMarketOrder, false);
+    assert.equal(cancelled12s, true);
+
+    // 5. Zero-Fee Settlement Hold Exemption at T - 90s (FV >= 0.85 and ITM > 0.25*sigma*sqrt(tau))
+    const settleHoldEval = evaluateChampionExitSignal({
+      positionId: 'pos-comp-settle',
+      entryPriceUsd: 0.58,
+      liveBidUsd: 0.88,
+      fairValueUsd: 0.90,
+      atr14Usd: 0.05,
+      peakGainUsd: 0.30,
+      elapsedMinutes: 13.8,
+      secondsToExpiry: 75, // <= 90s
+      consecutiveFvGapBreaches: 0,
+      settledCashUsd: 32.99,
+      contracts: 1,
+      side: 'BUY_YES',
+      spotPriceUsd: 90200,
+      strikePriceUsd: 90000,
+      annualizedSigma: 0.55,
+    });
+    assert.equal(settleHoldEval.shouldExit, false);
+    assert.equal(settleHoldEval.reason, 'HOLD_ZERO_FEE_SETTLEMENT');
+    assert.equal(settleHoldEval.zeroFeeSettlementHoldExempt, true);
+
+    // 6. Tight 2-Eval Inversion Stop (FV - bid < -0.04 x2 OR loss <= -$0.06 -> Rule 3 unwind)
+    const inv1 = evaluateChampionExitSignal({
+      positionId: 'pos-comp-inv',
+      entryPriceUsd: 0.58,
+      liveBidUsd: 0.56, // -0.02 unrealized (> -0.06), wait for 2nd breach
+      fairValueUsd: 0.51, // FV - bid = -0.05 < -0.04
+      atr14Usd: 0.05,
+      peakGainUsd: 0,
+      elapsedMinutes: 2.0,
+      secondsToExpiry: 500,
+      consecutiveFvGapBreaches: 0,
+      settledCashUsd: 32.99,
+      contracts: 1,
+    });
+    assert.equal(inv1.shouldExit, false);
+    assert.equal(inv1.updatedConsecutiveFvGapBreaches, 1);
+
+    let compSweepCancelled = false;
+    let compExitQty = 0;
+    const inv2Exec = await compVault.evaluateAndExecuteCompounderExit({
+      exitEval: {
+        positionId: 'pos-comp-inv',
+        entryPriceUsd: 0.58,
+        liveBidUsd: 0.56,
+        fairValueUsd: 0.51,
+        atr14Usd: 0.05,
+        peakGainUsd: 0,
+        elapsedMinutes: 2.25,
+        secondsToExpiry: 485,
+        consecutiveFvGapBreaches: inv1.updatedConsecutiveFvGapBreaches,
+        settledCashUsd: 32.99,
+        contracts: 1,
+      },
+      sweep: {
+        symbol: 'KXBTC15M-COMP',
+        exitSide: 'SELL_YES',
+        requestedQty: 1,
+        bestBidUsd: 0.56,
+        bestAskUsd: 0.58,
+        bboDepthUsd: 8000,
+        cancelAllOpenOrders: async () => {
+          compSweepCancelled = true;
+          return 1;
+        },
+        fetchOpenOrdersCount: async () => 0,
+        fetchSettledPositionQty: async () => 1,
+        executeLimitOrder: async ({ quantity }) => {
+          compExitQty = quantity;
+          return { ok: true, orderId: 'comp-exit-1' };
+        },
+      },
+    });
+    assert.equal(inv2Exec.evalResult.shouldExit, true);
+    assert.equal(inv2Exec.evalResult.reason, 'STOP_LOSS_COMPOUNDER_INVERSION');
+    assert.equal(inv2Exec.exitExecuted, true);
+    assert.equal(compSweepCancelled, true);
+    assert.equal(compExitQty, 1);
+
+    // -$0.06 unrealized loss immediate stop even on 1st check
+    const lossFloorStop = evaluateChampionExitSignal({
+      positionId: 'pos-comp-loss',
+      entryPriceUsd: 0.58,
+      liveBidUsd: 0.52, // -$0.06 loss
+      fairValueUsd: 0.53,
+      atr14Usd: 0.05,
+      peakGainUsd: 0,
+      elapsedMinutes: 1.5,
+      secondsToExpiry: 600,
+      consecutiveFvGapBreaches: 0,
+      settledCashUsd: 32.99,
+      contracts: 1,
+    });
+    assert.equal(lossFloorStop.shouldExit, true);
+    assert.equal(lossFloorStop.reason, 'STOP_LOSS_COMPOUNDER_INVERSION');
+
+    console.log(
+      'PASS [LOW_BALANCE_KALSHI_COMPOUNDER]: MICRO_LOT_30 ($32.99 -> 1 contract), Pre-Entry Resting Order Check, Maker-First post_only [0.52, 0.74] + 12s auto-cancel, Zero-Fee Settlement Hold Exemption, and Tight 2-Eval Inversion Stop passed.'
+    );
+
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER PASSED.');
   } finally {
     setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);

@@ -81,6 +81,47 @@ export interface UnifiedChampionConfig {
     correlation_stress_model: string;
     unknown_correlation_default: number;
   };
+  low_balance_kalshi_compounder?: {
+    enabled: boolean;
+    tier_name: string;
+    max_settled_cash_usd: number;
+    settled_cash_cap_fraction: number;
+    max_contracts_per_trade: number;
+    pre_entry_resting_order_check: {
+      enabled: boolean;
+      cancel_stale_resting_orders_first: boolean;
+      confirm_zero_resting_orders_before_entry: boolean;
+    };
+    maker_first_entry: {
+      post_only: boolean;
+      time_in_force: string;
+      cancel_order_on_pause: boolean;
+      allowed_triggers: string[];
+      min_fv_minus_entry_dollars: number;
+      chop14_max: number;
+      adx_min: number;
+      lhs_min: number;
+      price_band: [number, number];
+      price_formula: string;
+      unfilled_auto_cancel_seconds: number;
+      never_chase_market_order: boolean;
+    };
+    zero_fee_settlement_hold_exemption: {
+      enabled: boolean;
+      max_contracts: number;
+      t_minus_seconds: number;
+      min_fv_nd2: number;
+      min_itm_sigma_sqrt_tau_mult: number;
+      settlement_fee_usd: number;
+    };
+    tight_2eval_inversion_stop: {
+      enabled: boolean;
+      fv_minus_bid_threshold_usd: number;
+      consecutive_15s_checks: number;
+      max_unrealized_loss_usd: number;
+      trigger_rule3_pre_exit_sweep: boolean;
+    };
+  };
 }
 
 const baseChampion = rawChampionConfig as unknown as UnifiedChampionConfig;
@@ -531,41 +572,154 @@ export interface ChampionExitEvalInput {
   secondsToExpiry: number;
   consecutiveFvGapBreaches: number;
   regimeFlipPause?: boolean;
+  /** Optional low_balance_kalshi_compounder telemetry (< $150 settled cash) */
+  settledCashUsd?: number;
+  compounderMode?: boolean;
+  contracts?: number;
+  side?: 'YES' | 'NO' | 'BUY_YES' | 'BUY_NO';
+  spotPriceUsd?: number;
+  strikePriceUsd?: number;
+  annualizedSigma?: number;
+}
+
+export interface ZeroFeeSettlementExemptionResult {
+  exempt: boolean;
+  fvNd2: number;
+  signedItmLogDistance: number;
+  requiredSigmaSqrtTau: number;
+  tauYears: number;
+  reason: string;
+}
+
+export function evaluateZeroFeeSettlementHoldExemption(params: {
+  contracts: number;
+  fairValueUsd: number;
+  secondsToExpiry: number;
+  side?: 'YES' | 'NO' | 'BUY_YES' | 'BUY_NO';
+  spotPriceUsd?: number;
+  strikePriceUsd?: number;
+  annualizedSigma?: number;
+}): ZeroFeeSettlementExemptionResult {
+  const cfg = CHAMPION_CONFIG.low_balance_kalshi_compounder?.zero_fee_settlement_hold_exemption;
+  const maxContracts = cfg?.max_contracts ?? 1;
+  const tMinusSec = cfg?.t_minus_seconds ?? 90;
+  const minFv = cfg?.min_fv_nd2 ?? 0.85;
+  const mult = cfg?.min_itm_sigma_sqrt_tau_mult ?? 0.25;
+
+  const tauYears = Math.max(params.secondsToExpiry, 0.1) / (365.25 * 24 * 3600);
+  const sigma = params.annualizedSigma ?? 0;
+  const spot = params.spotPriceUsd ?? 0;
+  const strike = params.strikePriceUsd ?? 0;
+
+  if (params.contracts !== maxContracts || params.contracts <= 0) {
+    return {
+      exempt: false,
+      fvNd2: params.fairValueUsd,
+      signedItmLogDistance: 0,
+      requiredSigmaSqrtTau: 0,
+      tauYears,
+      reason: `Contracts=${params.contracts} != ${maxContracts} (exemption applies to 1-contract compounder positions).`,
+    };
+  }
+  if (params.secondsToExpiry > tMinusSec) {
+    return {
+      exempt: false,
+      fvNd2: params.fairValueUsd,
+      signedItmLogDistance: 0,
+      requiredSigmaSqrtTau: 0,
+      tauYears,
+      reason: `T-${params.secondsToExpiry.toFixed(0)}s > T-${tMinusSec}s cutoff.`,
+    };
+  }
+  if (params.fairValueUsd < minFv) {
+    return {
+      exempt: false,
+      fvNd2: params.fairValueUsd,
+      signedItmLogDistance: 0,
+      requiredSigmaSqrtTau: 0,
+      tauYears,
+      reason: `FV(N(d2))=${params.fairValueUsd.toFixed(3)} < ${minFv.toFixed(2)} minimum for zero-fee settlement hold.`,
+    };
+  }
+  if (!(spot > 0 && strike > 0 && sigma > 0)) {
+    return {
+      exempt: false,
+      fvNd2: params.fairValueUsd,
+      signedItmLogDistance: 0,
+      requiredSigmaSqrtTau: 0,
+      tauYears,
+      reason: 'Missing spotPriceUsd, strikePriceUsd, or annualizedSigma for ITM > 0.25*sigma*sqrt(tau) check.',
+    };
+  }
+
+  const sigmaSqrtTau = sigma * Math.sqrt(tauYears);
+  const requiredSigmaSqrtTau = mult * sigmaSqrtTau;
+  const isNo = params.side === 'NO' || params.side === 'BUY_NO';
+  const signedItmLogDistance = isNo ? Math.log(strike / spot) : Math.log(spot / strike);
+  const itmPasses = signedItmLogDistance > requiredSigmaSqrtTau;
+
+  return {
+    exempt: itmPasses,
+    fvNd2: params.fairValueUsd,
+    signedItmLogDistance: Number(signedItmLogDistance.toFixed(6)),
+    requiredSigmaSqrtTau: Number(requiredSigmaSqrtTau.toFixed(6)),
+    tauYears,
+    reason: itmPasses
+      ? `ZERO_FEE_SETTLEMENT_HOLD_EXEMPT: 1 contract with FV(N(d2))=${params.fairValueUsd.toFixed(3)} >= ${minFv} and ITM ${signedItmLogDistance.toFixed(5)} > ${mult}*sigma*sqrt(tau)=${requiredSigmaSqrtTau.toFixed(5)}; skipping T-${tMinusSec}s taker exit to settle at $1.00 ($0.00 fee).`
+      : `ITM distance ${signedItmLogDistance.toFixed(5)} <= ${mult}*sigma*sqrt(tau)=${requiredSigmaSqrtTau.toFixed(5)}.`,
+  };
 }
 
 export interface ChampionExitEvalResult {
   shouldExit: boolean;
   reason:
     | 'HOLD'
+    | 'HOLD_ZERO_FEE_SETTLEMENT'
     | 'FORCED_FLAT_T_MINUS_90S'
     | 'TAKE_PROFIT_ATR_OR_FV_GAP'
     | 'TRAILING_LOCK_50PCT_GAIN'
     | 'STOP_LOSS_2X_15S_CONFIRMED'
+    | 'STOP_LOSS_COMPOUNDER_INVERSION'
     | 'DEAD_TRADE_6M_TIME_STOP'
     | 'REGIME_FLIP_FLATTEN';
   updatedConsecutiveFvGapBreaches: number;
   updatedPeakGainUsd: number;
   trailingFloorGainUsd: number | null;
+  zeroFeeSettlementHoldExempt?: boolean;
+  compounderActive?: boolean;
   detail: string;
 }
 
 /**
- * Evaluates TASK-04 Champion Exit Rules on every 15s daemon pass:
+ * Evaluates TASK-04 Champion Exit Rules + low_balance_kalshi_compounder rules on every 15s daemon pass:
  * - Take profit at max(0.16, 2.5 * atr14_usd) OR FV - bid <= 0.03
  * - Trailing lock at +1.2 * atr14_usd (protecting 50% gain)
  * - Stop-loss at -max(0.07, 0.9 * atr14_usd) ONLY after 2 consecutive 15s evals where FV - bid < -0.04
+ *   (In low_balance_kalshi_compounder mode: triggers if FV - bid < -0.04 for 2 consecutive 15s checks OR unrealized loss <= -$0.06)
  * - 6-minute dead-trade time-stop if |PnL| < 0.3 * atr14_usd
- * - Forced flat at T - 90s
+ * - Forced flat at T - 90s (EXEMPT in compounder mode when 1 contract has FV >= 0.85 and ITM > 0.25*sigma*sqrt(tau) to ride to $1.00 $0-fee settlement)
  */
 export function evaluateChampionExitSignal(
   input: ChampionExitEvalInput
 ): ChampionExitEvalResult {
   const exitCfg = CHAMPION_CONFIG.active_strategy.exit_rules;
+  const compounderCfg = CHAMPION_CONFIG.low_balance_kalshi_compounder;
+  const isCompounderActive =
+    Boolean(compounderCfg?.enabled) &&
+    (input.compounderMode === true ||
+      (typeof input.settledCashUsd === 'number' &&
+        Number.isFinite(input.settledCashUsd) &&
+        input.settledCashUsd > 0 &&
+        input.settledCashUsd < (compounderCfg?.max_settled_cash_usd ?? 150)));
+
   const pnlUsd = input.liveBidUsd - input.entryPriceUsd;
   const fvMinusBid = input.fairValueUsd - input.liveBidUsd;
   const updatedPeakGainUsd = Math.max(input.peakGainUsd, pnlUsd);
 
-  const fvGapBreached = fvMinusBid < exitCfg.stop_loss_fv_bid_gap_threshold_usd;
+  const fvThreshold = isCompounderActive
+    ? compounderCfg?.tight_2eval_inversion_stop.fv_minus_bid_threshold_usd ?? -0.04
+    : exitCfg.stop_loss_fv_bid_gap_threshold_usd;
+  const fvGapBreached = fvMinusBid < fvThreshold;
   const updatedConsecutiveFvGapBreaches = fvGapBreached
     ? input.consecutiveFvGapBreaches + 1
     : 0;
@@ -577,17 +731,63 @@ export function evaluateChampionExitSignal(
       updatedConsecutiveFvGapBreaches,
       updatedPeakGainUsd,
       trailingFloorGainUsd: null,
+      compounderActive: isCompounderActive,
       detail: 'CHOP(14) > 61.8 regime-flip pause triggered; flattening via Pre-Exit Sweep.',
     };
   }
 
+  // Compounder Tight 2-Eval Inversion Stop: (FV - bid < -0.04 for 2 consecutive 15s checks) OR (unrealized loss <= -$0.06)
+  if (isCompounderActive && compounderCfg?.tight_2eval_inversion_stop.enabled) {
+    const consecReq = compounderCfg.tight_2eval_inversion_stop.consecutive_15s_checks;
+    const maxLossUsd = compounderCfg.tight_2eval_inversion_stop.max_unrealized_loss_usd;
+    const inversionConfirmed = updatedConsecutiveFvGapBreaches >= consecReq;
+    const lossFloorHit = pnlUsd <= maxLossUsd + 1e-9;
+    if (inversionConfirmed || lossFloorHit) {
+      return {
+        shouldExit: true,
+        reason: 'STOP_LOSS_COMPOUNDER_INVERSION',
+        updatedConsecutiveFvGapBreaches,
+        updatedPeakGainUsd,
+        trailingFloorGainUsd: null,
+        compounderActive: true,
+        detail: `Compounder Tight Inversion Stop (${inversionConfirmed ? `${updatedConsecutiveFvGapBreaches}x15s FV-bid=${fvMinusBid.toFixed(3)} < ${fvThreshold}` : `unrealized PnL $${pnlUsd.toFixed(3)} <= $${maxLossUsd.toFixed(2)}`}); execute Rule 3 CancelAllOpenOrders & close 1 contract.`,
+      };
+    }
+  }
+
   if (input.secondsToExpiry <= exitCfg.forced_flat_seconds_before_expiry) {
+    if (isCompounderActive && compounderCfg?.zero_fee_settlement_hold_exemption.enabled) {
+      const exemption = evaluateZeroFeeSettlementHoldExemption({
+        contracts: input.contracts ?? 1,
+        fairValueUsd: input.fairValueUsd,
+        secondsToExpiry: input.secondsToExpiry,
+        side: input.side,
+        spotPriceUsd: input.spotPriceUsd,
+        strikePriceUsd: input.strikePriceUsd,
+        annualizedSigma: input.annualizedSigma,
+      });
+      if (exemption.exempt) {
+        return {
+          shouldExit: false,
+          reason: 'HOLD_ZERO_FEE_SETTLEMENT',
+          updatedConsecutiveFvGapBreaches,
+          updatedPeakGainUsd,
+          trailingFloorGainUsd: null,
+          zeroFeeSettlementHoldExempt: true,
+          compounderActive: true,
+          detail: exemption.reason,
+        };
+      }
+    }
+
     return {
       shouldExit: true,
       reason: 'FORCED_FLAT_T_MINUS_90S',
       updatedConsecutiveFvGapBreaches,
       updatedPeakGainUsd,
       trailingFloorGainUsd: null,
+      zeroFeeSettlementHoldExempt: false,
+      compounderActive: isCompounderActive,
       detail: `Forced flat at T-${input.secondsToExpiry.toFixed(0)}s <= ${exitCfg.forced_flat_seconds_before_expiry}s.`,
     };
   }
@@ -607,6 +807,7 @@ export function evaluateChampionExitSignal(
       updatedConsecutiveFvGapBreaches,
       updatedPeakGainUsd,
       trailingFloorGainUsd: null,
+      compounderActive: isCompounderActive,
       detail: `Take-profit hit: PnL $${pnlUsd.toFixed(3)} (target $${tpTargetUsd.toFixed(3)}) or FV-bid $${fvMinusBid.toFixed(3)} <= $${exitCfg.take_profit_fv_bid_gap_max_usd.toFixed(2)}.`,
     };
   }
@@ -624,6 +825,7 @@ export function evaluateChampionExitSignal(
         updatedConsecutiveFvGapBreaches,
         updatedPeakGainUsd,
         trailingFloorGainUsd,
+        compounderActive: isCompounderActive,
         detail: `Trailing lock triggered: peak gain $${updatedPeakGainUsd.toFixed(3)} >= +${trailingActivateUsd.toFixed(3)}; PnL $${pnlUsd.toFixed(3)} <= 50% protected floor $${trailingFloorGainUsd.toFixed(3)}.`,
       };
     }
@@ -643,6 +845,7 @@ export function evaluateChampionExitSignal(
       updatedConsecutiveFvGapBreaches,
       updatedPeakGainUsd,
       trailingFloorGainUsd,
+      compounderActive: isCompounderActive,
       detail: `Stop-loss -$${stopLossDistanceUsd.toFixed(3)} confirmed after ${updatedConsecutiveFvGapBreaches} consecutive 15s evals with FV-bid ${fvMinusBid.toFixed(3)} < ${exitCfg.stop_loss_fv_bid_gap_threshold_usd}.`,
     };
   }
@@ -657,6 +860,7 @@ export function evaluateChampionExitSignal(
       updatedConsecutiveFvGapBreaches,
       updatedPeakGainUsd,
       trailingFloorGainUsd,
+      compounderActive: isCompounderActive,
       detail: `6-minute dead-trade time-stop (${input.elapsedMinutes.toFixed(1)}m >= ${exitCfg.dead_trade_time_stop_minutes}m) with |PnL| $${Math.abs(pnlUsd).toFixed(3)} < ${(exitCfg.dead_trade_min_pnl_atr_mult * input.atr14Usd).toFixed(3)}.`,
     };
   }
@@ -667,6 +871,7 @@ export function evaluateChampionExitSignal(
     updatedConsecutiveFvGapBreaches,
     updatedPeakGainUsd,
     trailingFloorGainUsd,
+    compounderActive: isCompounderActive,
     detail: `Hold: PnL $${pnlUsd.toFixed(3)}, FV-bid $${fvMinusBid.toFixed(3)}, consecutiveBreaches=${updatedConsecutiveFvGapBreaches}.`,
   };
 }

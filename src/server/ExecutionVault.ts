@@ -5,7 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   CHAMPION_CONFIG,
   computeLiquidityHealthScore,
+  evaluateChampionExitSignal,
   evaluateRegimeAndLiquidity,
+  evaluateZeroFeeSettlementHoldExemption,
+  type ChampionExitEvalInput,
+  type ChampionExitEvalResult,
   type ObiSample,
   type RegimeAndLiquidityInput,
   type RegimeAndLiquidityVerdict,
@@ -167,6 +171,99 @@ export interface TelemetryCompletenessResult {
   missingFields: string[];
 }
 
+export interface LowBalanceCompounderRestingOrder {
+  orderId: string;
+  ticker: string;
+  status: string;
+  remainingCount?: number;
+}
+
+export interface LowBalanceCompounderEntryInput {
+  ticker: string;
+  side: 'BUY_YES' | 'BUY_NO';
+  triggerId: 'SVB-60' | 'GKX-5';
+  settledCashUsd: number;
+  bestBidUsd: number;
+  bestAskUsd: number;
+  fairValueUsd: number;
+  chop14: number;
+  adx: number;
+  lhs: number;
+  bboDepthUsd?: number;
+  obiSamples?: ObiSample[];
+  timeframe?: CooldownTimeframe;
+  timestampMs?: number;
+  explicitClientKey?: string;
+  fetchRestingOrdersForTicker: (ticker: string) => Promise<LowBalanceCompounderRestingOrder[]>;
+  cancelRestingOrder: (orderId: string) => Promise<{ ok: boolean; error?: string }>;
+  submitPostOnlyLimitBuy: (params: {
+    ticker: string;
+    side: 'BUY_YES' | 'BUY_NO';
+    contracts: 1;
+    limitPriceUsd: number;
+    postOnly: true;
+    timeInForce: 'good_till_canceled';
+    cancelOrderOnPause: true;
+    idempotencyHash: string;
+  }) => Promise<{
+    ok: boolean;
+    orderId?: string;
+    status: 'FILLED' | 'EXECUTED' | 'RESTING' | 'REJECTED';
+    error?: string;
+  }>;
+  fetchOrderStatus: (orderId: string) => Promise<{
+    status: 'FILLED' | 'EXECUTED' | 'RESTING' | 'CANCELLED';
+    filledContracts?: number;
+  }>;
+  /** Default 12,000 ms (12 seconds) auto-cancel timer if unfilled */
+  unfilledAutoCancelMs?: number;
+  /** Poll cadence while waiting on resting post_only order; default 1000 ms */
+  pollIntervalMs?: number;
+  /** Optional sleep hook for deterministic tests */
+  sleepMs?: (ms: number) => Promise<void>;
+}
+
+export interface LowBalanceCompounderEntryResult {
+  ok: boolean;
+  status:
+    | 'FILLED'
+    | 'RESTING'
+    | 'AUTO_CANCELLED_UNFILLED_12S'
+    | 'COMPOUNDER_INACTIVE_ABOVE_150'
+    | 'GATE_BLOCKED'
+    | 'OUTSIDE_COMPOUNDER_PRICE_BAND'
+    | 'INSUFFICIENT_SETTLED_CASH_3PCT_CAP'
+    | 'IDEMPOTENCY_LOCK_BLOCKED'
+    | 'STALE_RESTING_ORDERS_NOT_CLEARED'
+    | 'VENUE_REJECTED';
+  tier: string;
+  contracts: number;
+  limitPriceUsd: number;
+  postOnly: boolean;
+  neverChaseMarketOrder: true;
+  staleRestingOrdersFound: number;
+  staleRestingOrdersCancelled: string[];
+  remainingRestingOrdersBeforeEntry: number;
+  autoCancelledAfter12s: boolean;
+  chasedWithMarketOrder: false;
+  orderId?: string;
+  idempotencyHash?: string;
+  blockedReasons: string[];
+  reason: string;
+}
+
+export interface LowBalanceCompounderExitInput {
+  exitEval: ChampionExitEvalInput;
+  sweep: PreExitSweepInput;
+}
+
+export interface LowBalanceCompounderExitResult {
+  evalResult: ChampionExitEvalResult;
+  exitExecuted: boolean;
+  zeroFeeSettlementHoldExempt: boolean;
+  rule3SweepResult: PreExitSweepResult | null;
+}
+
 export interface VaultAuditEntry {
   ts: string;
   rule:
@@ -175,7 +272,8 @@ export interface VaultAuditEntry {
     | 'RULE_3_PRE_EXIT_SWEEP_LHS'
     | 'REGIME_LIQUIDITY_GATE'
     | 'TELEMETRY_COMPLETENESS_GATE'
-    | 'PORTFOLIO_CORRELATION_GUARD';
+    | 'PORTFOLIO_CORRELATION_GUARD'
+    | 'LOW_BALANCE_COMPOUNDER';
   symbol: string;
   outcome: 'APPROVED' | 'REJECTED' | 'EXECUTED';
   detail: string;
@@ -1176,6 +1274,489 @@ export class ExecutionVault {
       exitStrategy: 'PASSIVE_TWAP_MICRO_TRANCHES',
       tranchesExecuted,
       reason: `Pre-exit sweep confirmed (${cancelledOpenOrders} cancelled); LHS=${lhsEval.lhs.toFixed(3)} < 0.65 -> ${tranchesExecuted.length} passive TWAP micro-tranches @ $${passiveLimitPriceUsd.toFixed(2)}.`,
+    };
+  }
+
+  public isLowBalanceKalshiCompounderActive(settledCashUsd: number): boolean {
+    const cfg = CHAMPION_CONFIG.low_balance_kalshi_compounder;
+    return (
+      Boolean(cfg?.enabled) &&
+      Number.isFinite(settledCashUsd) &&
+      settledCashUsd > 0 &&
+      settledCashUsd < (cfg?.max_settled_cash_usd ?? 150)
+    );
+  }
+
+  public computeLowBalanceCompounderSizing(
+    settledCashUsd: number,
+    entryPriceUsd: number
+  ): {
+    compounderActive: boolean;
+    tier: string;
+    cashCapUsd: number;
+    maxContracts: number;
+    approvedContracts: number;
+    reason: string;
+  } {
+    const cfg = CHAMPION_CONFIG.low_balance_kalshi_compounder;
+    const capFrac = cfg?.settled_cash_cap_fraction ?? 0.03;
+    const maxContracts = cfg?.max_contracts_per_trade ?? 1;
+    const tier = cfg?.tier_name ?? 'MICRO_LOT_30';
+    const compounderActive = this.isLowBalanceKalshiCompounderActive(settledCashUsd);
+    const cashCapUsd = Number((Math.max(0, settledCashUsd) * capFrac).toFixed(4));
+    if (!compounderActive) {
+      return {
+        compounderActive: false,
+        tier: 'STANDARD',
+        cashCapUsd,
+        maxContracts,
+        approvedContracts: 0,
+        reason: `Settled cash $${settledCashUsd.toFixed(2)} is not in low-balance compounder tier (0 < cash < $${cfg?.max_settled_cash_usd ?? 150}).`,
+      };
+    }
+    const rawQty = entryPriceUsd > 0 ? Math.floor((cashCapUsd + 1e-9) / entryPriceUsd) : 0;
+    const approvedContracts = Math.max(0, Math.min(maxContracts, rawQty));
+    return {
+      compounderActive: true,
+      tier,
+      cashCapUsd,
+      maxContracts,
+      approvedContracts,
+      reason:
+        approvedContracts === 1
+          ? `${tier}: 3% cap=$${cashCapUsd.toFixed(4)} on $${settledCashUsd.toFixed(2)} settled cash -> strictly 1 contract @ $${entryPriceUsd.toFixed(2)}.`
+          : `${tier}: 3% cap=$${cashCapUsd.toFixed(4)} cannot fund 1 contract @ $${entryPriceUsd.toFixed(2)}.`,
+    };
+  }
+
+  public computeCompounderMakerBuyPrice(
+    bestBidUsd: number,
+    bestAskUsd: number
+  ): {
+    ok: boolean;
+    priceUsd: number;
+    withinBand: boolean;
+    nonCrossing: boolean;
+    reason: string;
+  } {
+    const band = CHAMPION_CONFIG.low_balance_kalshi_compounder?.maker_first_entry.price_band ?? [0.52, 0.74];
+    const [bandMin, bandMax] = band;
+    if (
+      !Number.isFinite(bestBidUsd) ||
+      !Number.isFinite(bestAskUsd) ||
+      bestBidUsd <= 0 ||
+      bestAskUsd <= bestBidUsd
+    ) {
+      return {
+        ok: false,
+        priceUsd: 0,
+        withinBand: false,
+        nonCrossing: false,
+        reason: `Invalid BBO quote bestBid=$${bestBidUsd} bestAsk=$${bestAskUsd}.`,
+      };
+    }
+
+    const priceUsd = Number(Math.min(bestAskUsd - 0.01, bestBidUsd + 0.01).toFixed(2));
+    const nonCrossing = priceUsd < bestAskUsd - 1e-9 && priceUsd > 0;
+    const withinBand = priceUsd >= bandMin - 1e-9 && priceUsd <= bandMax + 1e-9;
+
+    return {
+      ok: nonCrossing && withinBand,
+      priceUsd,
+      withinBand,
+      nonCrossing,
+      reason:
+        nonCrossing && withinBand
+          ? `Maker-first post_only price $${priceUsd.toFixed(2)} = min($${bestAskUsd.toFixed(2)}-0.01, $${bestBidUsd.toFixed(2)}+0.01) inside [$${bandMin.toFixed(2)}, $${bandMax.toFixed(2)}].`
+          : !nonCrossing
+          ? `Computed price $${priceUsd.toFixed(2)} crosses or meets bestAsk $${bestAskUsd.toFixed(2)}.`
+          : `Computed price $${priceUsd.toFixed(2)} outside [$${bandMin.toFixed(2)}, $${bandMax.toFixed(2)}].`,
+    };
+  }
+
+  /**
+   * Executes Low-Balance Kalshi Compounder entry (< $150 settled cash, e.g. $32.99 MICRO_LOT_30):
+   * 1. Validates SVB-60/GKX-5, FV - entry_price >= 0.18, CHOP(14) < 50, ADX >= 25, LHS >= 0.65.
+   * 2. Computes post_only Maker-First limit buy at min(best_ask - 0.01, best_bid + 0.01) inside [0.52, 0.74].
+   * 3. Enforces 3% settled cash cap -> strictly 1 contract per trade ($0.9897 at $32.99).
+   * 4. Acquires Rule 2 deterministic idempotency lock.
+   * 5. Queries open resting orders on contract; cancels any stale resting order and confirms 0 remaining before entry.
+   * 6. Submits 1-contract post_only GTC limit buy; auto-cancels if unfilled after 12s (never chases market order).
+   */
+  public async executeLowBalanceCompounderEntry(
+    input: LowBalanceCompounderEntryInput
+  ): Promise<LowBalanceCompounderEntryResult> {
+    const cfg = CHAMPION_CONFIG.low_balance_kalshi_compounder;
+    const tier = cfg?.tier_name ?? 'MICRO_LOT_30';
+    const makerCfg = cfg?.maker_first_entry;
+    const minEdge = makerCfg?.min_fv_minus_entry_dollars ?? 0.18;
+    const chopMax = makerCfg?.chop14_max ?? 50.0;
+    const adxMin = makerCfg?.adx_min ?? 25.0;
+    const lhsMin = makerCfg?.lhs_min ?? 0.65;
+    const allowedTriggers = makerCfg?.allowed_triggers ?? ['SVB-60', 'GKX-5'];
+
+    if (!this.isLowBalanceKalshiCompounderActive(input.settledCashUsd)) {
+      return {
+        ok: false,
+        status: 'COMPOUNDER_INACTIVE_ABOVE_150',
+        tier: 'STANDARD',
+        contracts: 0,
+        limitPriceUsd: 0,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: 0,
+        staleRestingOrdersCancelled: [],
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        blockedReasons: [`settledCashUsd $${input.settledCashUsd.toFixed(2)} not in (0, $${cfg?.max_settled_cash_usd ?? 150}).`],
+        reason: 'Low-balance compounder only applies to accounts with 0 < settledCash < $150.',
+      };
+    }
+
+    const pxEval = this.computeCompounderMakerBuyPrice(input.bestBidUsd, input.bestAskUsd);
+    if (!pxEval.ok) {
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'LOW_BALANCE_COMPOUNDER',
+        symbol: input.ticker,
+        outcome: 'REJECTED',
+        detail: pxEval.reason,
+      });
+      return {
+        ok: false,
+        status: 'OUTSIDE_COMPOUNDER_PRICE_BAND',
+        tier,
+        contracts: 0,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: 0,
+        staleRestingOrdersCancelled: [],
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        blockedReasons: [pxEval.reason],
+        reason: pxEval.reason,
+      };
+    }
+
+    const blockedReasons: string[] = [];
+    if (!allowedTriggers.includes(input.triggerId)) {
+      blockedReasons.push(`Trigger ${input.triggerId} not in [${allowedTriggers.join(', ')}]`);
+    }
+    const edge = Number((input.fairValueUsd - pxEval.priceUsd).toFixed(4));
+    if (edge < minEdge - 1e-9) {
+      blockedReasons.push(`FV(N(d2)) - entry_price = ${edge.toFixed(4)} < ${minEdge.toFixed(2)}`);
+    }
+    if (!(input.chop14 < chopMax)) {
+      blockedReasons.push(`CHOP(14)=${input.chop14.toFixed(2)} >= ${chopMax}`);
+    }
+    if (!(input.adx >= adxMin)) {
+      blockedReasons.push(`ADX=${input.adx.toFixed(2)} < ${adxMin}`);
+    }
+    if (!(input.lhs >= lhsMin)) {
+      blockedReasons.push(`LHS=${input.lhs.toFixed(3)} < ${lhsMin}`);
+    }
+
+    if (blockedReasons.length > 0) {
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'LOW_BALANCE_COMPOUNDER',
+        symbol: input.ticker,
+        outcome: 'REJECTED',
+        detail: `Gate blocked: ${blockedReasons.join(' | ')}`,
+      });
+      return {
+        ok: false,
+        status: 'GATE_BLOCKED',
+        tier,
+        contracts: 0,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: 0,
+        staleRestingOrdersCancelled: [],
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        blockedReasons,
+        reason: blockedReasons.join(' | '),
+      };
+    }
+
+    const sizing = this.computeLowBalanceCompounderSizing(input.settledCashUsd, pxEval.priceUsd);
+    if (sizing.approvedContracts !== 1) {
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'LOW_BALANCE_COMPOUNDER',
+        symbol: input.ticker,
+        outcome: 'REJECTED',
+        detail: sizing.reason,
+      });
+      return {
+        ok: false,
+        status: 'INSUFFICIENT_SETTLED_CASH_3PCT_CAP',
+        tier,
+        contracts: 0,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: 0,
+        staleRestingOrdersCancelled: [],
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        blockedReasons: [sizing.reason],
+        reason: sizing.reason,
+      };
+    }
+
+    const lockResult = this.acquireIdempotencyLock({
+      symbol: input.ticker,
+      side: input.side,
+      strategyId: `COMPOUNDER_${input.triggerId}`,
+      timeframe: input.timeframe ?? '15m',
+      timestampMs: input.timestampMs,
+      explicitClientKey: input.explicitClientKey,
+    });
+    if (!lockResult.allowed) {
+      return {
+        ok: false,
+        status: 'IDEMPOTENCY_LOCK_BLOCKED',
+        tier,
+        contracts: 0,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: 0,
+        staleRestingOrdersCancelled: [],
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        idempotencyHash: lockResult.idempotencyHash,
+        blockedReasons: ['Duplicate compounder entry blocked by Rule 2 idempotency lock.'],
+        reason: `Duplicate entry blocked in ${lockResult.existingRecord?.timeframe ?? input.timeframe ?? '15m'} cooldown (${lockResult.remainingCooldownSec}s left).`,
+      };
+    }
+
+    // 1. Pre-Entry Resting Order Check: cancel any stale resting order on contract so settledCash is never double-locked
+    const restingBefore = await input.fetchRestingOrdersForTicker(input.ticker);
+    const staleCancelled: string[] = [];
+    for (const ord of restingBefore) {
+      if (ord.orderId) {
+        const cancelRes = await input.cancelRestingOrder(ord.orderId);
+        if (cancelRes.ok) {
+          staleCancelled.push(ord.orderId);
+        }
+      }
+    }
+    const restingAfter =
+      restingBefore.length > 0 ? await input.fetchRestingOrdersForTicker(input.ticker) : [];
+    if (restingAfter.length > 0) {
+      const msg = `Aborted ${input.ticker} entry: ${restingAfter.length} stale resting order(s) could not be cancelled before entry; preventing settledCash double-lock.`;
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'LOW_BALANCE_COMPOUNDER',
+        symbol: input.ticker,
+        outcome: 'REJECTED',
+        detail: msg,
+      });
+      return {
+        ok: false,
+        status: 'STALE_RESTING_ORDERS_NOT_CLEARED',
+        tier,
+        contracts: 0,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: restingBefore.length,
+        staleRestingOrdersCancelled: staleCancelled,
+        remainingRestingOrdersBeforeEntry: restingAfter.length,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        idempotencyHash: lockResult.idempotencyHash,
+        blockedReasons: [msg],
+        reason: msg,
+      };
+    }
+
+    // 2. Submit 1-contract post_only GTC limit buy at min(best_ask - 0.01, best_bid + 0.01) inside [0.52, 0.74]
+    const subRes = await input.submitPostOnlyLimitBuy({
+      ticker: input.ticker,
+      side: input.side,
+      contracts: 1,
+      limitPriceUsd: pxEval.priceUsd,
+      postOnly: true,
+      timeInForce: 'good_till_canceled',
+      cancelOrderOnPause: true,
+      idempotencyHash: lockResult.idempotencyHash,
+    });
+
+    if (!subRes.ok || !subRes.orderId || subRes.status === 'REJECTED') {
+      const msg = subRes.error || 'Venue rejected post_only maker entry order.';
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'LOW_BALANCE_COMPOUNDER',
+        symbol: input.ticker,
+        outcome: 'REJECTED',
+        detail: msg,
+      });
+      return {
+        ok: false,
+        status: 'VENUE_REJECTED',
+        tier,
+        contracts: 1,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: restingBefore.length,
+        staleRestingOrdersCancelled: staleCancelled,
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        idempotencyHash: lockResult.idempotencyHash,
+        blockedReasons: [msg],
+        reason: msg,
+      };
+    }
+
+    this.attachOrderIdToLock(lockResult.idempotencyHash, subRes.orderId);
+
+    if (subRes.status === 'FILLED' || subRes.status === 'EXECUTED') {
+      this.pushAudit({
+        ts: new Date().toISOString(),
+        rule: 'LOW_BALANCE_COMPOUNDER',
+        symbol: input.ticker,
+        outcome: 'EXECUTED',
+        detail: `${tier} 1-contract post_only FILLED @ $${pxEval.priceUsd.toFixed(2)} (trigger=${input.triggerId}, edge=${edge.toFixed(3)}, preCancelled=${staleCancelled.length}).`,
+      });
+      return {
+        ok: true,
+        status: 'FILLED',
+        tier,
+        contracts: 1,
+        limitPriceUsd: pxEval.priceUsd,
+        postOnly: true,
+        neverChaseMarketOrder: true,
+        staleRestingOrdersFound: restingBefore.length,
+        staleRestingOrdersCancelled: staleCancelled,
+        remainingRestingOrdersBeforeEntry: 0,
+        autoCancelledAfter12s: false,
+        chasedWithMarketOrder: false,
+        orderId: subRes.orderId,
+        idempotencyHash: lockResult.idempotencyHash,
+        blockedReasons: [],
+        reason: `1-contract post_only filled @ $${pxEval.priceUsd.toFixed(2)} (${tier}).`,
+      };
+    }
+
+    // Monitor resting order up to 12 seconds; auto-cancel if unfilled (never chase with market order)
+    const timeoutMs = input.unfilledAutoCancelMs ?? (makerCfg?.unfilled_auto_cancel_seconds ?? 12) * 1000;
+    const pollMs = Math.max(10, input.pollIntervalMs ?? 1000);
+    const sleeper =
+      input.sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    let elapsedMs = 0;
+
+    while (elapsedMs < timeoutMs) {
+      const waitStep = Math.min(pollMs, timeoutMs - elapsedMs);
+      await sleeper(waitStep);
+      elapsedMs += waitStep;
+      const st = await input.fetchOrderStatus(subRes.orderId);
+      if (st.status === 'FILLED' || st.status === 'EXECUTED') {
+        this.pushAudit({
+          ts: new Date().toISOString(),
+          rule: 'LOW_BALANCE_COMPOUNDER',
+          symbol: input.ticker,
+          outcome: 'EXECUTED',
+          detail: `${tier} 1-contract post_only FILLED after ${elapsedMs}ms @ $${pxEval.priceUsd.toFixed(2)}.`,
+        });
+        return {
+          ok: true,
+          status: 'FILLED',
+          tier,
+          contracts: 1,
+          limitPriceUsd: pxEval.priceUsd,
+          postOnly: true,
+          neverChaseMarketOrder: true,
+          staleRestingOrdersFound: restingBefore.length,
+          staleRestingOrdersCancelled: staleCancelled,
+          remainingRestingOrdersBeforeEntry: 0,
+          autoCancelledAfter12s: false,
+          chasedWithMarketOrder: false,
+          orderId: subRes.orderId,
+          idempotencyHash: lockResult.idempotencyHash,
+          blockedReasons: [],
+          reason: `1-contract post_only filled within ${elapsedMs}ms @ $${pxEval.priceUsd.toFixed(2)}.`,
+        };
+      }
+      if (st.status === 'CANCELLED') {
+        break;
+      }
+    }
+
+    await input.cancelRestingOrder(subRes.orderId);
+    const msg = `Unfilled 1-contract post_only order ${subRes.orderId} auto-cancelled after ${(timeoutMs / 1000).toFixed(1)}s; never chased with market order.`;
+    this.pushAudit({
+      ts: new Date().toISOString(),
+      rule: 'LOW_BALANCE_COMPOUNDER',
+      symbol: input.ticker,
+      outcome: 'REJECTED',
+      detail: msg,
+    });
+    return {
+      ok: false,
+      status: 'AUTO_CANCELLED_UNFILLED_12S',
+      tier,
+      contracts: 1,
+      limitPriceUsd: pxEval.priceUsd,
+      postOnly: true,
+      neverChaseMarketOrder: true,
+      staleRestingOrdersFound: restingBefore.length,
+      staleRestingOrdersCancelled: staleCancelled,
+      remainingRestingOrdersBeforeEntry: 0,
+      autoCancelledAfter12s: true,
+      chasedWithMarketOrder: false,
+      orderId: subRes.orderId,
+      idempotencyHash: lockResult.idempotencyHash,
+      blockedReasons: [msg],
+      reason: msg,
+    };
+  }
+
+  /**
+   * Evaluates and executes Low-Balance Compounder exits:
+   * - Enforces Zero-Fee Settlement Hold Exemption at T - 90s when 1 contract has FV >= 0.85 & ITM > 0.25*sigma*sqrt(tau).
+   * - Enforces Tight 2-Eval Inversion Stop (FV - bid < -0.04 x2 OR unrealized loss <= -$0.06) via Rule 3 sweep.
+   */
+  public async evaluateAndExecuteCompounderExit(
+    input: LowBalanceCompounderExitInput
+  ): Promise<LowBalanceCompounderExitResult> {
+    const evalResult = evaluateChampionExitSignal({
+      ...input.exitEval,
+      compounderMode: true,
+      contracts: input.exitEval.contracts ?? 1,
+    });
+
+    if (!evalResult.shouldExit) {
+      return {
+        evalResult,
+        exitExecuted: false,
+        zeroFeeSettlementHoldExempt: evalResult.reason === 'HOLD_ZERO_FEE_SETTLEMENT',
+        rule3SweepResult: null,
+      };
+    }
+
+    const rule3SweepResult = await this.unwindPositionSafely({
+      ...input.sweep,
+      requestedQty: Math.min(1, Math.max(1, input.sweep.requestedQty)),
+    });
+
+    return {
+      evalResult,
+      exitExecuted: rule3SweepResult.ok,
+      zeroFeeSettlementHoldExempt: false,
+      rule3SweepResult,
     };
   }
 }

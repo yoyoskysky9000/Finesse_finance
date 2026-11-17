@@ -1627,6 +1627,67 @@ def _load_ml_governance_config() -> Dict[str, Any]:
 ML_META_MODEL_GOVERNANCE: Dict[str, Any] = _load_ml_governance_config()
 
 
+def _load_low_balance_kalshi_compounder_config() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "tier_name": "MICRO_LOT_30",
+        "max_settled_cash_usd": 150.0,
+        "settled_cash_cap_fraction": 0.03,
+        "max_contracts_per_trade": 1,
+        "pre_entry_resting_order_check": {
+            "enabled": True,
+            "cancel_stale_resting_orders_first": True,
+            "confirm_zero_resting_orders_before_entry": True,
+        },
+        "maker_first_entry": {
+            "post_only": True,
+            "time_in_force": "good_till_canceled",
+            "cancel_order_on_pause": True,
+            "allowed_triggers": ["SVB-60", "GKX-5"],
+            "min_fv_minus_entry_dollars": 0.18,
+            "chop14_max": 50.0,
+            "adx_min": 25.0,
+            "lhs_min": 0.65,
+            "price_band": [0.52, 0.74],
+            "unfilled_auto_cancel_seconds": 12.0,
+            "never_chase_market_order": True,
+        },
+        "zero_fee_settlement_hold_exemption": {
+            "enabled": True,
+            "max_contracts": 1,
+            "t_minus_seconds": 90,
+            "min_fv_nd2": 0.85,
+            "min_itm_sigma_sqrt_tau_mult": 0.25,
+            "settlement_fee_usd": 0.0,
+        },
+        "tight_2eval_inversion_stop": {
+            "enabled": True,
+            "fv_minus_bid_threshold_usd": -0.04,
+            "consecutive_15s_checks": 2,
+            "max_unrealized_loss_usd": -0.06,
+            "trigger_rule3_pre_exit_sweep": True,
+        },
+    }
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "champion_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+            comp = raw_cfg.get("low_balance_kalshi_compounder")
+            if isinstance(comp, dict):
+                for k, v in comp.items():
+                    if isinstance(v, dict) and isinstance(defaults.get(k), dict):
+                        defaults[k].update(v)
+                    elif v is not None:
+                        defaults[k] = v
+    except Exception:
+        pass
+    return defaults
+
+
+LOW_BALANCE_KALSHI_COMPOUNDER: Dict[str, Any] = _load_low_balance_kalshi_compounder_config()
+
+
 def page_hinkley_alarm(
     rows: List[Any],
     delta: Optional[float] = None,
@@ -4505,6 +4566,504 @@ async def cancel_all_kalshi_v2_orders(reason: str = "GATE_5_MAX_DAILY_DRAWDOWN_B
     }
 
 
+def is_low_balance_kalshi_compounder_active(settled_cash: float) -> bool:
+    cfg = LOW_BALANCE_KALSHI_COMPOUNDER
+    max_cash = float(cfg.get("max_settled_cash_usd", 150.0))
+    return bool(cfg.get("enabled", True)) and math.isfinite(settled_cash) and (0.0 < settled_cash < max_cash)
+
+
+def compute_compounder_maker_limit_price(best_bid: float, best_ask: float) -> Dict[str, Any]:
+    """
+    Computes Maker-First limit buy price:
+      entry_price = min(best_ask - 0.01, best_bid + 0.01) inside [0.52, 0.74]
+    """
+    band = LOW_BALANCE_KALSHI_COMPOUNDER.get("maker_first_entry", {}).get("price_band", [0.52, 0.74])
+    band_min, band_max = float(band[0]), float(band[1])
+    if not (math.isfinite(best_bid) and math.isfinite(best_ask)) or best_bid <= 0.0 or best_ask <= best_bid:
+        return {
+            "ok": False,
+            "price_dollars": 0.0,
+            "within_band": False,
+            "non_crossing": False,
+            "reason": f"Invalid BBO quote best_bid={best_bid}, best_ask={best_ask}.",
+        }
+    price_usd = round(min(best_ask - 0.01, best_bid + 0.01), 2)
+    non_crossing = (price_usd < best_ask - 1e-9) and (price_usd > 0.0)
+    within_band = (band_min - 1e-9) <= price_usd <= (band_max + 1e-9)
+    return {
+        "ok": non_crossing and within_band,
+        "price_dollars": price_usd,
+        "within_band": within_band,
+        "non_crossing": non_crossing,
+        "reason": (
+            f"Maker-first post_only=${price_usd:.2f} inside [${band_min:.2f}, ${band_max:.2f}]"
+            if (non_crossing and within_band)
+            else f"Computed price ${price_usd:.2f} invalid/outside [${band_min:.2f}, ${band_max:.2f}] (best_ask=${best_ask:.2f})."
+        ),
+    }
+
+
+async def get_kalshi_resting_orders_for_ticker(ticker: str) -> Dict[str, Any]:
+    """Queries Kalshi V2 open resting orders filtered by contract ticker."""
+    clean_tkr = ticker.strip().upper()
+    res = await kalshi_signed_rest_request(
+        "GET",
+        f"/trade-api/v2/portfolio/orders?status=resting&ticker={clean_tkr}&limit=100",
+        is_write=False,
+    )
+    if not res.get("ok"):
+        return {
+            "ok": False,
+            "ticker": clean_tkr,
+            "orders": [],
+            "error": str(res.get("error") or "Failed to query resting orders on Kalshi."),
+        }
+    data = res.get("data") if isinstance(res.get("data"), dict) else {}
+    raw_orders = data.get("orders") if isinstance(data.get("orders"), list) else []
+    matching = [
+        o for o in raw_orders
+        if isinstance(o, dict) and str(o.get("ticker") or clean_tkr).strip().upper() == clean_tkr
+    ]
+    return {"ok": True, "ticker": clean_tkr, "orders": matching, "error": None}
+
+
+async def ensure_no_stale_resting_orders_before_entry(ticker: str) -> Dict[str, Any]:
+    """
+    Low-Balance Compounder Pre-Entry Resting Order Check:
+    Before placing any new 1-contract entry on Kalshi, query open resting orders on that contract;
+    if any stale resting order exists, cancel it first and confirm 0 remaining so settledCash is never double-locked.
+    """
+    clean_tkr = ticker.strip().upper()
+    first_query = await get_kalshi_resting_orders_for_ticker(clean_tkr)
+    if not first_query.get("ok"):
+        return {
+            "ok": False,
+            "ticker": clean_tkr,
+            "staleFound": 0,
+            "cancelledOrderIds": [],
+            "remainingResting": -1,
+            "reason": f"PRE_ENTRY_RESTING_QUERY_FAILED: {first_query.get('error')}",
+        }
+
+    stale_orders = first_query["orders"]
+    cancelled_ids: List[str] = []
+    if stale_orders:
+        for ord_item in stale_orders:
+            oid = str(ord_item.get("order_id") or "").strip()
+            if not oid:
+                continue
+            del_res = await kalshi_signed_rest_request(
+                "DELETE",
+                f"/trade-api/v2/portfolio/orders/{oid}",
+                is_write=True,
+                is_emergency_cancel_or_reduce_only_ioc=True,
+            )
+            if del_res.get("ok"):
+                cancelled_ids.append(oid)
+
+        confirm_query = await get_kalshi_resting_orders_for_ticker(clean_tkr)
+        if not confirm_query.get("ok") or len(confirm_query.get("orders", [])) > 0:
+            rem_count = len(confirm_query.get("orders", [])) if confirm_query.get("ok") else -1
+            return {
+                "ok": False,
+                "ticker": clean_tkr,
+                "staleFound": len(stale_orders),
+                "cancelledOrderIds": cancelled_ids,
+                "remainingResting": rem_count,
+                "reason": f"STALE_RESTING_ORDERS_NOT_CLEARED: {rem_count} resting order(s) remain on {clean_tkr}.",
+            }
+
+    return {
+        "ok": True,
+        "ticker": clean_tkr,
+        "staleFound": len(stale_orders),
+        "cancelledOrderIds": cancelled_ids,
+        "remainingResting": 0,
+        "reason": (
+            f"Cancelled {len(cancelled_ids)} stale resting order(s) on {clean_tkr} and confirmed 0 resting before entry."
+            if cancelled_ids
+            else f"Zero resting orders on {clean_tkr}; settledCash clear."
+        ),
+    }
+
+
+async def monitor_and_auto_cancel_unfilled_entry(
+    order_id: str,
+    ticker: str,
+    timeout_sec: float = 12.0,
+    poll_interval_sec: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Monitors a newly placed 1-contract post_only buy for up to 12 seconds.
+    If still unfilled/resting after 12 seconds, cancels it and NEVER chases with a market order.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    last_status = "RESTING"
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        await asyncio.sleep(min(float(poll_interval_sec), remaining))
+        status_res = await kalshi_signed_rest_request(
+            "GET",
+            f"/trade-api/v2/portfolio/orders/{order_id}",
+            is_write=False,
+        )
+        if status_res.get("ok") and isinstance(status_res.get("data"), dict):
+            data = status_res["data"]
+            ord_obj = data.get("order") if isinstance(data.get("order"), dict) else data
+            st = str(ord_obj.get("status") or "").strip().upper()
+            rem_count = ord_obj.get("remaining_count")
+            if st in ("EXECUTED", "FILLED") or (rem_count is not None and float(rem_count) <= 0):
+                return {
+                    "ok": True,
+                    "status": "FILLED",
+                    "order_id": order_id,
+                    "ticker": ticker,
+                    "autoCancelled": False,
+                    "chasedWithMarketOrder": False,
+                }
+            if st in ("CANCELED", "CANCELLED"):
+                return {
+                    "ok": False,
+                    "status": "CANCELLED_BY_VENUE",
+                    "order_id": order_id,
+                    "ticker": ticker,
+                    "autoCancelled": False,
+                    "chasedWithMarketOrder": False,
+                }
+            last_status = st or last_status
+
+    cancel_res = await kalshi_signed_rest_request(
+        "DELETE",
+        f"/trade-api/v2/portfolio/orders/{order_id}",
+        is_write=True,
+        is_emergency_cancel_or_reduce_only_ioc=True,
+    )
+    return {
+        "ok": False,
+        "status": "AUTO_CANCELLED_UNFILLED_12S",
+        "order_id": order_id,
+        "ticker": ticker,
+        "lastObservedStatus": last_status,
+        "autoCancelled": bool(cancel_res.get("ok")),
+        "cancelHttpStatus": cancel_res.get("status_code"),
+        "chasedWithMarketOrder": False,
+        "neverChaseMarketOrder": True,
+        "reason": f"Auto-cancelled unfilled post_only order {order_id} after {timeout_sec:.1f}s (never chase market order).",
+    }
+
+
+def evaluate_low_balance_compounder_exit(
+    *,
+    contracts: int,
+    entry_price: float,
+    live_bid: float,
+    fv_nd2: float,
+    seconds_to_expiry: float,
+    consecutive_inversion_checks: int = 0,
+    side: Literal["BUY_YES", "BUY_NO"] = "BUY_YES",
+    spot_price: float = 0.0,
+    strike_price: float = 0.0,
+    annualized_sigma: float = 0.0,
+    settled_cash: float = 32.99,
+) -> Dict[str, Any]:
+    """
+    Low-Balance Compounder Exit Monitor (Section 17.2):
+    - Tight 2-Eval Inversion Stop: If `FV - bid < -0.04` for 2 consecutive 15s checks
+      OR unrealized loss hits `-$0.06` (`live_bid - entry_price <= -0.06`), exit 1 contract via Rule 3.
+    - Zero-Fee Settlement Hold Exemption: At `T - 90s`, if an open 1-contract position has
+      `FV(N(d2)) >= 0.85` AND signed ITM distance `> 0.25 * sigma * sqrt(tau)` beyond the strike,
+      DO NOT pay taker exit fee/spread at `T - 90s`; ride to $1.00 binary settlement ($0.00 fee).
+    """
+    cfg = LOW_BALANCE_KALSHI_COMPOUNDER
+    stop_cfg = cfg.get("tight_2eval_inversion_stop", {})
+    hold_cfg = cfg.get("zero_fee_settlement_hold_exemption", {})
+
+    fv_threshold = float(stop_cfg.get("fv_minus_bid_threshold_usd", -0.04))
+    consec_req = int(stop_cfg.get("consecutive_15s_checks", 2))
+    max_loss = float(stop_cfg.get("max_unrealized_loss_usd", -0.06))
+    t_minus = float(hold_cfg.get("t_minus_seconds", 90))
+    min_fv = float(hold_cfg.get("min_fv_nd2", 0.85))
+    itm_mult = float(hold_cfg.get("min_itm_sigma_sqrt_tau_mult", 0.25))
+
+    pnl_usd = round(live_bid - entry_price, 4)
+    fv_minus_bid = round(fv_nd2 - live_bid, 4)
+    breached_now = fv_minus_bid < fv_threshold
+    updated_consec = (consecutive_inversion_checks + 1) if breached_now else 0
+
+    if (updated_consec >= consec_req) or (pnl_usd <= max_loss + 1e-9):
+        return {
+            "should_exit": True,
+            "reason": "STOP_LOSS_COMPOUNDER_INVERSION",
+            "trigger_rule3_sweep": True,
+            "zero_fee_settlement_hold_exempt": False,
+            "updated_consecutive_inversion_checks": updated_consec,
+            "pnl_usd": pnl_usd,
+            "fv_minus_bid": fv_minus_bid,
+            "compounder_active": is_low_balance_kalshi_compounder_active(settled_cash),
+            "rationale": (
+                f"Tight inversion stop triggered ({updated_consec}x15s FV-bid={fv_minus_bid:+.3f} < {fv_threshold} "
+                f"or PnL ${pnl_usd:+.3f} <= ${max_loss:.2f}); execute Rule 3 CancelAllOpenOrders & exit."
+            ),
+        }
+
+    if seconds_to_expiry <= t_minus:
+        tau_years = max(seconds_to_expiry, 0.1) / (365.25 * 24.0 * 3600.0)
+        sigma_sqrt_tau = annualized_sigma * math.sqrt(tau_years) if annualized_sigma > 0 else 0.0
+        required_itm = itm_mult * sigma_sqrt_tau
+        is_no = side == "BUY_NO"
+        signed_itm = (
+            (math.log(strike_price / spot_price) if is_no else math.log(spot_price / strike_price))
+            if (spot_price > 0 and strike_price > 0)
+            else 0.0
+        )
+        if contracts == int(hold_cfg.get("max_contracts", 1)) and fv_nd2 >= min_fv and annualized_sigma > 0 and signed_itm > required_itm:
+            return {
+                "should_exit": False,
+                "reason": "HOLD_ZERO_FEE_SETTLEMENT",
+                "trigger_rule3_sweep": False,
+                "zero_fee_settlement_hold_exempt": True,
+                "updated_consecutive_inversion_checks": updated_consec,
+                "pnl_usd": pnl_usd,
+                "fv_minus_bid": fv_minus_bid,
+                "signed_itm_log_distance": round(signed_itm, 6),
+                "required_itm_threshold": round(required_itm, 6),
+                "settlement_fee_usd": 0.0,
+                "compounder_active": is_low_balance_kalshi_compounder_active(settled_cash),
+                "rationale": (
+                    f"Zero-Fee Settlement Hold Exemption at T-{seconds_to_expiry:.0f}s: 1 contract with FV={fv_nd2:.3f}>={min_fv} "
+                    f"& ITM={signed_itm:.5f}>{itm_mult}*sigma*sqrt(tau)={required_itm:.5f}; holding to $1.00 ($0.00 fee)."
+                ),
+            }
+
+        return {
+            "should_exit": True,
+            "reason": "FORCED_FLAT_T_MINUS_90S",
+            "trigger_rule3_sweep": True,
+            "zero_fee_settlement_hold_exempt": False,
+            "updated_consecutive_inversion_checks": updated_consec,
+            "pnl_usd": pnl_usd,
+            "fv_minus_bid": fv_minus_bid,
+            "compounder_active": is_low_balance_kalshi_compounder_active(settled_cash),
+            "rationale": f"Forced flat at T-{seconds_to_expiry:.0f}s <= {t_minus:.0f}s.",
+        }
+
+    return {
+        "should_exit": False,
+        "reason": "HOLD",
+        "trigger_rule3_sweep": False,
+        "zero_fee_settlement_hold_exempt": False,
+        "updated_consecutive_inversion_checks": updated_consec,
+        "pnl_usd": pnl_usd,
+        "fv_minus_bid": fv_minus_bid,
+        "compounder_active": is_low_balance_kalshi_compounder_active(settled_cash),
+        "rationale": f"Hold 1 contract: PnL ${pnl_usd:+.3f}, FV-bid {fv_minus_bid:+.3f}, checks={updated_consec}.",
+    }
+
+
+async def execute_low_balance_compounder_exit(
+    *,
+    ticker: str,
+    idempotency_key: str,
+    side: Literal["BUY_YES", "BUY_NO"] = "BUY_YES",
+    contracts: int = 1,
+    entry_price: float,
+    live_bid: float,
+    fv_nd2: float,
+    seconds_to_expiry: float,
+    consecutive_inversion_checks: int = 0,
+    spot_price: float = 0.0,
+    strike_price: float = 0.0,
+    annualized_sigma: float = 0.0,
+    settled_cash: float = 32.99,
+    con: Optional[_LedgerConnectionWrapper] = None,
+) -> Dict[str, Any]:
+    """Evaluates compounder exit signal and executes Rule 3 (CancelAllOpenOrders -> confirm 0 resting -> close 1 contract)."""
+    eval_res = evaluate_low_balance_compounder_exit(
+        contracts=contracts,
+        entry_price=entry_price,
+        live_bid=live_bid,
+        fv_nd2=fv_nd2,
+        seconds_to_expiry=seconds_to_expiry,
+        consecutive_inversion_checks=consecutive_inversion_checks,
+        side=side,
+        spot_price=spot_price,
+        strike_price=strike_price,
+        annualized_sigma=annualized_sigma,
+        settled_cash=settled_cash,
+    )
+    if not eval_res["should_exit"]:
+        return {"ok": True, "exit_executed": False, "evaluation": eval_res, "rule3_cancel": None, "exit_order": None}
+
+    cancel_res = await cancel_all_kalshi_v2_orders(reason=f"COMPOUNDER_EXIT:{eval_res['reason']}:{ticker}")
+    resting_check = await get_kalshi_resting_orders_for_ticker(ticker)
+    if not resting_check.get("ok") or len(resting_check.get("orders", [])) > 0:
+        return {
+            "ok": False,
+            "exit_executed": False,
+            "status": "ABORTED_LOCKED_INVENTORY",
+            "evaluation": eval_res,
+            "rule3_cancel": cancel_res,
+            "exit_order": None,
+            "rationale": f"Rule 3 balance release failed on {ticker}; open resting orders still present.",
+        }
+
+    exit_side: Literal["SELL_YES", "SELL_NO"] = "SELL_YES" if side == "BUY_YES" else "SELL_NO"
+    exit_order = await submit_kalshi_v2_events_order(
+        ticker=ticker,
+        idempotency_key=f"{idempotency_key}:compounder-exit",
+        side=exit_side,
+        contracts=1,
+        desired_price_dollars=live_bid,
+        post_only=False,
+        reduce_only=True,
+        time_in_force="immediate_or_cancel",
+        cancel_order_on_pause=True,
+        con=con,
+    )
+    return {
+        "ok": bool(exit_order.get("ok")),
+        "exit_executed": bool(exit_order.get("ok")),
+        "status": exit_order.get("status"),
+        "evaluation": eval_res,
+        "rule3_cancel": cancel_res,
+        "exit_order": exit_order,
+    }
+
+
+async def execute_low_balance_kalshi_compounder_entry(
+    *,
+    ticker: str,
+    idempotency_key: str,
+    trigger_id: Literal["SVB-60", "GKX-5"],
+    side: Literal["BUY_YES", "BUY_NO"] = "BUY_YES",
+    best_bid: float,
+    best_ask: float,
+    fv_nd2: float,
+    chop14: float,
+    adx: float,
+    lhs: float,
+    settled_cash: Optional[float] = None,
+    unfilled_auto_cancel_sec: Optional[float] = None,
+    poll_interval_sec: float = 1.0,
+    con: Optional[_LedgerConnectionWrapper] = None,
+) -> Dict[str, Any]:
+    """
+    End-to-end Kalshi execution path for `low_balance_kalshi_compounder` (< $150 settled cash, e.g. $32.99 MICRO_LOT_30):
+      1. Verifies settled cash (< $150; 3% cap = $0.9897 at $32.99 -> strictly 1 contract per trade).
+      2. Enforces trigger in ['SVB-60', 'GKX-5'], FV(N(d2)) - entry_price >= 0.18, CHOP(14) < 50, ADX >= 25, LHS >= 0.65.
+      3. Computes post_only Maker-First limit buy at min(best_ask - 0.01, best_bid + 0.01) inside [0.52, 0.74].
+      4. Runs Pre-Entry Resting Order Check (cancels stale resting orders on ticker & confirms 0 resting).
+      5. Submits 1-contract post_only GTC limit buy and auto-cancels after 12s if unfilled (never chases market order).
+    """
+    cfg = LOW_BALANCE_KALSHI_COMPOUNDER
+    maker_cfg = cfg.get("maker_first_entry", {})
+    if settled_cash is None:
+        bal = await get_kalshi_live_balance(forceRefresh=True)
+        settled_cash = float(bal.get("settledCash") or 0.0)
+        if not bal.get("ok") or bal.get("status") == "BALANCE_UNVERIFIED_BLOCK" or settled_cash <= 0:
+            return {"ok": False, "status": "BALANCE_UNVERIFIED_BLOCK", "settledCash": 0.0, "contracts": 0}
+
+    if not is_low_balance_kalshi_compounder_active(settled_cash):
+        return {"ok": False, "status": "COMPOUNDER_INACTIVE_ABOVE_150", "settledCash": settled_cash, "contracts": 0}
+
+    px_eval = compute_compounder_maker_limit_price(best_bid, best_ask)
+    if not px_eval["ok"]:
+        return {"ok": False, "status": "OUTSIDE_COMPOUNDER_PRICE_BAND", **px_eval, "contracts": 0}
+
+    entry_px = float(px_eval["price_dollars"])
+    blocked: List[str] = []
+    if trigger_id not in maker_cfg.get("allowed_triggers", ["SVB-60", "GKX-5"]):
+        blocked.append(f"Trigger {trigger_id} not allowed")
+    edge = round(fv_nd2 - entry_px, 4)
+    if edge < float(maker_cfg.get("min_fv_minus_entry_dollars", 0.18)) - 1e-9:
+        blocked.append(f"FV(N(d2)) - entry_price = {edge:.4f} < 0.18")
+    if not (chop14 < float(maker_cfg.get("chop14_max", 50.0))):
+        blocked.append(f"CHOP(14)={chop14:.2f} >= 50")
+    if not (adx >= float(maker_cfg.get("adx_min", 25.0))):
+        blocked.append(f"ADX={adx:.2f} < 25")
+    if not (lhs >= float(maker_cfg.get("lhs_min", 0.65))):
+        blocked.append(f"LHS={lhs:.3f} < 0.65")
+    if blocked:
+        return {"ok": False, "status": "GATE_BLOCKED", "blockedReasons": blocked, "limitPrice": entry_px, "contracts": 0}
+
+    cap_usd = round(settled_cash * float(cfg.get("settled_cash_cap_fraction", 0.03)), 4)
+    if cap_usd + 1e-9 < entry_px:
+        return {
+            "ok": False,
+            "status": "INSUFFICIENT_SETTLED_CASH_3PCT_CAP",
+            "settledCash": settled_cash,
+            "threePercentCapUsd": cap_usd,
+            "limitPrice": entry_px,
+            "contracts": 0,
+        }
+
+    pre_check = await ensure_no_stale_resting_orders_before_entry(ticker)
+    if not pre_check.get("ok"):
+        return {"ok": False, "status": "STALE_RESTING_ORDERS_NOT_CLEARED", "preEntryCheck": pre_check, "contracts": 0}
+
+    v2_res = await submit_kalshi_v2_events_order(
+        ticker=ticker,
+        idempotency_key=idempotency_key,
+        side=side,
+        contracts=1,
+        desired_price_dollars=entry_px,
+        post_only=True,
+        reduce_only=False,
+        time_in_force="good_till_canceled",
+        cancel_order_on_pause=True,
+        con=con,
+    )
+    if not v2_res.get("ok"):
+        return {
+            "ok": False,
+            "status": v2_res.get("status", "VENUE_EXECUTION_FAILED"),
+            "tier": cfg.get("tier_name", "MICRO_LOT_30"),
+            "contracts": 1,
+            "preEntryCheck": pre_check,
+            "v2Order": v2_res,
+        }
+
+    status_up = str(v2_res.get("status") or "").upper()
+    if status_up in ("EXECUTED", "FILLED"):
+        return {
+            "ok": True,
+            "status": status_up,
+            "tier": cfg.get("tier_name", "MICRO_LOT_30"),
+            "contracts": 1,
+            "limitPrice": entry_px,
+            "postOnly": True,
+            "preEntryCheck": pre_check,
+            "v2Order": v2_res,
+            "autoCancelled": False,
+            "chasedWithMarketOrder": False,
+        }
+
+    timeout_s = float(
+        unfilled_auto_cancel_sec
+        if unfilled_auto_cancel_sec is not None
+        else maker_cfg.get("unfilled_auto_cancel_seconds", 12.0)
+    )
+    mon_res = await monitor_and_auto_cancel_unfilled_entry(
+        order_id=str(v2_res["order_id"]),
+        ticker=ticker,
+        timeout_sec=timeout_s,
+        poll_interval_sec=poll_interval_sec,
+    )
+    return {
+        "ok": bool(mon_res.get("ok")),
+        "status": mon_res.get("status"),
+        "tier": cfg.get("tier_name", "MICRO_LOT_30"),
+        "contracts": 1,
+        "limitPrice": entry_px,
+        "postOnly": True,
+        "preEntryCheck": pre_check,
+        "v2Order": v2_res,
+        "monitorResult": mon_res,
+        "autoCancelled": bool(mon_res.get("autoCancelled")),
+        "chasedWithMarketOrder": False,
+    }
+
+
 # =====================================================================
 # 3F. SQLITE HYPOTHESIS & BRIER SKILL SCORE (BSS) CALIBRATION LEDGER
 #     + SEQUENTIAL 5-GATE PRE-TRADE FIREWALL (`KalshiSignalSchema` -> `place_v2_maker_order`)
@@ -5103,10 +5662,17 @@ async def evaluate_5_gate_risk_engine_and_execute(
         p_eff = min(0.99, base_contract_cost + fee_per_contract)
         f_star = max(0.0, 0.5 * ((p_hat - p_eff) / max(1e-6, 1.0 - p_eff)))
         kelly_notional = signal.bankroll_dollars * f_star
-        capped_notional = min(kelly_notional, MAX_NOTIONAL_PER_MARKET)
+        compounder_active = is_low_balance_kalshi_compounder_active(signal.bankroll_dollars)
+        compounder_max_contracts = int(LOW_BALANCE_KALSHI_COMPOUNDER.get("max_contracts_per_trade", 1))
+        compounder_cash_cap = signal.bankroll_dollars * float(LOW_BALANCE_KALSHI_COMPOUNDER.get("settled_cash_cap_fraction", 0.03))
+        capped_notional = (
+            min(kelly_notional, compounder_cash_cap, MAX_NOTIONAL_PER_MARKET)
+            if compounder_active
+            else min(kelly_notional, MAX_NOTIONAL_PER_MARKET)
+        )
         contracts_sized = min(
-            MAX_CONTRACTS_PER_ORDER,
-            max(0, int(math.floor(capped_notional / max(0.01, p_eff)))),
+            compounder_max_contracts if compounder_active else MAX_CONTRACTS_PER_ORDER,
+            max(0, int(math.floor((capped_notional + 1e-9) / max(0.01, p_eff)))),
         )
         gate4_passed = (f_star > 0.0) and (contracts_sized >= 1)
         gate4_detail = {
@@ -5120,8 +5686,10 @@ async def evaluate_5_gate_risk_engine_and_execute(
             "rawKellyNotionalDollars": round(kelly_notional, 2),
             "cappedNotionalDollars": round(capped_notional, 2),
             "contractsSized": contracts_sized,
-            "maxContractsPerOrder": MAX_CONTRACTS_PER_ORDER,
-            "maxNotionalPerMarket": MAX_NOTIONAL_PER_MARKET,
+            "lowBalanceCompounderActive": compounder_active,
+            "compounderTier": LOW_BALANCE_KALSHI_COMPOUNDER.get("tier_name", "MICRO_LOT_30") if compounder_active else "STANDARD",
+            "maxContractsPerOrder": compounder_max_contracts if compounder_active else MAX_CONTRACTS_PER_ORDER,
+            "maxNotionalPerMarket": round(compounder_cash_cap, 4) if compounder_active else MAX_NOTIONAL_PER_MARKET,
         }
 
         # -----------------------------------------------------------------
@@ -5201,20 +5769,43 @@ async def evaluate_5_gate_risk_engine_and_execute(
             execution_mode = "BLOCKED_GATE_3_CALIBRATION_UNCERTAINTY"
             v2_order_result = None
         else:
-            v2_order_result = await place_v2_maker_order(
-                ticker=signal.market_ticker,
-                idempotency_key=signal.idempotency_key,
-                side=order_side,
-                contracts=contracts_sized,
-                desired_price_dollars=signal.execution_price,
-                cancel_order_on_pause=True,
-                con=con,
-            )
-            execution_mode = (
-                "LIVE_MAKER_EXECUTED"
-                if bool(v2_order_result and v2_order_result.get("ok"))
-                else "VENUE_EXECUTION_FAILED"
-            )
+            if compounder_active:
+                pre_entry_check = await ensure_no_stale_resting_orders_before_entry(signal.market_ticker)
+                if not pre_entry_check.get("ok"):
+                    v2_order_result = {"ok": False, "status": "STALE_RESTING_ORDERS_NOT_CLEARED", "preEntryCheck": pre_entry_check}
+                    execution_mode = "BLOCKED_STALE_RESTING_ORDERS_DOUBLE_LOCK"
+                else:
+                    v2_order_result = await place_v2_maker_order(
+                        ticker=signal.market_ticker,
+                        idempotency_key=signal.idempotency_key,
+                        side=order_side,
+                        contracts=1,
+                        desired_price_dollars=signal.execution_price,
+                        cancel_order_on_pause=True,
+                        con=con,
+                    )
+                    if isinstance(v2_order_result, dict):
+                        v2_order_result["preEntryCheck"] = pre_entry_check
+                    execution_mode = (
+                        "LIVE_MAKER_EXECUTED"
+                        if bool(v2_order_result and v2_order_result.get("ok"))
+                        else "VENUE_EXECUTION_FAILED"
+                    )
+            else:
+                v2_order_result = await place_v2_maker_order(
+                    ticker=signal.market_ticker,
+                    idempotency_key=signal.idempotency_key,
+                    side=order_side,
+                    contracts=contracts_sized,
+                    desired_price_dollars=signal.execution_price,
+                    cancel_order_on_pause=True,
+                    con=con,
+                )
+                execution_mode = (
+                    "LIVE_MAKER_EXECUTED"
+                    if bool(v2_order_result and v2_order_result.get("ok"))
+                    else "VENUE_EXECUTION_FAILED"
+                )
 
         sqlite_conn.execute(
             """
@@ -6047,6 +6638,9 @@ async def execute_kalshi_or_public_order(
             cal_yes_p = float(gate.get("fairYesProb") or 0.68)
             mid_p = round(max(0.05, min(0.95, ask_price - 0.01)), 4)
             exec_yes_px = round(max(0.01, min(0.99, ask_price - 0.01 if side == "BUY_YES" else (1.0 - ask_price) + 0.01)), 4)
+            compounder_active = is_low_balance_kalshi_compounder_active(settled_cash)
+            if compounder_active:
+                contracts = min(int(LOW_BALANCE_KALSHI_COMPOUNDER.get("max_contracts_per_trade", 1)), contracts)
             sig_obj = KalshiSignalSchema(
                 market_ticker=active_kalshi_ticker,
                 series_ticker=series_code,
@@ -6063,20 +6657,25 @@ async def execute_kalshi_or_public_order(
             )
             five_gate_result = await evaluate_5_gate_risk_engine_and_execute(signal=sig_obj, con=con)
             kalshi_v2_order_result = five_gate_result.get("v2_maker_order")
-            if not kalshi_v2_order_result:
-                # Direct Kalshi RSA-signed POST /trade-api/v2/portfolio/orders execution when 5-gate delegates to venue router
-                kalshi_v2_order_result = await submit_kalshi_v2_events_order(
-                    ticker=active_kalshi_ticker,
-                    idempotency_key=idempotency_key,
-                    side="BUY_YES" if side.upper() == "BUY_YES" else ("BUY_NO" if side.upper() == "BUY_NO" else "SELL_YES"),
-                    contracts=contracts,
-                    desired_price_dollars=exec_yes_px,
-                    post_only=True,
-                    reduce_only=False,
-                    time_in_force="good_till_canceled",
-                    cancel_order_on_pause=True,
-                    con=con,
-                )
+            if not kalshi_v2_order_result and five_gate_result.get("execution_mode") != "BLOCKED_STALE_RESTING_ORDERS_DOUBLE_LOCK":
+                if compounder_active:
+                    pre_entry_check = await ensure_no_stale_resting_orders_before_entry(active_kalshi_ticker)
+                    if not pre_entry_check.get("ok"):
+                        kalshi_v2_order_result = {"ok": False, "status": "STALE_RESTING_ORDERS_NOT_CLEARED", "preEntryCheck": pre_entry_check}
+                if kalshi_v2_order_result is None:
+                    # Direct Kalshi RSA-signed POST /trade-api/v2/portfolio/orders execution when 5-gate delegates to venue router
+                    kalshi_v2_order_result = await submit_kalshi_v2_events_order(
+                        ticker=active_kalshi_ticker,
+                        idempotency_key=idempotency_key,
+                        side="BUY_YES" if side.upper() == "BUY_YES" else ("BUY_NO" if side.upper() == "BUY_NO" else "SELL_YES"),
+                        contracts=contracts,
+                        desired_price_dollars=exec_yes_px,
+                        post_only=True,
+                        reduce_only=False,
+                        time_in_force="good_till_canceled",
+                        cancel_order_on_pause=True,
+                        con=con,
+                    )
             exchange_order_id = str((kalshi_v2_order_result or {}).get("exchange_order_id") or (kalshi_v2_order_result or {}).get("order_id") or "").strip()
             raw_venue_resp = (kalshi_v2_order_result or {}).get("raw_venue_response") or (kalshi_v2_order_result or {}).get("rawResponse") or {}
             if not kalshi_v2_order_result or not kalshi_v2_order_result.get("ok") or not exchange_order_id:
@@ -7784,7 +8383,25 @@ async def propose_or_execute_strategy(
 
     contracts = int(corr_guard["approvedContracts"])
     notional_usd = float(corr_guard["approvedNotionalUsd"])
-    is_post_only = conviction_tier == "MODERATE" or execution_mode == "MAKER_POST_ONLY"
+    compounder_active = is_low_balance_kalshi_compounder_active(settled_cash)
+    if compounder_active:
+        contracts = min(int(LOW_BALANCE_KALSHI_COMPOUNDER.get("max_contracts_per_trade", 1)), contracts)
+        is_post_only = True
+        pre_entry_check = await ensure_no_stale_resting_orders_before_entry(ticker)
+        if not pre_entry_check.get("ok"):
+            return {
+                "ok": False,
+                "status": "STALE_RESTING_ORDERS_NOT_CLEARED",
+                "idempotency_key": idempotency_key,
+                "ticker": ticker,
+                "settledCash": settled_cash,
+                "preEntryCheck": pre_entry_check,
+                "dataQualityWarning": False,
+                "rationale": str(pre_entry_check.get("reason")),
+            }
+    else:
+        is_post_only = conviction_tier == "MODERATE" or execution_mode == "MAKER_POST_ONLY"
+
     con = get_db_connection()
     try:
         v2_res = await submit_kalshi_v2_events_order(
