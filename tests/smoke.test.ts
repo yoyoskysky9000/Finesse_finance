@@ -10,6 +10,7 @@ const tempLedgerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quantpulse-smoke-')
 process.env.QUANTPULSE_TEST_MODE = 'true';
 process.env.QUANTPULSE_VAULT_LEDGER_PATH = path.join(tempLedgerDir, 'vault-ledger.json');
 process.env.QUANTPULSE_EXEC_IDEMPOTENCY_PATH = path.join(tempLedgerDir, 'exec-idempotency.json');
+process.env.QUANTPULSE_RISK_GUARD_PATH = path.join(tempLedgerDir, 'risk-guard-ledger.json');
 delete process.env.STRICT_API_AUTH_REQUIRED;
 
 async function runSmokeSuite() {
@@ -22,6 +23,8 @@ async function runSmokeSuite() {
     autonomousAgents,
     executedOrders,
     marketFeatures,
+    livePublicPositions,
+    riskGuard,
     resetVenueOrderSubmissionCount,
     setTestLiveCashBalances,
     setTestVenueExitHooks,
@@ -32,6 +35,8 @@ async function runSmokeSuite() {
     loadExecuteTradeIdempotencyStoreFromDisk,
     syncLiveKalshiPortfolio,
     computePortfolioSummary,
+    executeLivePublicBrokeragePulse,
+    placePublicTakeProfitSellOrders,
   } = serverMod;
   const { StrategyBacktester, runDeterministicRegimeBacktest } = await import(
     '../src/components/StrategyBacktester'
@@ -1477,7 +1482,478 @@ async function runSmokeSuite() {
       'PASS [LOW_BALANCE_KALSHI_COMPOUNDER]: MICRO_LOT_30 ($32.99 -> 1 contract), Pre-Entry Resting Order Check, Maker-First post_only [0.52, 0.74] + 12s auto-cancel, Zero-Fee Settlement Hold Exemption, and Tight 2-Eval Inversion Stop passed.'
     );
 
-    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER PASSED.');
+    // -------------------------------------------------------------------------
+    // TASK-14 [VAULT-FIX]: Secondary Live Routes RiskGuard Verification
+    // -------------------------------------------------------------------------
+    const authHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer valid-test-operator-token',
+    };
+
+    // (a1) Missing / unverified balance blocks all secondary live routes with BALANCE_UNVERIFIED_BLOCK & 0 venue calls
+    riskGuard.clearLocksForTests();
+    setTestLiveCashBalances({
+      kalshiCashUsd: null,
+      kalshiSyncOk: false,
+      publicCashUsd: null,
+      publicBuyingPowerUsd: null,
+      publicCashOnlyBuyingPowerUsd: null,
+      publicSyncOk: false,
+    });
+    resetVenueOrderSubmissionCount();
+
+    const unverifiedChecks: Array<{ label: string; url: string; body: Record<string, unknown> }> = [
+      {
+        label: '/api/kalshi/five-gate-evaluate',
+        url: `${baseUrl}/api/kalshi/five-gate-evaluate`,
+        body: {
+          market_ticker: 'KXBTC15M-SMOKE14A',
+          series_ticker: 'KXBTC15M',
+          kalshi_mid_prob: 0.50,
+          yes_bid_dollars: 0.49,
+          yes_ask_dollars: 0.51,
+          execution_price: 0.50,
+          calibrated_yes_prob: 0.78,
+          confidence_band: 0.06,
+          is_maker: true,
+          recommended_side: 'yes',
+          timeframe: '5m',
+        },
+      },
+      {
+        label: '/api/kalshi/gemini-signal',
+        url: `${baseUrl}/api/kalshi/gemini-signal`,
+        body: {
+          market_ticker: 'KXETH15M-SMOKE14A',
+          series_ticker: 'KXETH15M',
+          kalshi_mid_prob: 0.50,
+          yes_bid_dollars: 0.49,
+          yes_ask_dollars: 0.51,
+          calibrated_yes_prob_hint: 0.78,
+          confidence_band_hint: 0.06,
+          timeframe: '5m',
+        },
+      },
+      {
+        label: '/api/public/execute-burst',
+        url: `${baseUrl}/api/public/execute-burst`,
+        body: { symbols: ['SPY'], notionalPerTradeUsd: 50, timeframe: '5m' },
+      },
+      {
+        label: '/api/kalshi/hft-burst',
+        url: `${baseUrl}/api/kalshi/hft-burst`,
+        body: { series: ['KXBTC15M'], contractsPerOrder: 5 },
+      },
+      {
+        label: '/api/agents/deploy-best-strategy',
+        url: `${baseUrl}/api/agents/deploy-best-strategy`,
+        body: { symbol: 'SPY', notionalUsd: 65, timeframe: '5m', strategyId: 'SMOKE14_UNVERIFIED' },
+      },
+      {
+        label: '/api/agents/deploy-15m-hft-winner',
+        url: `${baseUrl}/api/agents/deploy-15m-hft-winner`,
+        body: { symbol: 'KXSOL15M', requestedContracts: 10, timeframe: '5m' },
+      },
+      {
+        label: '/api/lead-lag/execute-zero-hold-scalp',
+        url: `${baseUrl}/api/lead-lag/execute-zero-hold-scalp`,
+        body: { seriesTicker: 'KXBTC15M', requestedContracts: 10, timeframe: '5m' },
+      },
+    ];
+
+    for (const chk of unverifiedChecks) {
+      const resp = await fetch(chk.url, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify(chk.body),
+      });
+      const data = (await resp.json()) as Record<string, any>;
+      assert.equal(
+        resp.status,
+        400,
+        `Expected HTTP 400 BALANCE_UNVERIFIED_BLOCK on ${chk.label}, got ${resp.status} (${JSON.stringify(data)})`
+      );
+      assert.equal(
+        data.code,
+        'BALANCE_UNVERIFIED_BLOCK',
+        `Expected BALANCE_UNVERIFIED_BLOCK on ${chk.label}, got ${data.code}`
+      );
+    }
+    assert.equal(
+      serverMod.venueOrderSubmissionCount,
+      0,
+      `Expected 0 venue calls when settled cash is unverified across secondary routes, got ${serverMod.venueOrderSubmissionCount}`
+    );
+
+    // (a2) Stale (>60s) cash sync must also fail closed with BALANCE_UNVERIFIED_BLOCK
+    setTestLiveCashBalances({
+      kalshiCashUsd: 500,
+      kalshiSyncOk: true,
+      kalshiSyncedAtMs: Date.now() - 120_000,
+      publicCashUsd: 500,
+      publicBuyingPowerUsd: 500,
+      publicCashOnlyBuyingPowerUsd: 500,
+      publicSyncOk: true,
+      publicSyncedAtMs: Date.now() - 120_000,
+    });
+    const stalePubRes = await fetch(`${baseUrl}/api/public/execute-burst`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ symbols: ['NVDA'], notionalPerTradeUsd: 10, timeframe: '5m' }),
+    });
+    const stalePubData = (await stalePubRes.json()) as Record<string, any>;
+    assert.equal(stalePubRes.status, 400);
+    assert.equal(stalePubData.code, 'BALANCE_UNVERIFIED_BLOCK');
+    const staleKalshiRes = await fetch(`${baseUrl}/api/kalshi/five-gate-evaluate`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(unverifiedChecks[0].body),
+    });
+    const staleKalshiData = (await staleKalshiRes.json()) as Record<string, any>;
+    assert.equal(staleKalshiRes.status, 400);
+    assert.equal(staleKalshiData.code, 'BALANCE_UNVERIFIED_BLOCK');
+    assert.equal(serverMod.venueOrderSubmissionCount, 0);
+    console.log(
+      'PASS [TASK-14 (a)]: Missing and >60s-stale settled balances refused with BALANCE_UNVERIFIED_BLOCK and 0 venue calls across all secondary routes.'
+    );
+
+    // (b) Duplicate identical secondary-route orders in the same bucket produce exactly ONE venue call (+ 90s bucket unlock check)
+    riskGuard.clearLocksForTests();
+    setTestLiveCashBalances({
+      kalshiCashUsd: 500,
+      kalshiSyncOk: true,
+      publicCashUsd: 500,
+      publicBuyingPowerUsd: 500,
+      publicCashOnlyBuyingPowerUsd: 500,
+      publicSyncOk: true,
+    });
+    resetVenueOrderSubmissionCount();
+
+    const deployDupPayload = {
+      symbol: 'SPY',
+      notionalUsd: 10,
+      timeframe: '5m',
+      strategyId: 'SMOKE14_DUP_DEPLOY',
+    };
+    const depFirst = await fetch(`${baseUrl}/api/agents/deploy-best-strategy`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(deployDupPayload),
+    });
+    const depFirstData = (await depFirst.json()) as Record<string, any>;
+    assert.equal(depFirst.status, 200);
+    assert(depFirstData.order?.id, 'Expected first deploy-best-strategy call to execute');
+    const callsAfterDepFirst = serverMod.venueOrderSubmissionCount;
+    assert.equal(callsAfterDepFirst, 1, 'Expected 1 venue submission after first deploy-best-strategy call');
+
+    const depSecond = await fetch(`${baseUrl}/api/agents/deploy-best-strategy`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(deployDupPayload),
+    });
+    const depSecondData = (await depSecond.json()) as Record<string, any>;
+    assert.equal(depSecond.status, 200);
+    assert.equal(depSecondData.duplicateBlocked, true);
+    assert.equal(depSecondData.code, 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK');
+    assert.equal(
+      serverMod.venueOrderSubmissionCount,
+      callsAfterDepFirst,
+      'Expected second identical deploy-best-strategy in same bucket to make 0 additional venue calls'
+    );
+
+    // Public burst helper twice in same bucket -> 1 venue call
+    const pubPulse1 = await executeLivePublicBrokeragePulse({
+      symbols: ['NVDA'],
+      notionalPerTradeUsd: 10,
+      timeframe: '5m',
+    });
+    assert.equal(pubPulse1.executedCount, 1);
+    const callsAfterPubPulse1 = serverMod.venueOrderSubmissionCount;
+    assert.equal(callsAfterPubPulse1, callsAfterDepFirst + 1);
+
+    const pubPulse2 = await executeLivePublicBrokeragePulse({
+      symbols: ['NVDA'],
+      notionalPerTradeUsd: 10,
+      timeframe: '5m',
+    });
+    assert.equal(pubPulse2.executedCount, 0);
+    assert.equal(pubPulse2.duplicateBlocked, true);
+    assert.equal(pubPulse2.code, 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK');
+    assert.equal(serverMod.venueOrderSubmissionCount, callsAfterPubPulse1);
+
+    // 5-Gate route twice in same bucket -> 1 venue call
+    const fgPayload = {
+      market_ticker: 'KXBTC15M-SMOKE14DUP',
+      series_ticker: 'KXBTC15M',
+      kalshi_mid_prob: 0.50,
+      yes_bid_dollars: 0.49,
+      yes_ask_dollars: 0.51,
+      execution_price: 0.50,
+      calibrated_yes_prob: 0.78,
+      confidence_band: 0.06,
+      is_maker: true,
+      recommended_side: 'yes',
+      timeframe: '5m',
+    };
+    const fgFirst = await fetch(`${baseUrl}/api/kalshi/five-gate-evaluate`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(fgPayload),
+    });
+    const fgFirstData = (await fgFirst.json()) as Record<string, any>;
+    assert.equal(fgFirst.status, 200);
+    assert.equal(fgFirstData.ok, true);
+    assert.equal(fgFirstData.v2_maker_order?.ok, true);
+    const callsAfterFg1 = serverMod.venueOrderSubmissionCount;
+    assert.equal(callsAfterFg1, callsAfterPubPulse1 + 1);
+
+    const fgSecond = await fetch(`${baseUrl}/api/kalshi/five-gate-evaluate`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(fgPayload),
+    });
+    const fgSecondData = (await fgSecond.json()) as Record<string, any>;
+    assert.equal(fgSecond.status, 200);
+    assert.equal(fgSecondData.duplicateBlocked, true);
+    assert.equal(fgSecondData.code, 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK');
+    assert.equal(serverMod.venueOrderSubmissionCount, callsAfterFg1);
+
+    // Zero-hold scalp twice in same bucket -> 1 venue call
+    const scalpPayload = { seriesTicker: 'KXBTC15M', requestedContracts: 2, timeframe: '5m' };
+    const scalp1 = await fetch(`${baseUrl}/api/lead-lag/execute-zero-hold-scalp`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(scalpPayload),
+    });
+    const scalp1Data = (await scalp1.json()) as Record<string, any>;
+    assert.equal(scalp1.status, 200);
+    assert.equal(scalp1Data.executedCount, 1);
+    const callsAfterScalp1 = serverMod.venueOrderSubmissionCount;
+    assert.equal(callsAfterScalp1, callsAfterFg1 + 1);
+
+    const scalp2 = await fetch(`${baseUrl}/api/lead-lag/execute-zero-hold-scalp`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify(scalpPayload),
+    });
+    const scalp2Data = (await scalp2.json()) as Record<string, any>;
+    assert.equal(scalp2.status, 200);
+    assert.equal(scalp2Data.executedCount, 0);
+    assert.equal(scalp2Data.duplicateBlocked, true);
+    assert.equal(serverMod.venueOrderSubmissionCount, callsAfterScalp1);
+
+    // Explicit 90s bucket preserves stale-Maker auto-recycle without Date.now()
+    const baseBucketTs = 1_800_000_000_000;
+    const sniperB1 = riskGuard.evaluateEntryOrder({
+      venue: 'KALSHI',
+      symbol: 'KXBTC15M-RECYCLE',
+      side: 'BUY_YES',
+      strategyId: 'KALSHI_HFT_SNIPER',
+      timeframe: '90s',
+      requestedNotionalUsd: 2.0,
+      unitPriceUsd: 0.50,
+      isIntegerContracts: true,
+      timestampMs: baseBucketTs,
+      settledCash: {
+        venue: 'KALSHI',
+        settledCashUsd: 500,
+        syncOk: true,
+        lastSyncAtMs: baseBucketTs,
+        nowMs: baseBucketTs,
+      },
+    });
+    assert.equal(sniperB1.ok, true);
+    const sniperSameBucket = riskGuard.evaluateEntryOrder({
+      venue: 'KALSHI',
+      symbol: 'KXBTC15M-RECYCLE',
+      side: 'BUY_YES',
+      strategyId: 'KALSHI_HFT_SNIPER',
+      timeframe: '90s',
+      requestedNotionalUsd: 2.0,
+      unitPriceUsd: 0.50,
+      isIntegerContracts: true,
+      timestampMs: baseBucketTs + 45_000,
+      settledCash: {
+        venue: 'KALSHI',
+        settledCashUsd: 500,
+        syncOk: true,
+        lastSyncAtMs: baseBucketTs + 45_000,
+        nowMs: baseBucketTs + 45_000,
+      },
+    });
+    assert.equal(sniperSameBucket.ok, false);
+    assert.equal(sniperSameBucket.code, 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK');
+    const sniperNextBucket = riskGuard.evaluateEntryOrder({
+      venue: 'KALSHI',
+      symbol: 'KXBTC15M-RECYCLE',
+      side: 'BUY_YES',
+      strategyId: 'KALSHI_HFT_SNIPER',
+      timeframe: '90s',
+      requestedNotionalUsd: 2.0,
+      unitPriceUsd: 0.50,
+      isIntegerContracts: true,
+      timestampMs: baseBucketTs + 90_000,
+      settledCash: {
+        venue: 'KALSHI',
+        settledCashUsd: 500,
+        syncOk: true,
+        lastSyncAtMs: baseBucketTs + 90_000,
+        nowMs: baseBucketTs + 90_000,
+      },
+    });
+    assert.equal(sniperNextBucket.ok, true);
+    console.log(
+      'PASS [TASK-14 (b)]: Identical secondary-route orders in same bucket produced single venue call; explicit 90s bucket unlocks next recycle window.'
+    );
+
+    // (c) Secondary-route orders above 3% settled-cash cap are sized down strictly to <= 3% settled cash (never equity or margin buying power)
+    riskGuard.clearLocksForTests();
+    setTestLiveCashBalances({
+      kalshiCashUsd: 30, // 3% = $0.90 -> max 1 contract @ $0.50-$0.56
+      kalshiSyncOk: true,
+      publicCashUsd: 500, // 3% = $15.00
+      publicCashOnlyBuyingPowerUsd: 500,
+      publicBuyingPowerUsd: 10000, // Deliberately 20x higher margin buying power to ensure cap uses settled cash ($500), NOT buying power ($10,000)
+      publicSyncOk: true,
+    });
+    resetVenueOrderSubmissionCount();
+
+    const oversizedPubRes = await executeLivePublicBrokeragePulse({
+      symbols: ['SPY'],
+      notionalPerTradeUsd: 120, // Requested $120 > $15 (3% of $500 settled cash), well below 3% of $10k buying power ($300)
+      timeframe: '5m',
+    });
+    assert.equal(oversizedPubRes.executedCount, 1);
+    const cappedPubNotional = oversizedPubRes.publicBuyOrders[0].notionalUsd ?? 0;
+    assert(
+      cappedPubNotional <= 15.05 && cappedPubNotional > 0,
+      `Expected Public burst order notional to clamp to <= $15.00 (3% settled cash), got $${cappedPubNotional}`
+    );
+
+    const oversizedHftWinnerRes = await fetch(`${baseUrl}/api/agents/deploy-15m-hft-winner`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ symbol: 'KXSOL15M', requestedContracts: 20, timeframe: '5m' }),
+    });
+    const oversizedHftWinnerData = (await oversizedHftWinnerRes.json()) as Record<string, any>;
+    assert.equal(oversizedHftWinnerRes.status, 200);
+    assert.equal(oversizedHftWinnerData.wasCapped, true);
+    assert.equal(
+      oversizedHftWinnerData.order?.quantity,
+      1,
+      `Expected deploy-15m-hft-winner 20 contracts on $30 settled cash to clamp to 1 contract, got ${oversizedHftWinnerData.order?.quantity}`
+    );
+
+    const oversizedScalpRes = await fetch(`${baseUrl}/api/lead-lag/execute-zero-hold-scalp`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ seriesTicker: 'KXBTC15M', requestedContracts: 20, timeframe: '5m' }),
+    });
+    const oversizedScalpData = (await oversizedScalpRes.json()) as Record<string, any>;
+    assert.equal(oversizedScalpRes.status, 200);
+    assert.equal(oversizedScalpData.executedCount, 1);
+    assert.equal(
+      oversizedScalpData.executedScalps?.[0]?.contracts,
+      1,
+      `Expected zero-hold-scalp 20 contracts on $30 settled cash to clamp to 1 contract, got ${oversizedScalpData.executedScalps?.[0]?.contracts}`
+    );
+
+    const oversizedFiveGateRes = await fetch(`${baseUrl}/api/kalshi/five-gate-evaluate`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        market_ticker: 'KXBTC15M-SMOKE14CAP',
+        series_ticker: 'KXBTC15M',
+        kalshi_mid_prob: 0.50,
+        yes_bid_dollars: 0.49,
+        yes_ask_dollars: 0.51,
+        execution_price: 0.50,
+        calibrated_yes_prob: 0.78,
+        confidence_band: 0.06,
+        is_maker: true,
+        recommended_side: 'yes',
+        timeframe: '5m',
+      }),
+    });
+    const oversizedFiveGateData = (await oversizedFiveGateRes.json()) as Record<string, any>;
+    assert.equal(oversizedFiveGateRes.status, 200);
+    assert.equal(oversizedFiveGateData.ok, true);
+    assert.equal(oversizedFiveGateData.v2_maker_order?.ok, true);
+    assert.equal(
+      oversizedFiveGateData.gates?.gate4_half_kelly_sizing?.contractsSized,
+      1,
+      `Expected five-gate-evaluate on $30 settled cash to clamp to 1 contract, got ${oversizedFiveGateData.gates?.gate4_half_kelly_sizing?.contractsSized}`
+    );
+    console.log(
+      'PASS [TASK-14 (c)]: Secondary routes clamped oversized orders strictly to 3% settled cash (Public <= $15 on $500 cash despite $10k margin; Kalshi 1 contract on $30 cash).'
+    );
+
+    // (d) Rule 3 Pre-Exit Sweep on placePublicTakeProfitSellOrders (CancelAllOpenOrders -> confirm 0 resting -> sell exact settled qty)
+    const savedPubPositions = livePublicPositions.splice(0, livePublicPositions.length);
+    try {
+      livePublicPositions.push({
+        symbol: 'SPY',
+        name: 'SPDR S&P 500 ETF Trust',
+        instrumentType: 'EQUITY',
+        quantity: 3,
+        marketValue: 1515,
+        currentPrice: 505,
+        averagePrice: 500,
+        unrealizedPnl: 15,
+        gainPercentage: 1.0,
+        dailyGainUsd: 7.5,
+        percentOfPortfolio: 100,
+      });
+
+      let openOrderCountToReturn = 2; // First simulate 2 stuck open orders blocking balance release
+      let cancelInvocations = 0;
+      let submittedExitTotalQty = 0;
+
+      setTestVenueExitHooks({
+        cancelOpenOrders: async () => {
+          cancelInvocations += 1;
+          return openOrderCountToReturn;
+        },
+        getOpenOrdersCount: async () => openOrderCountToReturn,
+        getSettledPositionQty: async () => 2, // Settled qty is 2 (smaller than nominal pos.quantity=3)
+        submitPublicExit: async (params) => {
+          submittedExitTotalQty += Number(params.quantity);
+          return { ok: true, liveSubmitted: true, orderId: 'pub-rule3-confirmed-1' };
+        },
+      });
+
+      const blockedExit = await placePublicTakeProfitSellOrders({ force: true });
+      assert.equal(
+        blockedExit.placedCount,
+        0,
+        'Expected Rule 3 sweep to withhold exit when resting open orders do not reach 0'
+      );
+
+      openOrderCountToReturn = 0; // Now simulate clean balance/collateral release
+      cancelInvocations = 0;
+      submittedExitTotalQty = 0;
+      const confirmedExit = await placePublicTakeProfitSellOrders({ force: true });
+      assert.equal(confirmedExit.placedCount, 1);
+      assert(cancelInvocations >= 1, 'Expected Rule 3 sweep to call cancelAllOpenOrders before SELL');
+      assert.equal(
+        submittedExitTotalQty,
+        2,
+        `Expected Rule 3 exit tranches to sum to exact settled qty 2, got ${submittedExitTotalQty}`
+      );
+      assert.equal(
+        confirmedExit.publicSellOrders[0].quantity,
+        2,
+        `Expected recorded SELL order quantity to be 2, got ${confirmedExit.publicSellOrders[0].quantity}`
+      );
+      console.log(
+        'PASS [TASK-14 (d)]: placePublicTakeProfitSellOrders enforced Rule 3 sweep (withheld when openOrders>0, cancelled & sold exact settled qty=2).'
+      );
+    } finally {
+      setTestVenueExitHooks(null);
+      livePublicPositions.splice(0, livePublicPositions.length, ...savedPubPositions);
+    }
+
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER + TASK-14-RISK-GUARD PASSED.');
   } finally {
     setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);

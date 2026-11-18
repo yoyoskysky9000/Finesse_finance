@@ -148,6 +148,11 @@ import {
   type XvdEvaluationResult,
   type XvdTriggerInput,
 } from './src/strategies/LeadLagAnomalyTriggers.ts';
+import {
+  riskGuard,
+  type RiskGuardTimeframe,
+  type SettledCashSnapshot,
+} from './src/server/riskGuard.ts';
 
 dotenv.config();
 
@@ -2980,6 +2985,29 @@ export function setTestLiveCashBalances(params: {
   }
 }
 
+function getKalshiSettledCashSnapshot(): SettledCashSnapshot {
+  return {
+    venue: 'KALSHI',
+    settledCashUsd: liveKalshiCashBalanceUsd,
+    syncOk: kalshiCashLastSyncOk,
+    lastSyncAtMs: kalshiCashLastSyncAtMs,
+    syncError: kalshiCashLastSyncError,
+  };
+}
+
+function getPublicSettledCashSnapshot(): SettledCashSnapshot {
+  return {
+    venue: 'PUBLIC_BROKERAGE',
+    settledCashUsd:
+      livePublicCashOnlyBuyingPower !== null
+        ? livePublicCashOnlyBuyingPower
+        : livePublicCashBalance,
+    syncOk: publicCashLastSyncOk,
+    lastSyncAtMs: publicCashLastSyncAtMs,
+    syncError: publicCashLastSyncError,
+  };
+}
+
 export interface ExecuteTradeRejectionRecord {
   id: string;
   timestamp: string;
@@ -3759,7 +3787,7 @@ function verifyNonCrossingMakerPriceDollars(
 //     Dynamically resolves `exchange_index` (2 for 15m crypto series, 0 for standard event contracts) with automatic 0/2 fallback.
 async function submitKalshiV2EventsOrder(params: {
   ticker: string;
-  idempotencySeed: string;
+  idempotencySeed?: string;
   side: 'bid' | 'ask';
   contracts: number;
   desiredYesPrice: number;
@@ -3770,6 +3798,10 @@ async function submitKalshiV2EventsOrder(params: {
   timeInForce?: 'good_till_canceled' | 'immediate_or_cancel';
   cancelOrderOnPause?: boolean;
   exchangeIndex?: number;
+  preValidatedByExecuteTrade?: boolean;
+  riskGuardVerifiedHash?: string;
+  timeframe?: RiskGuardTimeframe;
+  strategyId?: string;
 }): Promise<{
   ok: boolean;
   clientOrderId: string;
@@ -3782,11 +3814,7 @@ async function submitKalshiV2EventsOrder(params: {
   fillCount?: number;
   remainingCount?: number;
 }> {
-  venueOrderSubmissionCount += 1;
   const cleanTicker = params.ticker.trim().toUpperCase();
-  const clientOrderId = generateDeterministicUuidV4FromSeed(
-    `kalshi-v2:${params.idempotencySeed}:${cleanTicker}:${params.side}`
-  );
   const is15mCryptoTicker =
     cleanTicker.startsWith('KXBTC15M') ||
     cleanTicker.startsWith('KXETH15M') ||
@@ -3809,6 +3837,88 @@ async function submitKalshiV2EventsOrder(params: {
         params.yesAskDollars
       )
     : Math.max(0.01, Math.min(0.99, params.desiredYesPrice)).toFixed(4);
+
+  const parsedYesPxGuard = Number(priceDollars);
+  const effectiveUnitCostUsd = Math.max(
+    0.01,
+    params.side === 'bid' ? parsedYesPxGuard : Number((1.0 - parsedYesPxGuard).toFixed(4))
+  );
+
+  let effectiveSeed = String(params.idempotencySeed || '').trim();
+  if (!effectiveSeed) {
+    effectiveSeed = riskGuard.deriveDeterministicKey({
+      symbol: cleanTicker,
+      side: reduceOnly ? 'SELL' : params.side === 'bid' ? 'BUY_YES' : 'BUY_NO',
+      strategyId: params.strategyId || 'KALSHI_V2_DIRECT',
+      timeframe: params.timeframe || '15m',
+    }).idempotencyHash;
+  }
+
+  let clientOrderId = generateDeterministicUuidV4FromSeed(
+    `kalshi-v2:${effectiveSeed}:${cleanTicker}:${params.side}`
+  );
+
+  let activeRiskGuardHash = params.riskGuardVerifiedHash;
+  if (!reduceOnly && !params.preValidatedByExecuteTrade) {
+    if (activeRiskGuardHash && riskGuard.isActiveApprovedHash(activeRiskGuardHash)) {
+      const cashRes = riskGuard.verifySettledCash(getKalshiSettledCashSnapshot());
+      if (!cashRes.verified) {
+        return {
+          ok: false,
+          clientOrderId,
+          statusLabel: cashRes.code,
+          priceDollars,
+          postOnly,
+          timeInForce,
+          cancelOrderOnPause,
+        };
+      }
+      const maxContractsByCashCap = Math.floor(cashRes.settledCashCapUsd / effectiveUnitCostUsd + 1e-9);
+      if (maxContractsByCashCap < 1) {
+        return {
+          ok: false,
+          clientOrderId,
+          statusLabel: 'SETTLED_CASH_3PCT_CAP_ZERO',
+          priceDollars,
+          postOnly,
+          timeInForce,
+          cancelOrderOnPause,
+        };
+      }
+      params.contracts = Math.min(params.contracts, maxContractsByCashCap);
+    } else {
+      const entryDecision = riskGuard.evaluateEntryOrder({
+        venue: 'KALSHI',
+        symbol: cleanTicker,
+        side: params.side === 'bid' ? 'BUY_YES' : 'BUY_NO',
+        strategyId: params.strategyId || 'KALSHI_V2_DIRECT',
+        timeframe: params.timeframe || '15m',
+        requestedNotionalUsd: Math.max(1, params.contracts) * effectiveUnitCostUsd,
+        unitPriceUsd: effectiveUnitCostUsd,
+        isIntegerContracts: true,
+        settledCash: getKalshiSettledCashSnapshot(),
+      });
+      if (!entryDecision.ok) {
+        return {
+          ok: false,
+          clientOrderId,
+          statusLabel: entryDecision.code,
+          priceDollars,
+          postOnly,
+          timeInForce,
+          cancelOrderOnPause,
+        };
+      }
+      params.contracts = Math.min(params.contracts, entryDecision.approvedContracts);
+      activeRiskGuardHash = entryDecision.idempotencyHash;
+      if (!params.idempotencySeed) {
+        effectiveSeed = entryDecision.idempotencyHash;
+        clientOrderId = generateDeterministicUuidV4FromSeed(
+          `kalshi-v2:${effectiveSeed}:${cleanTicker}:${params.side}`
+        );
+      }
+    }
+  }
 
   // KERNEL-LEVEL PRE-TRADE FIREWALL (Applies to ALL opening Kalshi V2 orders across every route in server.ts):
   if (is15mCryptoTicker && !reduceOnly) {
@@ -3886,6 +3996,8 @@ async function submitKalshiV2EventsOrder(params: {
     };
   }
 
+  venueOrderSubmissionCount += 1;
+
   // Test-mode venue exit simulator hook (ONLY when QUANTPULSE_TEST_MODE === 'true')
   if (process.env.QUANTPULSE_TEST_MODE === 'true' && testVenueExitHooks?.submitKalshiExit && reduceOnly) {
     const simRes = await testVenueExitHooks.submitKalshiExit({
@@ -3896,7 +4008,7 @@ async function submitKalshiV2EventsOrder(params: {
       reduceOnly,
       timeInForce,
       postOnly,
-      idempotencySeed: params.idempotencySeed,
+      idempotencySeed: effectiveSeed,
     });
     return {
       ok: simRes.ok,
@@ -3912,13 +4024,19 @@ async function submitKalshiV2EventsOrder(params: {
     };
   }
 
-  // Phase 1 Default Paper Mode: Never submit live orders when in PAPER mode
-  if (isPaperModeEnabled()) {
-    const paperExchangeId = `paper-k-${clientOrderId.slice(0, 8)}`;
+  // Phase 1 Default Paper Mode / Test Mode without Kalshi secrets: Never submit real external orders after pre-trade RiskGuard + venue counter checks
+  if (
+    isPaperModeEnabled() ||
+    (process.env.QUANTPULSE_TEST_MODE === 'true' && !resolveKalshiCredentials())
+  ) {
+    const paperExchangeId = `${isPaperModeEnabled() ? 'paper-k' : 'test-k'}-${clientOrderId.slice(0, 8)}`;
+    const statusLbl = isPaperModeEnabled()
+      ? 'PAPER_MODE_SIMULATED_ORDER'
+      : 'TEST_MODE_SIMULATED_ORDER';
     const countStrPaper = Math.max(1, params.contracts).toFixed(2);
     kalshiClientOrderIdLedger.set(clientOrderId, {
       clientOrderId,
-      idempotencyKey: params.idempotencySeed,
+      idempotencyKey: effectiveSeed,
       ticker: cleanTicker,
       side: params.side,
       count: countStrPaper,
@@ -3927,15 +4045,23 @@ async function submitKalshiV2EventsOrder(params: {
       timeInForce,
       cancelOrderOnPause,
       reduceOnly,
-      status: 'PAPER_MODE_SIMULATED_ORDER',
+      status: statusLbl,
       exchangeOrderId: paperExchangeId,
       persistedAt: new Date().toISOString(),
     });
+    if (activeRiskGuardHash) {
+      riskGuard.attachOrderOutcome(activeRiskGuardHash, {
+        orderId: clientOrderId,
+        venueOrderId: paperExchangeId,
+        status: statusLbl,
+        approvedQuantity: params.contracts,
+      });
+    }
     return {
       ok: true,
       clientOrderId,
       exchangeOrderId: paperExchangeId,
-      statusLabel: 'PAPER_MODE_SIMULATED_ORDER',
+      statusLabel: statusLbl,
       priceDollars,
       postOnly,
       timeInForce,
@@ -4147,6 +4273,10 @@ async function place_v2_maker_order(params: {
   yesBidDollars: number;
   yesAskDollars: number;
   cancelOrderOnPause?: boolean;
+  preValidatedByExecuteTrade?: boolean;
+  riskGuardVerifiedHash?: string;
+  timeframe?: RiskGuardTimeframe;
+  strategyId?: string;
 }) {
   return submitKalshiV2EventsOrder({
     ...params,
@@ -4872,8 +5002,17 @@ async function evaluateFiveGateRiskEngineInServer(params: {
   realizedDailyPnlDollars?: number;
   unrealizedDailyPnlDollars?: number;
   executeOrderIfApproved?: boolean;
+  timeframe?: RiskGuardTimeframe;
+  riskGuardVerifiedHash?: string;
+  strategyId?: string;
 }): Promise<{
   ok: boolean;
+  rejected?: boolean;
+  duplicateBlocked?: boolean;
+  code?: string;
+  reason?: string;
+  settledCashCapUsd?: number;
+  idempotencyHash?: string;
   prediction_id: string;
   execution_mode: string;
   signal: KalshiSignalSchema;
@@ -4882,6 +5021,42 @@ async function evaluateFiveGateRiskEngineInServer(params: {
   v2_maker_order: any;
 }> {
   const sig = params.signal;
+  const calStatePre = computeBrierDecompositionForSeries(sig.series_ticker);
+
+  // Fail-closed settled cash verification BEFORE sizing or routing when executing orders
+  if (params.executeOrderIfApproved !== false) {
+    if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+      await syncLiveKalshiPortfolio(0);
+    }
+    const cashCheck = riskGuard.verifySettledCash(getKalshiSettledCashSnapshot());
+    if (!cashCheck.verified) {
+      sig.bankroll_dollars = 0;
+      const blockedPredictionId = generateDeterministicUuidV4FromSeed(
+        `brier-blocked:${sig.idempotency_key}:${sig.market_ticker}`
+      );
+      return {
+        ok: false,
+        rejected: true,
+        duplicateBlocked: false,
+        code: cashCheck.code,
+        reason: cashCheck.reason,
+        settledCashCapUsd: 0,
+        idempotencyHash: sig.idempotency_key,
+        prediction_id: blockedPredictionId,
+        execution_mode: cashCheck.code,
+        signal: sig,
+        gates: {},
+        series_calibration: calStatePre,
+        v2_maker_order: null,
+      };
+    }
+    // Never size off inflated client bankroll or unverified fallback — cap strictly to verified Kalshi settled cash
+    sig.bankroll_dollars =
+      sig.bankroll_dollars > 0
+        ? Math.min(sig.bankroll_dollars, cashCheck.settledCashUsd)
+        : cashCheck.settledCashUsd;
+  }
+
   const wsBook = kalshiWsState.books.get(sig.market_ticker);
   const nowMs = Date.now();
   const wsFresh = wsBook && Math.abs(nowMs - wsBook.clock) <= 12000;
@@ -4941,7 +5116,7 @@ async function evaluateFiveGateRiskEngineInServer(params: {
   };
 
   // Gate 3: Calibration & Uncertainty Gate
-  const calState = computeBrierDecompositionForSeries(sig.series_ticker);
+  const calState = calStatePre;
   const bssDemotes = calState.settled_count >= 10 && calState.brier_skill_score <= 0;
   const confDemotes = sig.confidence_band > 0.15;
   const routeToPaperOnly = bssDemotes || confDemotes;
@@ -4976,13 +5151,13 @@ async function evaluateFiveGateRiskEngineInServer(params: {
   const rawKellyNotional = sig.bankroll_dollars * fStar;
   const dynamicMaxContracts = getDynamicProfitScaledMaxContracts();
   const dynamicMaxNotional = getDynamicProfitScaledMaxNotionalUsd();
-  const cappedNotional = Math.min(rawKellyNotional, dynamicMaxNotional);
-  const contractsSized = Math.min(
+  let cappedNotional = Math.min(rawKellyNotional, dynamicMaxNotional);
+  let contractsSized = Math.min(
     dynamicMaxContracts,
     Math.max(0, Math.floor(cappedNotional / Math.max(0.01, pEff)))
   );
   const gate4Passed = fStar > 0 && contractsSized >= 1;
-  const gate4 = {
+  const gate4: Record<string, any> = {
     gate: 'GATE_4_FRACTIONAL_HALF_KELLY',
     passed: gate4Passed,
     side: isBuyYes ? 'BUY_YES' : 'BUY_NO',
@@ -5041,8 +5216,18 @@ async function evaluateFiveGateRiskEngineInServer(params: {
 
   let executionMode = 'LIVE_MAKER_EXECUTED';
   let v2MakerOrder: any = null;
+  let guardRejected = false;
+  let guardDuplicateBlocked = false;
+  let guardCode: string | undefined;
+  let guardReason: string | undefined;
+  let guardSettledCashCapUsd: number | undefined;
+  let guardIdempotencyHash = sig.idempotency_key;
+
   if (!gate5Passed) {
     executionMode = 'HALTED_GATE_5_KILL_SWITCH_CANCEL_ALL';
+    guardRejected = true;
+    guardCode = 'GLOBAL_KILL_SWITCH_ACTIVE';
+    guardReason = fiveGateKillSwitchState.lockReason || 'GATE_5_KILL_SWITCH_ACTIVE';
   } else if (sig.recommended_side === 'pass') {
     executionMode = 'PASS_RECOMMENDED_BY_SIGNAL';
   } else if (!gate1Passed) {
@@ -5064,20 +5249,89 @@ async function evaluateFiveGateRiskEngineInServer(params: {
       reason: gate3.demotionReason,
     };
   } else if (params.executeOrderIfApproved !== false) {
-    v2MakerOrder = await place_v2_maker_order({
-      ticker: sig.market_ticker,
-      idempotencySeed: sig.idempotency_key,
-      side,
-      contracts: contractsSized,
-      desiredYesPrice: sig.execution_price,
-      yesBidDollars: sig.yes_bid_dollars,
-      yesAskDollars: sig.yes_ask_dollars,
-      cancelOrderOnPause: true,
-    });
+    const unitCostUsd = Math.max(0.01, baseCost);
+    let verifiedHashToUse = params.riskGuardVerifiedHash;
+    if (verifiedHashToUse && riskGuard.isActiveApprovedHash(verifiedHashToUse)) {
+      const freshCash = riskGuard.verifySettledCash(getKalshiSettledCashSnapshot());
+      if (!freshCash.verified) {
+        executionMode = freshCash.code;
+        guardRejected = true;
+        guardCode = freshCash.code;
+        guardReason = freshCash.reason;
+      } else {
+        guardSettledCashCapUsd = freshCash.settledCashCapUsd;
+        const maxByCap = Math.floor(freshCash.settledCashCapUsd / unitCostUsd + 1e-9);
+        if (maxByCap < 1) {
+          executionMode = 'SETTLED_CASH_3PCT_CAP_ZERO';
+          guardRejected = true;
+          guardCode = 'SETTLED_CASH_3PCT_CAP_ZERO';
+          guardReason = `3% settled-cash cap ($${freshCash.settledCashCapUsd.toFixed(2)}) below 1 contract ($${unitCostUsd.toFixed(2)}).`;
+        } else {
+          contractsSized = Math.min(contractsSized, maxByCap);
+          cappedNotional = Number((contractsSized * unitCostUsd).toFixed(2));
+          gate4.contractsSized = contractsSized;
+          gate4.cappedNotionalDollars = cappedNotional;
+        }
+      }
+    } else {
+      const decision = riskGuard.evaluateEntryOrder({
+        venue: 'KALSHI',
+        symbol: sig.market_ticker,
+        side: isBuyYes ? 'BUY_YES' : 'BUY_NO',
+        strategyId: params.strategyId || 'FIVE_GATE_RISK_ENGINE',
+        timeframe: params.timeframe || '15m',
+        requestedNotionalUsd: contractsSized * unitCostUsd,
+        unitPriceUsd: unitCostUsd,
+        isIntegerContracts: true,
+        settledCash: getKalshiSettledCashSnapshot(),
+      });
+      guardSettledCashCapUsd = decision.settledCashCapUsd;
+      guardIdempotencyHash = decision.idempotencyHash;
+      if (!decision.ok) {
+        executionMode = decision.code;
+        guardRejected = true;
+        guardDuplicateBlocked = decision.duplicateBlocked;
+        guardCode = decision.code;
+        guardReason = decision.reason;
+      } else {
+        verifiedHashToUse = decision.idempotencyHash;
+        contractsSized = Math.min(contractsSized, decision.approvedContracts);
+        cappedNotional = Number((contractsSized * unitCostUsd).toFixed(2));
+        gate4.contractsSized = contractsSized;
+        gate4.cappedNotionalDollars = cappedNotional;
+        gate4.settledCashCapUsd = decision.settledCashCapUsd;
+        gate4.wasCappedBy3PctRule = decision.wasCapped;
+      }
+    }
+
+    if (!guardRejected && verifiedHashToUse) {
+      v2MakerOrder = await place_v2_maker_order({
+        ticker: sig.market_ticker,
+        idempotencySeed: verifiedHashToUse,
+        side,
+        contracts: contractsSized,
+        desiredYesPrice: sig.execution_price,
+        yesBidDollars: sig.yes_bid_dollars,
+        yesAskDollars: sig.yes_ask_dollars,
+        cancelOrderOnPause: true,
+        riskGuardVerifiedHash: verifiedHashToUse,
+        timeframe: params.timeframe || '15m',
+        strategyId: params.strategyId || 'FIVE_GATE_RISK_ENGINE',
+      });
+      if (v2MakerOrder?.ok) {
+        riskGuard.attachOrderOutcome(verifiedHashToUse, {
+          orderId: v2MakerOrder.clientOrderId,
+          venueOrderId: v2MakerOrder.exchangeOrderId,
+          status: v2MakerOrder.statusLabel,
+          approvedQuantity: contractsSized,
+          approvedNotionalUsd: cappedNotional,
+        });
+      }
+    }
   }
 
   const predictionId = generateDeterministicUuidV4FromSeed(
-    `brier-pred:${sig.idempotency_key}:${sig.market_ticker}:${sig.timestamp}`
+    `brier-pred:${guardIdempotencyHash}:${sig.market_ticker}:${sig.timestamp}`
   );
   const newRow: BrierPredictionRow = {
     prediction_id: predictionId,
@@ -5105,6 +5359,12 @@ async function evaluateFiveGateRiskEngineInServer(params: {
 
   return {
     ok: executionMode === 'LIVE_MAKER_EXECUTED' || executionMode === 'PAPER_ONLY_CALIBRATION_GATE',
+    rejected: guardRejected,
+    duplicateBlocked: guardDuplicateBlocked,
+    code: guardCode,
+    reason: guardReason,
+    settledCashCapUsd: guardSettledCashCapUsd,
+    idempotencyHash: guardIdempotencyHash,
     prediction_id: predictionId,
     execution_mode: executionMode,
     signal: sig,
@@ -5296,6 +5556,7 @@ async function deliberateKalshiSignalWithGeminiInServer(params: {
   confidence_band_hint?: number;
   bankroll_dollars?: number;
   idempotency_key?: string;
+  timeframe?: RiskGuardTimeframe;
 }): Promise<{
   signal: KalshiSignalSchema;
   geminiTelemetry: Record<string, any>;
@@ -5475,6 +5736,21 @@ async function deliberateKalshiSignalWithGeminiInServer(params: {
     ).toFixed(4)
   );
 
+  const deterministicSide =
+    parsedObj.recommended_side === 'yes'
+      ? 'BUY_YES'
+      : parsedObj.recommended_side === 'no'
+      ? 'BUY_NO'
+      : 'PASS';
+  const deterministicGeminiKey =
+    params.idempotency_key ||
+    riskGuard.deriveDeterministicKey({
+      symbol: rawTicker,
+      side: deterministicSide,
+      strategyId: 'GEMINI_SIGNAL_DELIBERATION',
+      timeframe: params.timeframe || '15m',
+    }).idempotencyHash;
+
   const fullSignal: KalshiSignalSchema = {
     ...parsedObj,
     series_ticker: seriesTicker,
@@ -5487,8 +5763,8 @@ async function deliberateKalshiSignalWithGeminiInServer(params: {
     m_taker: mults.m_taker,
     m_maker: mults.m_maker,
     theta_min: 0.015,
-    bankroll_dollars: Number(params.bankroll_dollars ?? (liveKalshiCashBalanceUsd || 92.05)),
-    idempotency_key: String(params.idempotency_key || `gemini-sig-${rawTicker}-${Date.now()}`),
+    bankroll_dollars: Number(params.bankroll_dollars ?? (liveKalshiCashBalanceUsd ?? 0)),
+    idempotency_key: String(deterministicGeminiKey),
   };
 
   return {
@@ -8774,12 +9050,10 @@ app.post('/api/playbook/sweep-dust', (_req, res) => {
   );
   livePublicPositions = livePublicPositions.filter((p) => protectedSymbols.has(p.symbol));
 
-  if (totalCashFreed > 0) {
-    livePublicCashBalance = Number(((livePublicCashBalance ?? 435.08) + totalCashFreed).toFixed(2));
-    livePublicBuyingPower = Number(((livePublicBuyingPower ?? 435.08) + totalCashFreed).toFixed(2));
+  if (totalCashFreed > 0 && livePublicCashBalance !== null && livePublicBuyingPower !== null) {
+    livePublicCashBalance = Number((livePublicCashBalance + totalCashFreed).toFixed(2));
+    livePublicBuyingPower = Number((livePublicBuyingPower + totalCashFreed).toFixed(2));
     livePublicCashOnlyBuyingPower = livePublicBuyingPower;
-    livePublicEventContractsEquity = 11.2;
-    livePublicStockEquity = 171.0;
   }
 
   res.json({
@@ -8826,11 +9100,10 @@ app.post('/api/playbook/apply-upgrades', async (_req, res) => {
     playbookCleanupAudit.filter((r) => r.action === 'KEEP_PROTECTED').map((r) => r.symbol)
   );
   livePublicPositions = livePublicPositions.filter((p) => protectedSymbols.has(p.symbol));
-  if (freedUsd > 0) {
-    livePublicCashBalance = Number(((livePublicCashBalance ?? 435.08) + freedUsd).toFixed(2));
+  if (freedUsd > 0 && livePublicCashBalance !== null) {
+    livePublicCashBalance = Number((livePublicCashBalance + freedUsd).toFixed(2));
     livePublicBuyingPower = livePublicCashBalance;
     livePublicCashOnlyBuyingPower = livePublicCashBalance;
-    livePublicEventContractsEquity = 11.2;
   }
 
   // 3. Recompute Strategy Tournament with HFT_15M_CLOB_MICRO_SCALPER #1
@@ -8936,10 +9209,11 @@ let autoSellEnabled = true;
 let defaultTakeProfitDeltaCents = 8;
 
 function getDeployableWorkingKalshiBankrollUsd(): number {
-  const rawCash = liveKalshiCashBalanceUsd ?? 100.00;
-  const vaulted = globalProfitLockState?.lockedProfitVaultUsd ?? 20.00;
-  // Strictly wall off the Protected Kalshi Vault Reserve ($20.00 + 75% of new wins) from active position sizing risk, leaving $80.00 active Kalshi working bankroll
-  return Number(Math.max(20.0, rawCash - vaulted).toFixed(2));
+  if (liveKalshiCashBalanceUsd === null || !Number.isFinite(liveKalshiCashBalanceUsd)) {
+    return 0;
+  }
+  const vaulted = globalProfitLockState?.lockedProfitVaultUsd ?? 0;
+  return Number(Math.max(0, liveKalshiCashBalanceUsd - vaulted).toFixed(2));
 }
 
 async function cancelRestingKalshiOrdersForTicker(ticker?: string): Promise<number> {
@@ -9406,8 +9680,8 @@ async function persistCloudDaemonCheckpointToFirestore(): Promise<boolean> {
               rankedSeriesTickers:
                 lastMetaLearningSummary?.rankedSeriesTickers || HFT_15M_SERIES_ROTATION,
               calibratedBrierScore: lastMetaLearningSummary?.calibratedBrierScore ?? 0.1577,
-              kalshiCashUsd: liveKalshiCashBalanceUsd ?? 100,
-              publicCashUsd: livePublicCashBalance ?? 128.13,
+              kalshiCashUsd: liveKalshiCashBalanceUsd ?? 0,
+              publicCashUsd: livePublicCashBalance ?? 0,
               updatedAt: nowIso,
             },
             { merge: true }
@@ -9450,16 +9724,23 @@ async function submitSingleKalshiSellOrder(params: {
   ledgerOrder: ExecutedOrder;
 }> {
   const kalshiCreds = resolveKalshiCredentials();
+  const hasTestHooks =
+    process.env.QUANTPULSE_TEST_MODE === 'true' && Boolean(testVenueExitHooks);
   const cleanContracts = Math.max(1, Math.round(params.contracts));
   const clampedTarget = Number(Math.min(0.96, Math.max(0.04, params.targetSellPrice)).toFixed(2));
-  const suffix = `${params.ticker.slice(-4).toLowerCase()}-${Math.floor(100 + Math.random() * 900)}`;
-  let sellOrderId = `kalshi-sell-tp-${Date.now().toString().slice(-5)}-${suffix}`;
+  const sellDeterministicKey = riskGuard.deriveDeterministicKey({
+    symbol: params.ticker,
+    side: params.sideToSell === 'NO' ? 'SELL_NO' : 'SELL_YES',
+    strategyId: params.immediateExit ? 'KALSHI_SINGLE_SELL_IMMEDIATE' : 'KALSHI_SINGLE_SELL_TP',
+    timeframe: '15m',
+  }).idempotencyHash;
+  let sellOrderId = `kalshi-sell-tp-${sellDeterministicKey.slice(0, 12)}`;
   let exchangeStatus = params.immediateExit
     ? 'LIVE_KALSHI_IMMEDIATE_PROFIT_HARVEST_SELL'
     : 'ZERO_FEE_MAKER_TAKE_PROFIT_RESTING';
   let actualOrderStatus = 'WORKING_OCO' as 'FILLED' | 'WORKING_OCO';
 
-  if (kalshiCreds) {
+  if (kalshiCreds || hasTestHooks) {
     const eventsSide: 'bid' | 'ask' = params.sideToSell === 'YES' ? 'ask' : 'bid';
     const wsBook = kalshiWsState.books.get(params.ticker);
     const livePx = params.liveMarketPrice ?? clampedTarget;
@@ -9470,26 +9751,37 @@ async function submitSingleKalshiSellOrder(params: {
 
     if (params.immediateExit) {
       const lastAttemptMs = kalshiExitCooldownByTicker.get(params.ticker) ?? 0;
-      if (Date.now() - lastAttemptMs >= 25000) {
+      if (Date.now() - lastAttemptMs >= 25000 || hasTestHooks) {
         kalshiExitCooldownByTicker.set(params.ticker, Date.now());
         try {
           const bboDepthUsd = Math.max(
             5000,
             cleanContracts * Math.max(0.05, yesBid) * 100
           );
-          const unwindResult = await executionVault.unwindPositionSafely({
+          const unwindResult = await riskGuard.executeRule3PreExitSweep({
             symbol: params.ticker,
             exitSide: eventsSide,
             requestedQty: cleanContracts,
             bestBidUsd: yesBid,
             bestAskUsd: yesAsk,
             bboDepthUsd,
-            cancelAllOpenOrders: async (sym) => cancelRestingKalshiOrdersForTicker(sym),
+            cancelAllOpenOrders: async (sym) => {
+              if (hasTestHooks && testVenueExitHooks?.cancelOpenOrders) {
+                return await testVenueExitHooks.cancelOpenOrders('PREDICTION_MARKET', sym);
+              }
+              return await cancelRestingKalshiOrdersForTicker(sym);
+            },
             fetchOpenOrdersCount: async (sym) => {
+              if (hasTestHooks && testVenueExitHooks?.getOpenOrdersCount) {
+                return await testVenueExitHooks.getOpenOrdersCount('PREDICTION_MARKET', sym);
+              }
               const resting = await getRestingOrdersForTicker(sym);
               return resting.length;
             },
             fetchSettledPositionQty: async (sym) => {
+              if (hasTestHooks && testVenueExitHooks?.getSettledPositionQty) {
+                return await testVenueExitHooks.getSettledPositionQty('PREDICTION_MARKET', sym);
+              }
               const pos = liveKalshiPositions.find(
                 (p) => p.ticker.toUpperCase() === sym.trim().toUpperCase()
               );
@@ -9511,7 +9803,7 @@ async function submitSingleKalshiSellOrder(params: {
               });
               const filledIoc = iocSell.fillCount ?? 0;
               if (iocSell.ok && (filledIoc > 0 || iocSell.statusLabel.includes('FILLED'))) {
-                sellOrderId = `kalshi-ioc-${iocSell.exchangeOrderId}-${suffix}`;
+                sellOrderId = `kalshi-ioc-${iocSell.exchangeOrderId || sellDeterministicKey.slice(0, 8)}`;
                 exchangeStatus = `${iocSell.statusLabel}_REDUCE_ONLY_IOC_${filledIoc || cleanContracts}`;
                 actualOrderStatus = 'FILLED';
                 traded15mContractTickersSet.add(params.ticker.trim().toUpperCase());
@@ -9532,14 +9824,14 @@ async function submitSingleKalshiSellOrder(params: {
         }
       }
     } else {
-      // SINGLE-EXIT REDUCE_ONLY IOC MUTEX (ZERO RESTING GTC SELL ORDERS ON EXCHANGE):
-      // Kalshi V2 disallows `reduce_only: true` on `good_till_canceled` (GTC) orders.
-      // Placing a non-reduce_only GTC sell order alongside an IoC exit caused the Double-Exit Position Flip on KXBTC15M-26NOV110915-15.
-      // Therefore, we NEVER place non-reduce_only GTC sell orders on the exchange; we monitor the live bid and fire ONLY a single reduce_only=true IoC exit!
+      // SINGLE-EXIT REDUCE_ONLY IOC MUTEX + RULE 3 OPEN ORDER CHECK:
       const existingTp = kalshiRestingTpPlacedByTicker.get(params.ticker);
       if (existingTp) {
         await cancelRestingKalshiOrdersForTicker(params.ticker).catch(() => {});
-        kalshiRestingTpPlacedByTicker.delete(params.ticker);
+        const remainingResting = await getRestingOrdersForTicker(params.ticker).catch(() => []);
+        if (remainingResting.length === 0) {
+          kalshiRestingTpPlacedByTicker.delete(params.ticker);
+        }
       }
       sellOrderId = `kalshi-oco-mutex-${params.ticker.slice(-8).toLowerCase()}`;
       exchangeStatus = `SINGLE_EXIT_IOC_MUTEX_ARMED (Target $${clampedTarget.toFixed(2)} · reduce_only=true IoC Only · 0 GTC Flip Risk)`;
@@ -9620,7 +9912,9 @@ async function placeKalshiTakeProfitSellOrders(options?: {
   }
   isPlacingKalshiTakeProfitSells = true;
   try {
-    await syncLiveKalshiPortfolio(0);
+    if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+      await syncLiveKalshiPortfolio(0);
+    }
     // +3c zero-fee fast Maker take-profit target (+5.5% to +7.0% ROI with $0.00 fee drag and 84%+ fill rate!)
     const deltaDollars = Math.max(0.02, Math.min(0.08, (options?.profitDeltaCents ?? defaultTakeProfitDeltaCents) / 100));
     const sellOrders: KalshiRestingSellOrder[] = [];
@@ -9741,7 +10035,7 @@ async function placeKalshiTakeProfitSellOrders(options?: {
     }
   }
 
-  if (ledgerOrders.length > 0) {
+  if (ledgerOrders.length > 0 && process.env.QUANTPULSE_TEST_MODE !== 'true') {
     await syncLiveKalshiPortfolio(0);
   }
 
@@ -10906,6 +11200,10 @@ async function executeLiveKalshiHftPulse(options?: {
   kalshiOrders: ExecutedOrder[];
   kalshiSellOrders: KalshiRestingSellOrder[];
   publicOrders: ExecutedOrder[];
+  rejected?: boolean;
+  duplicateBlocked?: boolean;
+  code?: string;
+  reason?: string;
 }> {
   if (isExecutingLiveKalshiPulse) {
     return { executedCount: 0, kalshiOrders: [], kalshiSellOrders: [], publicOrders: [] };
@@ -10915,21 +11213,53 @@ async function executeLiveKalshiHftPulse(options?: {
     fiveGateLocked: fiveGateKillSwitchState.locked,
   });
   if (killState.active) {
-    return { executedCount: 0, kalshiOrders: [], kalshiSellOrders: [], publicOrders: [] };
+    return {
+      executedCount: 0,
+      kalshiOrders: [],
+      kalshiSellOrders: [],
+      publicOrders: [],
+      rejected: true,
+      code: 'GLOBAL_KILL_SWITCH_ACTIVE',
+      reason: killState.reason,
+    };
   }
   isExecutingLiveKalshiPulse = true;
   try {
+    if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+      await syncLiveKalshiPortfolio(0);
+    }
+
+    // Fail-closed settled cash check BEFORE opening any HFT pulse position (never falls back to $100 seed)
+    const kalshiCashCheck = riskGuard.verifySettledCash(getKalshiSettledCashSnapshot());
+    if (!kalshiCashCheck.verified) {
+      return {
+        executedCount: 0,
+        kalshiOrders: [],
+        kalshiSellOrders: [],
+        publicOrders: [],
+        rejected: true,
+        code: kalshiCashCheck.code,
+        reason: kalshiCashCheck.reason,
+      };
+    }
+
     // Purge duplicate stacked working orders and expired contracts first
     purgeDuplicateAndExpiredWorkingOrders();
 
     // Auto-cancel any unfilled resting Kalshi Maker BUY orders older than 90 seconds so capital is never stuck in stale quotes
-    const recycledSummary = await recycleStaleRestingMakerOrders(90000);
+    const recycledSummary =
+      process.env.QUANTPULSE_TEST_MODE === 'true'
+        ? { recycledCount: 0, recycledTickers: [] as string[] }
+        : await recycleStaleRestingMakerOrders(90000);
 
     // Step 1: Always sync live positions and arm $0-fee Maker Take-Profit orders FIRST
-    const preHarvest = await placeKalshiTakeProfitSellOrders({
-      force: false,
-      profitDeltaCents: defaultTakeProfitDeltaCents,
-    });
+    const preHarvest =
+      process.env.QUANTPULSE_TEST_MODE === 'true'
+        ? { placedCount: 0, sellOrders: [] as KalshiRestingSellOrder[], ledgerOrders: [] as ExecutedOrder[] }
+        : await placeKalshiTakeProfitSellOrders({
+            force: false,
+            profitDeltaCents: defaultTakeProfitDeltaCents,
+          });
 
     // Portfolio-Wide Concurrent 15m Exposure Guard:
     // Never hold more than 2 open 15-minute positions across the entire Kalshi account simultaneously!
@@ -10946,7 +11276,10 @@ async function executeLiveKalshiHftPulse(options?: {
     }
 
     const kalshiCreds = resolveKalshiCredentials();
-    const bearer = options?.routePublicMirror !== false ? await getPublicBearerToken() : null;
+    const isTestPaper =
+      process.env.QUANTPULSE_TEST_MODE === 'true' || isPaperModeEnabled();
+    const bearer =
+      options?.routePublicMirror !== false && !isTestPaper ? await getPublicBearerToken() : null;
     if (!livePublicAccountId && bearer) {
       try {
         const accRes = await fetch('https://api.public.com/userapigateway/trading/account', {
@@ -11019,6 +11352,9 @@ async function executeLiveKalshiHftPulse(options?: {
     const kalshiSellOrders: KalshiRestingSellOrder[] = [...preHarvest.sellOrders];
     const publicOrders: ExecutedOrder[] = [];
     const cycleDiagnostics: CloudDaemonGateDiagnostic[] = [];
+    let anyDuplicateBlocked = false;
+    let blockedCode: string | undefined;
+    let blockedReason: string | undefined;
 
     for (const seriesSym of seriesToRun) {
       const feature = marketFeatures.find((m) => m.symbol === seriesSym);
@@ -11388,19 +11724,45 @@ async function executeLiveKalshiHftPulse(options?: {
 
       agent.indicatorStrategyId = selectedStrategyId;
 
-      const suffixTag = `${seriesSym.slice(-4).toLowerCase()}-${Math.floor(100 + Math.random() * 900)}`;
-      let externalKalshiId = `kalshi-safe-${Date.now().toString().slice(-5)}-${suffixTag}`;
+      // Mandatory RiskGuard Gate (Fail-Closed Settled Cash + 3% Cap + Explicit 90s Bucket Preserving Maker Recycle Timing)
+      const entryDecision = riskGuard.evaluateEntryOrder({
+        venue: 'KALSHI',
+        symbol: activeTicker,
+        side: resolvedSide,
+        strategyId: selectedStrategyId,
+        timeframe: '90s',
+        requestedNotionalUsd: effectiveContractsForAgent * entryPrice,
+        unitPriceUsd: entryPrice,
+        isIntegerContracts: true,
+        settledCash: getKalshiSettledCashSnapshot(),
+      });
+      if (!entryDecision.ok) {
+        blockedCode = entryDecision.code;
+        blockedReason = entryDecision.reason;
+        if (entryDecision.duplicateBlocked) {
+          anyDuplicateBlocked = true;
+        }
+        recordGateDiag(
+          entryDecision.duplicateBlocked ? 'WAITING_FOR_WINDOW' : 'SPREAD_OR_VOL_GUARD',
+          `RiskGuard blocked ${activeTicker}: ${entryDecision.reason}`,
+          bestEdgeCents
+        );
+        continue;
+      }
+
+      const cappedContractsForAgent = entryDecision.approvedContracts;
+      const suffixTag = entryDecision.idempotencyHash.slice(0, 8);
+      let externalKalshiId = `kalshi-safe-${suffixTag}`;
       let kalshiStatusLabel = 'LIVE_KALSHI_V2_ZERO_FEE_MAKER_ROUTED';
       let buyFilledCount = 0;
       let exchangeOrderSucceeded = false;
 
-      if (kalshiCreds && activeTicker.includes('-')) {
+      if ((kalshiCreds && activeTicker.includes('-')) || isTestPaper) {
         const desiredYesPrice =
           resolvedSide === 'BUY_YES'
             ? entryPrice
             : Number(Math.max(0.16, Math.min(0.84, 1.0 - entryPrice)).toFixed(2));
         const midProb = Number(((yesBid + yesAsk) / 2).toFixed(4));
-        // Honest model probability derived from actual signal + Maker spread capture (no fabricated +0.12 override!)
         const calibratedYesProb =
           resolvedSide === 'BUY_YES'
             ? Number(Math.min(0.85, Math.max(desiredYesPrice + bestEdge, fairYesProb)).toFixed(4))
@@ -11409,7 +11771,7 @@ async function executeLiveKalshiHftPulse(options?: {
         const signalSchema: KalshiSignalSchema = {
           market_ticker: activeTicker,
           bull_case_summary: `[${seriesSym} · ${selectedStrategyId} · ${underlyingSpotSym}] Regime-matched ${resolvedSide} @ $${entryPrice.toFixed(2)} (Edge +${(bestEdge * 100).toFixed(1)}¢ >= min +${(requiredMinEdgeDollars * 100).toFixed(1)}¢, ${minsRemaining.toFixed(1)}m left, RSI=${rsi14.toFixed(1)}, OB=${obImbalance.toFixed(2)}).`,
-          bear_case_summary: `[${seriesSym}] Cost-capped [$0.16, $0.66] Maker entry ($0.00 fee), dynamic ${effectiveContractsForAgent}x contract cap, and 90s auto-requote.`,
+          bear_case_summary: `[${seriesSym}] Cost-capped [$0.16, $0.66] Maker entry ($0.00 fee), dynamic ${cappedContractsForAgent}x contract cap (3% settled cash), and 90s auto-requote.`,
           calibrated_yes_prob: calibratedYesProb,
           confidence_band: 0.06,
           recommended_side: resolvedSide === 'BUY_YES' ? 'yes' : 'no',
@@ -11424,29 +11786,31 @@ async function executeLiveKalshiHftPulse(options?: {
           m_taker: 1.0,
           m_maker: 0.0,
           theta_min: 0.025,
-          bankroll_dollars: getDeployableWorkingKalshiBankrollUsd(),
-          // Allow fresh idempotency key after a 90s stale Maker order recycle
-          idempotency_key: `sniper-${activeTicker}-${Math.floor(Date.now() / 90000)}`,
+          bankroll_dollars: entryDecision.settledCashUsd,
+          // Explicit 90s deterministic RiskGuard bucket replaces Date.now()/90000 while keeping 90s auto-recycle cadence
+          idempotency_key: entryDecision.idempotencyHash,
         };
 
         const fiveGateRes = await evaluateFiveGateRiskEngineInServer({
           signal: signalSchema,
           executeOrderIfApproved: true,
+          timeframe: '90s',
+          riskGuardVerifiedHash: entryDecision.idempotencyHash,
+          strategyId: selectedStrategyId,
         });
 
         const v2MakerOrder = fiveGateRes.v2_maker_order;
         if (v2MakerOrder && v2MakerOrder.ok && v2MakerOrder.exchangeOrderId) {
           externalKalshiId = `kalshi-${v2MakerOrder.exchangeOrderId}-${suffixTag}`;
-          kalshiStatusLabel = `${v2MakerOrder.statusLabel} [REGIME: ${selectedStrategyId} · $0 FEE MAKER · ${effectiveContractsForAgent}x]`;
+          kalshiStatusLabel = `${v2MakerOrder.statusLabel} [REGIME: ${selectedStrategyId} · $0 FEE MAKER · ${cappedContractsForAgent}x]`;
           buyFilledCount = v2MakerOrder.fillCount ?? 0;
           exchangeOrderSucceeded = true;
           liveRestingTickersOnExchange.add(activeTicker.toUpperCase());
-          // Lock the 15m contract ticker on placement so we never double-buy; 90s stale Maker recycler unlocks it ONLY if cancelled unfilled!
           traded15mContractTickersSet.add(activeTicker);
           cloudDaemonTelemetry.totalOrdersRoutedByDaemon += 1;
           recordGateDiag(
             'ORDER_ROUTED',
-            `Routed ${resolvedSide} ${effectiveContractsForAgent}x ${activeTicker} @ $${entryPrice.toFixed(2)} (+${bestEdgeCents.toFixed(1)}¢ edge · $0 fee Maker)`,
+            `Routed ${resolvedSide} ${cappedContractsForAgent}x ${activeTicker} @ $${entryPrice.toFixed(2)} (+${bestEdgeCents.toFixed(1)}¢ edge · $0 fee Maker)`,
             bestEdgeCents
           );
         } else if (fiveGateRes.execution_mode === 'PAPER_ONLY_CALIBRATION_GATE') {
@@ -11461,7 +11825,7 @@ async function executeLiveKalshiHftPulse(options?: {
         }
       }
 
-      if (kalshiCreds && !exchangeOrderSucceeded) {
+      if (!exchangeOrderSucceeded) {
         continue;
       }
 
@@ -11469,6 +11833,8 @@ async function executeLiveKalshiHftPulse(options?: {
       const tpTargetPrice = Number(Math.min(0.92, entryPrice + tpDeltaDollars).toFixed(2));
       const kOrder: ExecutedOrder = {
         id: externalKalshiId,
+        idempotencyKey: entryDecision.idempotencyHash,
+        notionalUsd: Number((cappedContractsForAgent * entryPrice).toFixed(2)),
         timestamp: new Date().toISOString(),
         agentId: agent.id,
         agentName: `${agent.name}`,
@@ -11476,13 +11842,13 @@ async function executeLiveKalshiHftPulse(options?: {
         venue: 'PREDICTION_MARKET',
         side: resolvedSide,
         orderType: 'LIMIT_OCO',
-        quantity: effectiveContractsForAgent,
+        quantity: cappedContractsForAgent,
         fillPrice: entryPrice,
         stopLossPrice: Number(Math.max(0.08, entryPrice - 0.04).toFixed(2)),
         takeProfitPrice: tpTargetPrice,
         regimeAtEntry: resolvedSide === 'BUY_NO' ? 'TRENDING_BEAR' : 'LOW_VOLATILITY_COMPRESSION',
         status: buyFilledCount > 0 ? 'FILLED' : 'WORKING_OCO',
-        rationale: `[${kalshiStatusLabel} · T-${minsRemaining.toFixed(1)}m] ${resolvedSide} ${effectiveContractsForAgent}x ${activeTicker} @ $${entryPrice.toFixed(2)} ($0.00 Maker Fee · +${defaultTakeProfitDeltaCents}¢ Fast Maker TP @ $${tpTargetPrice.toFixed(2)} · Edge +${(bestEdge * 100).toFixed(1)}¢ · 90s Auto-Requote).`,
+        rationale: `[${kalshiStatusLabel} · T-${minsRemaining.toFixed(1)}m] ${resolvedSide} ${cappedContractsForAgent}x ${activeTicker} @ $${entryPrice.toFixed(2)} ($0.00 Maker Fee · +${defaultTakeProfitDeltaCents}¢ Fast Maker TP @ $${tpTargetPrice.toFixed(2)} · Edge +${(bestEdge * 100).toFixed(1)}¢ · 90s Auto-Requote).`,
       };
       executedOrders.unshift(kOrder);
       kalshiOrders.push(kOrder);
@@ -11493,7 +11859,7 @@ async function executeLiveKalshiHftPulse(options?: {
           ticker: activeTicker,
           title: `${activeTicker} · +8c Zero-Fee Maker Take-Profit + 75% Vault Lock`,
           sideToSell: resolvedSide === 'BUY_NO' ? 'NO' : 'YES',
-          contracts: Math.min(effectiveContractsForAgent, Math.round(buyFilledCount)),
+          contracts: Math.min(cappedContractsForAgent, Math.round(buyFilledCount)),
           entryPrice,
           targetSellPrice: tpTargetPrice,
           immediateExit: false,
@@ -11505,65 +11871,91 @@ async function executeLiveKalshiHftPulse(options?: {
 
       if (bearer && livePublicAccountId && options?.routePublicMirror !== false && activeTicker.includes('-')) {
         const publicEvSymbol = `KALSHI.${activeTicker}.${resolvedSide === 'BUY_NO' ? 'N' : 'Y'}`;
-        let pubOrdId = `pub-kalshi-ev-${Date.now().toString().slice(-5)}-${suffixTag}`;
-        let pubStatusLabel = 'PUBLIC_EVENTCONTRACT_ROUTED';
-        try {
-          const pubBuyRes = await submitPublicOrderWithExponentialRetry({
-            symbol: publicEvSymbol,
-            idempotencyKey: `pub-ev-buy-${activeTicker}-${Date.now()}`,
-            instrumentType: 'EVENTCONTRACT',
-            orderSide: 'BUY',
-            orderType: 'LIMIT',
-            quantity: String(effectiveContractsForAgent),
-            limitPrice: entryPrice.toFixed(2),
-            maxRetries: 3,
-          });
-          if (pubBuyRes.ok && pubBuyRes.liveSubmitted) {
-            pubOrdId = `pub-ord-${pubBuyRes.orderId}-${suffixTag}`;
-            pubStatusLabel = `LIVE_PUBLIC_COM_ORDER_SUBMITTED (attempts=${pubBuyRes.attemptsUsed})`;
+        const pubMirrorDecision = riskGuard.evaluateEntryOrder({
+          venue: 'PUBLIC_BROKERAGE',
+          symbol: publicEvSymbol,
+          side: 'BUY',
+          strategyId: 'KALSHI_HFT_PULSE_PUBLIC_MIRROR',
+          timeframe: '90s',
+          requestedNotionalUsd: cappedContractsForAgent * entryPrice,
+          unitPriceUsd: entryPrice,
+          isIntegerContracts: true,
+          settledCash: getPublicSettledCashSnapshot(),
+        });
+        if (pubMirrorDecision.ok) {
+          const mirrorContracts = pubMirrorDecision.approvedContracts;
+          let pubOrdId = `pub-kalshi-ev-${pubMirrorDecision.idempotencyHash.slice(0, 12)}`;
+          let pubStatusLabel = 'PUBLIC_EVENTCONTRACT_ROUTED';
+          try {
+            const pubBuyRes = await submitPublicOrderWithExponentialRetry({
+              symbol: publicEvSymbol,
+              idempotencyKey: pubMirrorDecision.idempotencyHash,
+              riskGuardVerifiedHash: pubMirrorDecision.idempotencyHash,
+              timeframe: '90s',
+              strategyId: 'KALSHI_HFT_PULSE_PUBLIC_MIRROR',
+              instrumentType: 'EVENTCONTRACT',
+              orderSide: 'BUY',
+              orderType: 'LIMIT',
+              quantity: String(mirrorContracts),
+              limitPrice: entryPrice.toFixed(2),
+              maxRetries: 3,
+            });
+            if (pubBuyRes.ok && pubBuyRes.liveSubmitted) {
+              pubOrdId = `pub-ord-${pubBuyRes.orderId}`;
+              pubStatusLabel = `LIVE_PUBLIC_COM_ORDER_SUBMITTED (attempts=${pubBuyRes.attemptsUsed})`;
 
-            // Stage paired resting Take-Profit SELL limit order on Public.com for the Event Contract
-            if (autoSellEnabled) {
-              await new Promise((r) => setTimeout(r, 650));
-              const pubTpRes = await submitPublicOrderWithExponentialRetry({
-                symbol: publicEvSymbol,
-                idempotencyKey: `pub-ev-tp-${activeTicker}-${Date.now()}`,
-                instrumentType: 'EVENTCONTRACT',
-                orderSide: 'SELL',
-                orderType: 'LIMIT',
-                quantity: String(effectiveContractsForAgent),
-                limitPrice: tpTargetPrice.toFixed(2),
-                maxRetries: 2,
-              });
-              if (pubTpRes.ok && pubTpRes.liveSubmitted) {
-                pubStatusLabel = `LIVE_PUBLIC_COM_BUY_AND_TP_SELL_STAGED (TP #${pubTpRes.orderId.slice(0, 8)})`;
+              // Stage paired resting Take-Profit SELL limit order on Public.com for the Event Contract
+              if (autoSellEnabled) {
+                await new Promise((r) => setTimeout(r, 650));
+                const tpMirrorKey = riskGuard.deriveDeterministicKey({
+                  symbol: publicEvSymbol,
+                  side: 'SELL',
+                  strategyId: 'KALSHI_HFT_PULSE_PUBLIC_MIRROR_TP',
+                  timeframe: '90s',
+                }).idempotencyHash;
+                const pubTpRes = await submitPublicOrderWithExponentialRetry({
+                  symbol: publicEvSymbol,
+                  idempotencyKey: tpMirrorKey,
+                  timeframe: '90s',
+                  strategyId: 'KALSHI_HFT_PULSE_PUBLIC_MIRROR_TP',
+                  instrumentType: 'EVENTCONTRACT',
+                  orderSide: 'SELL',
+                  orderType: 'LIMIT',
+                  quantity: String(mirrorContracts),
+                  limitPrice: tpTargetPrice.toFixed(2),
+                  maxRetries: 2,
+                });
+                if (pubTpRes.ok && pubTpRes.liveSubmitted) {
+                  pubStatusLabel = `LIVE_PUBLIC_COM_BUY_AND_TP_SELL_STAGED (TP #${pubTpRes.orderId.slice(0, 8)})`;
+                }
               }
             }
+          } catch {
+            // Keep tracked in ledger
           }
-        } catch {
-          // Keep tracked in ledger
-        }
 
-        const pOrder: ExecutedOrder = {
-          id: pubOrdId,
-          timestamp: new Date().toISOString(),
-          agentId: agent.id,
-          agentName: `${agent.name} · Public.com Event Contract Mirror`,
-          symbol: publicEvSymbol,
-          venue: 'PUBLIC_BROKERAGE',
-          side: resolvedSide,
-          orderType: 'LIMIT_OCO',
-          quantity: effectiveContractsForAgent,
-          fillPrice: entryPrice,
-          stopLossPrice: Number(Math.max(0.06, entryPrice - 0.04).toFixed(2)),
-          takeProfitPrice: tpTargetPrice,
-          regimeAtEntry: 'TRENDING_BULL',
-          status: pubStatusLabel.startsWith('LIVE_') ? 'FILLED' : 'WORKING_OCO',
-          rationale: `[${pubStatusLabel} · Public.com EVENTCONTRACT ${publicEvSymbol}] ${resolvedSide} ${effectiveContractsForAgent} contracts @ $${entryPrice.toFixed(2)} + Paired Take-Profit SELL @ $${tpTargetPrice.toFixed(2)}.`,
-        };
-        // Insert pOrder AFTER kOrder so the primary Kalshi order always sits at index 0 of executedOrders
-        executedOrders.splice(1, 0, pOrder);
-        publicOrders.push(pOrder);
+          const pOrder: ExecutedOrder = {
+            id: pubOrdId,
+            idempotencyKey: pubMirrorDecision.idempotencyHash,
+            notionalUsd: pubMirrorDecision.approvedNotionalUsd,
+            timestamp: new Date().toISOString(),
+            agentId: agent.id,
+            agentName: `${agent.name} · Public.com Event Contract Mirror`,
+            symbol: publicEvSymbol,
+            venue: 'PUBLIC_BROKERAGE',
+            side: resolvedSide,
+            orderType: 'LIMIT_OCO',
+            quantity: mirrorContracts,
+            fillPrice: entryPrice,
+            stopLossPrice: Number(Math.max(0.06, entryPrice - 0.04).toFixed(2)),
+            takeProfitPrice: tpTargetPrice,
+            regimeAtEntry: 'TRENDING_BULL',
+            status: pubStatusLabel.startsWith('LIVE_') ? 'FILLED' : 'WORKING_OCO',
+            rationale: `[${pubStatusLabel} · Public.com EVENTCONTRACT ${publicEvSymbol}] ${resolvedSide} ${mirrorContracts} contracts @ $${entryPrice.toFixed(2)} + Paired Take-Profit SELL @ $${tpTargetPrice.toFixed(2)}.`,
+          };
+          executedOrders.splice(1, 0, pOrder);
+          publicOrders.push(pOrder);
+        }
       }
 
       agent.metrics.tradesExecuted += 1;
@@ -11575,22 +11967,28 @@ async function executeLiveKalshiHftPulse(options?: {
     }
 
     // Sync live Kalshi positions and ensure all open positions have resting Take-Profit SELL limit orders or immediate profit harvests
-    if (autoSellEnabled) {
-      const swept = await placeKalshiTakeProfitSellOrders({ force: false });
-      for (const s of swept.sellOrders) {
-      if (!kalshiSellOrders.some((x) => x.orderId === s.orderId)) {
-        kalshiSellOrders.push(s);
+    if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+      if (autoSellEnabled) {
+        const swept = await placeKalshiTakeProfitSellOrders({ force: false });
+        for (const s of swept.sellOrders) {
+          if (!kalshiSellOrders.some((x) => x.orderId === s.orderId)) {
+            kalshiSellOrders.push(s);
+          }
+        }
+      } else {
+        await syncLiveKalshiPortfolio(0);
       }
     }
-  } else {
-    await syncLiveKalshiPortfolio(0);
-  }
 
   return {
     executedCount: kalshiOrders.length,
     kalshiOrders,
     kalshiSellOrders,
     publicOrders,
+    rejected: kalshiOrders.length === 0 && Boolean(blockedCode),
+    duplicateBlocked: kalshiOrders.length === 0 && anyDuplicateBlocked,
+    code: kalshiOrders.length === 0 ? blockedCode : undefined,
+    reason: kalshiOrders.length === 0 ? blockedReason : undefined,
   };
   } finally {
     isExecutingLiveKalshiPulse = false;
@@ -11633,6 +12031,10 @@ async function submitPublicOrderWithExponentialRetry(params: {
   maxRetries?: number;
   baseDelaySec?: number;
   simulatedTransientFailures?: number;
+  preValidatedByExecuteTrade?: boolean;
+  riskGuardVerifiedHash?: string;
+  timeframe?: RiskGuardTimeframe;
+  strategyId?: string;
 }): Promise<{
   ok: boolean;
   liveSubmitted: boolean;
@@ -11654,13 +12056,121 @@ async function submitPublicOrderWithExponentialRetry(params: {
     retrying: boolean;
   }>;
 }> {
-  venueOrderSubmissionCount += 1;
   const maxRetries = Math.max(0, Math.min(5, params.maxRetries ?? 3));
   const baseDelaySec = Math.max(0.05, Math.min(2.0, params.baseDelaySec ?? 0.35));
   const simFailures = Math.max(0, Math.min(maxRetries + 1, params.simulatedTransientFailures ?? 0));
-  const seedKey = params.idempotencyKey || `${params.symbol}-${params.orderSide}-${Date.now()}`;
-  const deterministicOrderId = crypto.randomUUID();
   const cleanSymbol = params.symbol.trim().toUpperCase();
+  const isBuySide = params.orderSide === 'BUY';
+
+  let seedKey = String(params.idempotencyKey || '').trim();
+  if (!seedKey) {
+    seedKey = riskGuard.deriveDeterministicKey({
+      symbol: cleanSymbol,
+      side: params.orderSide,
+      strategyId: params.strategyId || 'PUBLIC_ORDER_DIRECT',
+      timeframe: params.timeframe || '15m',
+    }).idempotencyHash;
+  }
+
+  let deterministicOrderId = generateDeterministicUuidV4FromSeed(
+    `pub-order:${seedKey}:${cleanSymbol}:${params.orderSide}`
+  );
+
+  // Enforce RiskGuard (Fail-Closed Settled Cash + 3% Cap + Persistent Bucket Lock) on ALL BUY entries not pre-validated by execute-trade
+  let effectiveQuantity = params.quantity;
+  let activeRiskGuardHash = params.riskGuardVerifiedHash;
+  if (isBuySide && !params.preValidatedByExecuteTrade) {
+    const matchedFeat = marketFeatures.find(
+      (f) => f.symbol.toUpperCase() === cleanSymbol || f.symbol.toUpperCase() === `${cleanSymbol}-USD`
+    );
+    const parsedLimitPx = params.limitPrice !== undefined ? Number(params.limitPrice) : NaN;
+    const unitPxUsd = Math.max(
+      0.01,
+      Number.isFinite(parsedLimitPx) && parsedLimitPx > 0 ? parsedLimitPx : matchedFeat?.price || 1.0
+    );
+    const reqQty = Math.max(0, Number(params.quantity) || 0);
+
+    if (activeRiskGuardHash && riskGuard.isActiveApprovedHash(activeRiskGuardHash)) {
+      const cashRes = riskGuard.verifySettledCash(getPublicSettledCashSnapshot());
+      if (!cashRes.verified) {
+        return {
+          ok: false,
+          liveSubmitted: false,
+          orderId: deterministicOrderId,
+          attemptsUsed: 0,
+          maxRetries,
+          totalBackoffMs: 0,
+          recoveredAfterRetry: false,
+          preflightHydrated: false,
+          lastErrorMessage: cashRes.reason,
+          failureClassification: cashRes.code,
+          attemptHistory: [],
+        };
+      }
+      const maxQty =
+        params.instrumentType === 'EVENTCONTRACT'
+          ? Math.floor(cashRes.settledCashCapUsd / unitPxUsd + 1e-9)
+          : Number((cashRes.settledCashCapUsd / unitPxUsd).toFixed(4));
+      if (maxQty <= 0) {
+        return {
+          ok: false,
+          liveSubmitted: false,
+          orderId: deterministicOrderId,
+          attemptsUsed: 0,
+          maxRetries,
+          totalBackoffMs: 0,
+          recoveredAfterRetry: false,
+          preflightHydrated: false,
+          lastErrorMessage: `3% settled-cash cap ($${cashRes.settledCashCapUsd.toFixed(2)}) yielded 0 executable quantity`,
+          failureClassification: 'SETTLED_CASH_3PCT_CAP_ZERO',
+          attemptHistory: [],
+        };
+      }
+      const clampedQty = Math.min(reqQty > 0 ? reqQty : maxQty, maxQty);
+      effectiveQuantity =
+        params.instrumentType === 'EVENTCONTRACT'
+          ? String(Math.max(1, Math.floor(clampedQty)))
+          : String(Number(clampedQty.toFixed(4)));
+    } else {
+      const decision = riskGuard.evaluateEntryOrder({
+        venue: 'PUBLIC_BROKERAGE',
+        symbol: cleanSymbol,
+        side: 'BUY',
+        strategyId: params.strategyId || 'PUBLIC_ORDER_DIRECT',
+        timeframe: params.timeframe || '15m',
+        requestedNotionalUsd: Math.max(0.01, reqQty) * unitPxUsd,
+        unitPriceUsd: unitPxUsd,
+        isIntegerContracts: params.instrumentType === 'EVENTCONTRACT',
+        settledCash: getPublicSettledCashSnapshot(),
+      });
+      if (!decision.ok) {
+        return {
+          ok: false,
+          liveSubmitted: false,
+          orderId: deterministicOrderId,
+          attemptsUsed: 0,
+          maxRetries,
+          totalBackoffMs: 0,
+          recoveredAfterRetry: false,
+          preflightHydrated: false,
+          lastErrorMessage: decision.reason,
+          failureClassification: decision.code,
+          attemptHistory: [],
+        };
+      }
+      activeRiskGuardHash = decision.idempotencyHash;
+      if (!params.idempotencyKey) {
+        seedKey = decision.idempotencyHash;
+        deterministicOrderId = generateDeterministicUuidV4FromSeed(
+          `pub-order:${seedKey}:${cleanSymbol}:${params.orderSide}`
+        );
+      }
+      effectiveQuantity =
+        params.instrumentType === 'EVENTCONTRACT'
+          ? String(decision.approvedContracts)
+          : String(decision.approvedQuantity);
+    }
+  }
 
   // Phase 1.5: Global Kill Switch Pre-Check (Env + Memory + Gate 5 + Firestore)
   const killState = await evaluateGlobalKillSwitch({
@@ -11683,6 +12193,8 @@ async function submitPublicOrderWithExponentialRetry(params: {
     };
   }
 
+  venueOrderSubmissionCount += 1;
+
   // Test-mode venue exit simulator hook (ONLY when QUANTPULSE_TEST_MODE === 'true')
   if (
     process.env.QUANTPULSE_TEST_MODE === 'true' &&
@@ -11693,9 +12205,9 @@ async function submitPublicOrderWithExponentialRetry(params: {
       symbol: cleanSymbol,
       orderSide: params.orderSide,
       orderType: params.orderType,
-      quantity: params.quantity,
+      quantity: effectiveQuantity,
       limitPrice: params.limitPrice,
-      idempotencyKey: params.idempotencyKey,
+      idempotencyKey: seedKey,
     });
     return {
       ok: simPub.ok,
@@ -11725,6 +12237,14 @@ async function submitPublicOrderWithExponentialRetry(params: {
   // Phase 1 Default Paper Mode: Never place live orders on Public.com when in PAPER mode
   if (isPaperModeEnabled() && simFailures === 0) {
     const paperOrderId = `paper-pub-${deterministicOrderId.slice(0, 8)}`;
+    if (activeRiskGuardHash) {
+      riskGuard.attachOrderOutcome(activeRiskGuardHash, {
+        orderId: deterministicOrderId,
+        venueOrderId: paperOrderId,
+        status: 'PAPER_MODE_SIMULATED_ORDER',
+        approvedQuantity: Number(effectiveQuantity),
+      });
+    }
     return {
       ok: true,
       liveSubmitted: false,
@@ -11854,7 +12374,7 @@ async function submitPublicOrderWithExponentialRetry(params: {
       orderSide: params.orderSide,
       orderType: params.orderType,
       expiration: expirationObj,
-      quantity: params.quantity,
+      quantity: effectiveQuantity,
     };
     if (params.orderType === 'LIMIT' && params.limitPrice) {
       preflightBody.limitPrice = params.limitPrice;
@@ -12073,16 +12593,20 @@ async function placePublicTakeProfitSellOrders(options?: {
   placedCount: number;
   publicSellOrders: ExecutedOrder[];
 }> {
+  const hasTestExitHooks =
+    process.env.QUANTPULSE_TEST_MODE === 'true' && Boolean(testVenueExitHooks);
   const ksCheck = await evaluateGlobalKillSwitch({
     memoryKillSwitchActive: globalKillSwitchActive,
     fiveGateLocked: fiveGateKillSwitchState.locked,
   });
-  if (ksCheck.active || isPaperModeEnabled()) {
+  if (ksCheck.active || (isPaperModeEnabled() && !hasTestExitHooks)) {
     return { placedCount: 0, publicSellOrders: [] };
   }
-  await syncWithPublicApiGateway(false);
-  const bearer = await getPublicBearerToken();
-  if (!bearer || !livePublicAccountId) {
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
+  const bearer = hasTestExitHooks ? 'test-bearer' : await getPublicBearerToken();
+  if ((!bearer || !livePublicAccountId) && !hasTestExitHooks) {
     return { placedCount: 0, publicSellOrders: [] };
   }
 
@@ -12102,8 +12626,6 @@ async function placePublicTakeProfitSellOrders(options?: {
     const basePx = pos.currentPrice > 0 ? pos.currentPrice : pos.averagePrice;
     if (basePx <= 0.02) continue;
 
-    // Never use Math.max(pos.averagePrice, basePx) which moves the target further away as price rises!
-    // If position is already in profit, harvest immediately via MARKET/marketable LIMIT sell
     const isInProfit =
       pos.unrealizedPnl >= 0.04 ||
       (pos.averagePrice > 0 && basePx >= pos.averagePrice * 1.006);
@@ -12116,23 +12638,84 @@ async function placePublicTakeProfitSellOrders(options?: {
           ).toFixed(2)
         )
       : Number((isInProfit ? basePx : pos.averagePrice * 1.008).toFixed(2));
-    const sellQtyStr = isEventContract
-      ? String(Math.max(1, Math.floor(pos.quantity)))
-      : String(pos.quantity);
-
-    const sellResult = await submitPublicOrderWithExponentialRetry({
+    const requestedSellQty = isEventContract
+      ? Math.max(1, Math.floor(pos.quantity))
+      : Number(pos.quantity);
+    const tpSeedKey = riskGuard.deriveDeterministicKey({
       symbol: pos.symbol,
-      idempotencyKey: `tp-sell-${pos.symbol}-${Date.now()}`,
-      instrumentType: isEventContract ? 'EVENTCONTRACT' : 'EQUITY',
-      orderSide: 'SELL',
-      orderType: !isEventContract && isInProfit ? 'MARKET' : 'LIMIT',
-      quantity: sellQtyStr,
-      limitPrice: !isEventContract && isInProfit ? undefined : targetTpPrice.toFixed(2),
-      maxRetries: 3,
+      side: 'SELL',
+      strategyId: 'PUBLIC_TAKE_PROFIT_SELL',
+      timeframe: '15m',
+    }).idempotencyHash;
+
+    // Rule 3 Pre-Exit Sweep: CancelAllOpenOrders -> confirm 0 resting -> query exact settled qty -> SELL settled size
+    let trancheCounter = 0;
+    let lastSellResult: Awaited<ReturnType<typeof submitPublicOrderWithExponentialRetry>> | null = null;
+    const sweepResult = await riskGuard.executeRule3PreExitSweep({
+      symbol: pos.symbol,
+      exitSide: 'SELL',
+      requestedQty: requestedSellQty,
+      bestBidUsd: basePx,
+      bestAskUsd: Number((basePx * 1.005).toFixed(4)),
+      bboDepthUsd: Math.max(1000, basePx * requestedSellQty * 20),
+      cancelAllOpenOrders: async (sym) => {
+        if (hasTestExitHooks && testVenueExitHooks?.cancelOpenOrders) {
+          return await testVenueExitHooks.cancelOpenOrders('PUBLIC_BROKERAGE', sym);
+        }
+        return await cancelPublicOpenOrdersForSymbol(sym);
+      },
+      fetchOpenOrdersCount: async (sym) => {
+        if (hasTestExitHooks && testVenueExitHooks?.getOpenOrdersCount) {
+          return await testVenueExitHooks.getOpenOrdersCount('PUBLIC_BROKERAGE', sym);
+        }
+        return await getPublicOpenOrdersCountForSymbol(sym);
+      },
+      fetchSettledPositionQty: async (sym) => {
+        if (hasTestExitHooks && testVenueExitHooks?.getSettledPositionQty) {
+          return await testVenueExitHooks.getSettledPositionQty('PUBLIC_BROKERAGE', sym);
+        }
+        return await getPublicSettledPositionQtyForSymbol(sym, requestedSellQty);
+      },
+      executeLimitOrder: async ({ quantity }) => {
+        trancheCounter += 1;
+        const sellQtyTranche = isEventContract
+          ? String(Math.max(1, Math.round(quantity)))
+          : String(Number(quantity.toFixed(4)));
+        const sellResult = await submitPublicOrderWithExponentialRetry({
+          symbol: pos.symbol,
+          idempotencyKey: `${tpSeedKey}:tranche:${trancheCounter}`,
+          strategyId: 'PUBLIC_TAKE_PROFIT_SELL',
+          timeframe: '15m',
+          instrumentType: isEventContract ? 'EVENTCONTRACT' : 'EQUITY',
+          orderSide: 'SELL',
+          orderType: !isEventContract && isInProfit ? 'MARKET' : 'LIMIT',
+          quantity: sellQtyTranche,
+          limitPrice: !isEventContract && isInProfit ? undefined : targetTpPrice.toFixed(2),
+          maxRetries: 3,
+        });
+        lastSellResult = sellResult;
+        return {
+          ok: sellResult.ok && (sellResult.liveSubmitted || hasTestExitHooks),
+          orderId: sellResult.orderId,
+          status: sellResult.failureClassification,
+          error: sellResult.lastErrorMessage,
+        };
+      },
     });
 
-    if (sellResult.ok && sellResult.liveSubmitted) {
-      const ordId = sellResult.orderId;
+    if (
+      sweepResult.ok &&
+      lastSellResult &&
+      lastSellResult.ok &&
+      (lastSellResult.liveSubmitted || hasTestExitHooks)
+    ) {
+      const ordId = lastSellResult.orderId;
+      const executedSweepQty = sweepResult.tranchesExecuted.reduce(
+        (sum, t) => sum + (t.ok ? t.quantity : 0),
+        0
+      );
+      const finalSoldQty =
+        executedSweepQty > 0 ? executedSweepQty : sweepResult.settledPositionQty;
       const matchedAgent =
         autonomousAgents.find((a) => a.targetSymbol === pos.symbol) ||
         autonomousAgents.find((a) => a.venue === 'PUBLIC_BROKERAGE') ||
@@ -12140,6 +12723,7 @@ async function placePublicTakeProfitSellOrders(options?: {
 
       const tpExecOrder: ExecutedOrder = {
         id: `pub-tp-${ordId}`,
+        idempotencyKey: tpSeedKey,
         timestamp: new Date().toISOString(),
         agentId: matchedAgent.id,
         agentName: `Public.com Auto-Take-Profit Bracket (${pos.symbol})`,
@@ -12147,13 +12731,13 @@ async function placePublicTakeProfitSellOrders(options?: {
         venue: 'PUBLIC_BROKERAGE',
         side: 'SELL',
         orderType: !isEventContract && isInProfit ? 'MARKET_IOC' : 'LIMIT_OCO',
-        quantity: Number(sellQtyStr),
+        quantity: finalSoldQty,
         fillPrice: targetTpPrice,
         stopLossPrice: Number((basePx * 0.96).toFixed(2)),
         takeProfitPrice: targetTpPrice,
         regimeAtEntry: 'TRENDING_BULL',
         status: !isEventContract && isInProfit ? 'FILLED' : 'WORKING_OCO',
-        rationale: `[LIVE PUBLIC.COM ${isInProfit ? 'IMMEDIATE PROFIT HARVEST' : 'TAKE-PROFIT SELL LIMIT'} · orderId=${ordId} · attempts=${sellResult.attemptsUsed}] SELL ${sellQtyStr} ${pos.symbol} (${pos.instrumentType}) @ $${targetTpPrice.toFixed(2)} (Avg Cost $${pos.averagePrice.toFixed(2)}).`,
+        rationale: `[LIVE PUBLIC.COM RULE-3 SWEEP ${isInProfit ? 'IMMEDIATE PROFIT HARVEST' : 'TAKE-PROFIT SELL LIMIT'} · orderId=${ordId} · attempts=${lastSellResult.attemptsUsed}] SELL ${finalSoldQty} ${pos.symbol} (${pos.instrumentType}) @ $${targetTpPrice.toFixed(2)} (Avg Cost $${pos.averagePrice.toFixed(2)}).`,
       };
       executedOrders.unshift(tpExecOrder);
       publicSellOrders.push(tpExecOrder);
@@ -12170,33 +12754,74 @@ async function placePublicTakeProfitSellOrders(options?: {
 async function executeLivePublicBrokeragePulse(options?: {
   symbols?: string[];
   notionalPerTradeUsd?: number;
+  timeframe?: RiskGuardTimeframe;
 }): Promise<{
   executedCount: number;
   publicBuyOrders: ExecutedOrder[];
   publicSellOrders: ExecutedOrder[];
+  rejected?: boolean;
+  duplicateBlocked?: boolean;
+  code?: string;
+  reason?: string;
 }> {
   const killState = await evaluateGlobalKillSwitch({
     memoryKillSwitchActive: globalKillSwitchActive,
     fiveGateLocked: fiveGateKillSwitchState.locked,
   });
   if (killState.active) {
-    return { executedCount: 0, publicBuyOrders: [], publicSellOrders: [] };
+    return {
+      executedCount: 0,
+      publicBuyOrders: [],
+      publicSellOrders: [],
+      rejected: true,
+      code: 'GLOBAL_KILL_SWITCH_ACTIVE',
+      reason: killState.reason,
+    };
   }
 
-  await syncWithPublicApiGateway(false);
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
+
+  // Fail-closed Public.com settled cash check BEFORE reading credentials or sizing (never falls back to ?? 100)
+  const publicCashCheck = riskGuard.verifySettledCash(getPublicSettledCashSnapshot());
+  if (!publicCashCheck.verified) {
+    return {
+      executedCount: 0,
+      publicBuyOrders: [],
+      publicSellOrders: [],
+      rejected: true,
+      code: publicCashCheck.code,
+      reason: publicCashCheck.reason,
+    };
+  }
+
+  const isTestModeWithPaper =
+    process.env.QUANTPULSE_TEST_MODE === 'true' || isPaperModeEnabled();
   const bearer = await getPublicBearerToken();
-  if (!bearer || !livePublicAccountId) {
-    return { executedCount: 0, publicBuyOrders: [], publicSellOrders: [] };
+  if ((!bearer || !livePublicAccountId) && !isTestModeWithPaper) {
+    return {
+      executedCount: 0,
+      publicBuyOrders: [],
+      publicSellOrders: [],
+      rejected: true,
+      code: 'BALANCE_UNVERIFIED_BLOCK',
+      reason: 'BALANCE_UNVERIFIED_BLOCK: Public.com API credentials or account ID missing.',
+    };
   }
 
   const targetSymbols = options?.symbols && options.symbols.length > 0
     ? options.symbols
     : ['NVDA', 'QQQ', 'SPY', 'TLT', 'AISP'];
-  const notionalUsd = Math.max(4.5, Math.min(12.0, options?.notionalPerTradeUsd ?? 8.0));
+  const requestedNotionalUsd = Math.max(0.5, options?.notionalPerTradeUsd ?? 8.0);
+  const pulseTimeframe: RiskGuardTimeframe = options?.timeframe || '15m';
   const publicBuyOrders: ExecutedOrder[] = [];
+  let blockedReason: string | undefined;
+  let blockedCode: string | undefined;
+  let anyDuplicateBlocked = false;
 
   for (const sym of targetSymbols) {
-    const cleanSym = sym.replace('-USD', '');
+    const cleanSym = sym.replace('-USD', '').trim().toUpperCase();
     // Never stack duplicate queued BUY orders on a symbol that already has a working BUY order on Public.com
     const alreadyHasWorkingBuy = livePublicOrders.some(
       (o) =>
@@ -12207,23 +12832,44 @@ async function executeLivePublicBrokeragePulse(options?: {
     if (alreadyHasWorkingBuy) {
       continue;
     }
-    // Cap each equity position so we get in and out without holding huge bags
     const existingPos = livePublicPositions.find((p) => p.symbol === cleanSym);
     if (existingPos && existingPos.marketValue >= 25.0 && !options?.symbols) {
       continue;
     }
-    if ((livePublicBuyingPower ?? 100) < notionalUsd + 5.0) {
-      break;
-    }
 
     const feature = marketFeatures.find((f) => f.symbol === sym || f.symbol === cleanSym);
-    const price = feature?.price || existingPos?.currentPrice || 100;
-    const qtyNum = price < 10 ? Math.max(1, Math.round(notionalUsd / price)) : Number((notionalUsd / price).toFixed(2));
+    const price = Math.max(0.01, feature?.price || existingPos?.currentPrice || 100);
+
+    // Mandatory RiskGuard Gate: 3% settled-cash size-down + deterministic SHA-256 idempotency bucket lock
+    const entryDecision = riskGuard.evaluateEntryOrder({
+      venue: 'PUBLIC_BROKERAGE',
+      symbol: cleanSym,
+      side: 'BUY',
+      strategyId: 'PUBLIC_BROKERAGE_PULSE',
+      timeframe: pulseTimeframe,
+      requestedNotionalUsd,
+      unitPriceUsd: price,
+      isIntegerContracts: false,
+      settledCash: getPublicSettledCashSnapshot(),
+    });
+    if (!entryDecision.ok) {
+      blockedCode = entryDecision.code;
+      blockedReason = entryDecision.reason;
+      if (entryDecision.duplicateBlocked) {
+        anyDuplicateBlocked = true;
+      }
+      continue;
+    }
+
+    const qtyNum = entryDecision.approvedQuantity;
     const qtyStr = String(qtyNum);
 
     const buyResult = await submitPublicOrderWithExponentialRetry({
       symbol: cleanSym,
-      idempotencyKey: `pub-buy-${cleanSym}-${Date.now()}`,
+      idempotencyKey: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: pulseTimeframe,
+      strategyId: 'PUBLIC_BROKERAGE_PULSE',
       instrumentType: 'EQUITY',
       orderSide: 'BUY',
       orderType: 'MARKET',
@@ -12231,7 +12877,7 @@ async function executeLivePublicBrokeragePulse(options?: {
       maxRetries: 3,
     });
 
-    if (buyResult.ok && buyResult.liveSubmitted) {
+    if (buyResult.ok && (buyResult.liveSubmitted || isTestModeWithPaper)) {
       const ordId = buyResult.orderId;
       const matchedAgent =
         autonomousAgents.find((a) => a.targetSymbol === sym || a.targetSymbol === cleanSym) ||
@@ -12240,6 +12886,8 @@ async function executeLivePublicBrokeragePulse(options?: {
 
       const buyExecOrder: ExecutedOrder = {
         id: `pub-buy-${ordId}`,
+        idempotencyKey: entryDecision.idempotencyHash,
+        notionalUsd: entryDecision.approvedNotionalUsd,
         timestamp: new Date().toISOString(),
         agentId: matchedAgent.id,
         agentName: matchedAgent.name,
@@ -12252,8 +12900,8 @@ async function executeLivePublicBrokeragePulse(options?: {
         stopLossPrice: Number((price * 0.96).toFixed(2)),
         takeProfitPrice: Number((price * 1.008).toFixed(2)),
         regimeAtEntry: feature?.lastAssessment?.market_regime || 'TRENDING_BULL',
-        status: 'FILLED',
-        rationale: `[LIVE PUBLIC.COM BROKERAGE FILL · Account ${livePublicAccountId} · orderId=${ordId} · attempts=${buyResult.attemptsUsed}] Executed BUY ${qtyStr} ${cleanSym} @ ~$${price.toFixed(2)} + Paired Take-Profit SELL Limit Bracket.`,
+        status: buyResult.liveSubmitted ? 'FILLED' : 'WORKING_OCO',
+        rationale: `[${buyResult.liveSubmitted ? 'LIVE PUBLIC.COM BROKERAGE FILL' : 'PAPER_MODE_SIMULATED_ORDER'} · orderId=${ordId} · 3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}] Executed BUY ${qtyStr} ${cleanSym} @ ~$${price.toFixed(2)} ($${entryDecision.approvedNotionalUsd.toFixed(2)}).`,
       };
       executedOrders.unshift(buyExecOrder);
       publicBuyOrders.push(buyExecOrder);
@@ -12262,38 +12910,76 @@ async function executeLivePublicBrokeragePulse(options?: {
     }
   }
 
-  // Wait briefly for fills to settle, then stage resting Take-Profit SELL limit orders across all active Public.com positions
-  await new Promise((r) => setTimeout(r, 900));
-  const tpResult = await placePublicTakeProfitSellOrders({ force: false });
-  await syncWithPublicApiGateway(false);
+  let tpSellOrders: ExecutedOrder[] = [];
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    if (publicBuyOrders.length > 0) {
+      await new Promise((r) => setTimeout(r, 900));
+    }
+    const tpResult = await placePublicTakeProfitSellOrders({ force: false });
+    tpSellOrders = tpResult.publicSellOrders;
+    await syncWithPublicApiGateway(false);
+  }
 
   return {
     executedCount: publicBuyOrders.length,
     publicBuyOrders,
-    publicSellOrders: tpResult.publicSellOrders,
+    publicSellOrders: tpSellOrders,
+    rejected: publicBuyOrders.length === 0 && Boolean(blockedCode),
+    duplicateBlocked: publicBuyOrders.length === 0 && anyDuplicateBlocked,
+    code: publicBuyOrders.length === 0 ? blockedCode : undefined,
+    reason: publicBuyOrders.length === 0 ? blockedReason : undefined,
   };
 }
 
 // API Endpoint: Fire an immediate Public.com Brokerage Multi-Asset Execution Burst + Paired Take-Profit SELL Limit Orders
 app.post('/api/public/execute-burst', async (req, res) => {
-  const { symbols, notionalPerTradeUsd = 8.0 } = (req.body || {}) as {
+  const { symbols, notionalPerTradeUsd = 8.0, timeframe } = (req.body || {}) as {
     symbols?: string[];
     notionalPerTradeUsd?: number;
+    timeframe?: RiskGuardTimeframe;
   };
-  globalKillSwitchActive = false;
   const result = await executeLivePublicBrokeragePulse({
     symbols,
     notionalPerTradeUsd,
+    timeframe,
   });
-  // Also route a live Kalshi + Public.com Event Contract mirror pulse (Safe 3-contract defensive sizing)
-  const evPulse = await executeLiveKalshiHftPulse({
-    targetSeries: ['KXBTC15M'],
-    contractsPerOrder: 3,
-    routePublicMirror: true,
-  });
-  await syncWithPublicApiGateway(false);
+  if (
+    result.rejected &&
+    !result.duplicateBlocked &&
+    (result.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+      result.code === 'INSUFFICIENT_SETTLED_CASH' ||
+      result.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+      result.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+  ) {
+    return res.status(400).json({
+      error: result.reason,
+      rejected: true,
+      code: result.code,
+      reason: result.reason,
+      executedCount: 0,
+      publicBuyOrders: [],
+      publicSellOrders: [],
+    });
+  }
+  const evPulse =
+    result.duplicateBlocked
+      ? { executedCount: 0, kalshiOrders: [], kalshiSellOrders: [], publicOrders: [] }
+      : await executeLiveKalshiHftPulse({
+          targetSeries: ['KXBTC15M'],
+          contractsPerOrder: 3,
+          routePublicMirror: true,
+        });
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   res.json({
-    status: 'PUBLIC_BROKERAGE_BURST_AND_TP_BRACKETS_EXECUTED',
+    status: result.duplicateBlocked
+      ? 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK'
+      : 'PUBLIC_BROKERAGE_BURST_AND_TP_BRACKETS_EXECUTED',
+    rejected: Boolean(result.rejected),
+    duplicateBlocked: Boolean(result.duplicateBlocked),
+    code: result.code,
+    reason: result.reason,
     executedCount: result.executedCount + evPulse.publicOrders.length,
     publicBuyOrders: [...result.publicBuyOrders, ...evPulse.publicOrders],
     publicSellOrders: result.publicSellOrders,
@@ -12309,7 +12995,9 @@ app.post('/api/public/execute-burst', async (req, res) => {
 app.post('/api/public/place-sell-orders', async (req, res) => {
   const { force = false } = (req.body || {}) as { force?: boolean };
   const result = await placePublicTakeProfitSellOrders({ force });
-  await syncWithPublicApiGateway(false);
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   res.json({
     status: 'PUBLIC_TAKE_PROFIT_SELL_ORDERS_PLACED',
     placedCount: result.placedCount,
@@ -12326,20 +13014,33 @@ app.post('/api/kalshi/hft-burst', async (req, res) => {
     series?: string[];
     contractsPerOrder?: number;
   };
-  globalKillSwitchActive = false;
-  for (const a of autonomousAgents) {
-    if (a.status === 'HALTED_BY_KILL_SWITCH') {
-      a.status = 'ACTIVE';
-      a.killSwitchReason = undefined;
-    }
-  }
   const burstResult = await executeLiveKalshiHftPulse({
     targetSeries: series,
     contractsPerOrder,
     routePublicMirror: true,
   });
+  if (
+    burstResult.rejected &&
+    (burstResult.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+      burstResult.code === 'INSUFFICIENT_SETTLED_CASH' ||
+      burstResult.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+      burstResult.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+  ) {
+    return res.status(400).json({
+      error: burstResult.reason,
+      rejected: true,
+      code: burstResult.code,
+      reason: burstResult.reason,
+      executedCount: 0,
+      kalshiOrders: [],
+      kalshiSellOrders: burstResult.kalshiSellOrders,
+      publicOrders: [],
+    });
+  }
   lastAutoKalshiHftPulseMs = Date.now();
-  await syncWithPublicApiGateway(false);
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   res.json({
     status: 'KALSHI_HFT_BURST_AND_SELL_BRACKETS_EXECUTED',
     executedCount: burstResult.executedCount,
@@ -12411,6 +13112,7 @@ app.post('/api/kalshi/five-gate-evaluate', async (req, res) => {
     realizedDailyPnlDollars?: number;
     unrealizedDailyPnlDollars?: number;
     executeOrderIfApproved?: boolean;
+    timeframe?: RiskGuardTimeframe;
   };
   const rawTicker = String(body.market_ticker || 'KXBTC15M').trim().toUpperCase();
   const seriesTicker = String(
@@ -12436,6 +13138,15 @@ app.post('/api/kalshi/five-gate-evaluate', async (req, res) => {
       : calProb >= midProb
       ? 'yes'
       : 'no';
+
+  const deterministicKey =
+    body.idempotency_key ||
+    riskGuard.deriveDeterministicKey({
+      symbol: rawTicker,
+      side: recSide === 'yes' ? 'BUY_YES' : recSide === 'no' ? 'BUY_NO' : 'PASS',
+      strategyId: 'FIVE_GATE_RISK_ENGINE',
+      timeframe: body.timeframe || '15m',
+    }).idempotencyHash;
 
   const signal: KalshiSignalSchema = {
     market_ticker: rawTicker,
@@ -12464,8 +13175,8 @@ app.post('/api/kalshi/five-gate-evaluate', async (req, res) => {
     m_taker: Number(body.m_taker ?? mults.m_taker),
     m_maker: Number(body.m_maker ?? mults.m_maker),
     theta_min: Number(body.theta_min ?? (isMaker ? 0.015 : 0.04)),
-    bankroll_dollars: Number(body.bankroll_dollars ?? (liveKalshiCashBalanceUsd || 405.6)),
-    idempotency_key: String(body.idempotency_key || `5gate-${rawTicker}-${Date.now()}`),
+    bankroll_dollars: Number(body.bankroll_dollars ?? (liveKalshiCashBalanceUsd ?? 0)),
+    idempotency_key: String(deterministicKey),
   };
 
   const result = await evaluateFiveGateRiskEngineInServer({
@@ -12473,7 +13184,22 @@ app.post('/api/kalshi/five-gate-evaluate', async (req, res) => {
     realizedDailyPnlDollars: body.realizedDailyPnlDollars,
     unrealizedDailyPnlDollars: body.unrealizedDailyPnlDollars,
     executeOrderIfApproved: body.executeOrderIfApproved ?? true,
+    timeframe: body.timeframe,
   });
+
+  if (
+    result.rejected &&
+    !result.duplicateBlocked &&
+    (result.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+      result.code === 'INSUFFICIENT_SETTLED_CASH' ||
+      result.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+      result.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+  ) {
+    return res.status(400).json({
+      error: result.reason,
+      ...result,
+    });
+  }
 
   res.json({
     ...result,
@@ -12589,6 +13315,9 @@ app.post('/api/kalshi/gemini-signal', async (req, res) => {
     thinking_level?: 'LOW' | 'MEDIUM' | 'HIGH';
     calibrated_yes_prob_hint?: number;
     confidence_band_hint?: number;
+    bankroll_dollars?: number;
+    idempotency_key?: string;
+    timeframe?: RiskGuardTimeframe;
     executeOrderIfApproved?: boolean;
   };
 
@@ -12605,12 +13334,32 @@ app.post('/api/kalshi/gemini-signal', async (req, res) => {
     thinking_level: body.thinking_level,
     calibrated_yes_prob_hint: body.calibrated_yes_prob_hint,
     confidence_band_hint: body.confidence_band_hint,
+    bankroll_dollars: body.bankroll_dollars,
+    idempotency_key: body.idempotency_key,
+    timeframe: body.timeframe,
   });
 
   const fiveGateOutcome = await evaluateFiveGateRiskEngineInServer({
     signal,
     executeOrderIfApproved: body.executeOrderIfApproved ?? true,
+    timeframe: body.timeframe,
+    strategyId: 'GEMINI_SIGNAL_DELIBERATION',
   });
+
+  if (
+    fiveGateOutcome.rejected &&
+    !fiveGateOutcome.duplicateBlocked &&
+    (fiveGateOutcome.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+      fiveGateOutcome.code === 'INSUFFICIENT_SETTLED_CASH' ||
+      fiveGateOutcome.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+      fiveGateOutcome.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+  ) {
+    return res.status(400).json({
+      error: fiveGateOutcome.reason,
+      ...fiveGateOutcome,
+      geminiDeliberation: geminiTelemetry,
+    });
+  }
 
   res.json({
     geminiDeliberation: geminiTelemetry,
@@ -13434,6 +14183,42 @@ app.post('/api/mentions/trigger-sniper', async (req, res) => {
       contractsPerOrder: cleanQty,
       routePublicMirror: true,
     });
+    if (
+      pulse.rejected &&
+      !pulse.duplicateBlocked &&
+      (pulse.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+        pulse.code === 'INSUFFICIENT_SETTLED_CASH' ||
+        pulse.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+        pulse.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+    ) {
+      return res.status(400).json({
+        error: pulse.reason,
+        rejected: true,
+        code: pulse.code,
+        reason: pulse.reason,
+        executedCount: 0,
+        kalshiOrders: [],
+        kalshiSellOrders: [],
+        publicOrders: [],
+      });
+    }
+    if (pulse.duplicateBlocked && pulse.kalshiOrders.length === 0) {
+      return res.status(200).json({
+        status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+        rejected: true,
+        duplicateBlocked: true,
+        code: pulse.code,
+        reason: pulse.reason,
+        bundle,
+        kalshiOrders: [],
+        kalshiSellOrders: [],
+        publicOrders: [],
+        mentionState: buildMentionSniperState(),
+        portfolio: computePortfolioSummary(),
+        orders: executedOrders,
+        agents: autonomousAgents,
+      });
+    }
     return res.json({
       status: 'COMBINATORIAL_ARB_AND_AUTO_SELL_EXECUTED',
       bundle,
@@ -13498,30 +14283,73 @@ app.post('/api/mentions/trigger-sniper', async (req, res) => {
     }ms pre-audio head start)`;
   }
 
-  // Route real Kalshi v2 order + paired resting Take-Profit SELL limit order
+  // Route real Kalshi v2 order + paired resting Take-Profit SELL limit order (RiskGuard-enforced)
   const pulse = await executeLiveKalshiHftPulse({
     targetSeries: ['KXBTC15M'],
     contractsPerOrder: cleanQty,
     routePublicMirror: true,
   });
 
+  if (
+    pulse.rejected &&
+    !pulse.duplicateBlocked &&
+    (pulse.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+      pulse.code === 'INSUFFICIENT_SETTLED_CASH' ||
+      pulse.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+      pulse.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+  ) {
+    return res.status(400).json({
+      error: pulse.reason,
+      rejected: true,
+      code: pulse.code,
+      reason: pulse.reason,
+      executedCount: 0,
+      kalshiOrders: [],
+      kalshiSellOrders: [],
+      publicOrders: [],
+    });
+  }
+  if (pulse.duplicateBlocked && pulse.kalshiOrders.length === 0) {
+    return res.status(200).json({
+      status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+      rejected: true,
+      duplicateBlocked: true,
+      code: pulse.code,
+      reason: pulse.reason,
+      kalshiOrders: [],
+      kalshiSellOrders: [],
+      publicOrders: [],
+      mentionState: buildMentionSniperState(),
+      portfolio: computePortfolioSummary(),
+      orders: executedOrders,
+      agents: autonomousAgents,
+    });
+  }
+
   const buyOrder = pulse.kalshiOrders[0];
   const sellOrder = pulse.kalshiSellOrders[0];
+  const cappedMentionQty = buyOrder?.quantity || 1;
 
   // Also register the dedicated Mention Sniper BUY + Auto-Sell Take-Profit bracket in the ledger and trigger history
   const mentionSell = await submitSingleKalshiSellOrder({
     ticker: matchedContract.kalshiTicker,
     title: `${speaker.speakerName} · "${matchedContract.targetWord}" Mention Auto-Take-Profit`,
     sideToSell: 'YES',
-    contracts: cleanQty,
+    contracts: cappedMentionQty,
     entryPrice: matchedContract.yesAsk,
     targetSellPrice: matchedContract.targetTakeProfitSellPrice,
     agentId: 'agent-hft-15m-kxbtc',
     agentName: `Mention & Viseme Lip-Read Sniper (${speaker.speakerName.split('·')[0].trim()})`,
   });
 
+  const triggerDigest = crypto
+    .createHash('sha256')
+    .update(`${speaker.speakerId}:${matchedContract.kalshiTicker}:${buyOrder?.id || 'mention'}`)
+    .digest('hex')
+    .slice(0, 6);
+
   const triggerRecord = {
-    id: `lip-trig-${Date.now().toString().slice(-4)}`,
+    id: `lip-trig-${triggerDigest}`,
     timestamp: new Date().toISOString(),
     speakerName: speaker.speakerName,
     detectedStreamText:
@@ -13534,7 +14362,7 @@ app.post('/api/mentions/trigger-sniper', async (req, res) => {
       (primaryPrecursor?.avgLeadTimeMs || 2100) +
       matchedContract.lipReadSignature.visualLeadAdvantageMs,
     convictionPct: matchedContract.lipReadSignature.confidenceScorePct,
-    buyOrderId: buyOrder?.id || `kalshi-ment-buy-${Date.now().toString().slice(-4)}`,
+    buyOrderId: buyOrder?.id || `kalshi-ment-buy-${triggerDigest}`,
     buyPrice: matchedContract.yesAsk,
     restingSellOrderId: sellOrder?.orderId || mentionSell.restingSell.orderId,
     targetSellPrice: matchedContract.targetTakeProfitSellPrice,
@@ -13840,8 +14668,8 @@ app.post('/api/feeds/toggle', (req, res) => {
   res.json({ feeds: dataFeedSpecs });
 });
 
-// API Endpoint: Spawn a new autonomous trading agent ("Long and Low" or "Short and Fast") with server-validated capital allocation
-app.post('/api/agents/spawn', (req, res) => {
+// API Endpoint: Spawn a new autonomous trading agent ("Long and Low" or "Short and Fast") with server-validated capital allocation + RiskGuard
+app.post('/api/agents/spawn', async (req, res) => {
   const {
     name,
     archetype,
@@ -13853,6 +14681,8 @@ app.post('/api/agents/spawn', (req, res) => {
     maxDrawdownLimitPct,
     atrSpikeKillMultiplier,
     subscribedFeeds,
+    notionalUsd,
+    timeframe,
   } = req.body as {
     name?: string;
     archetype?: 'LONG_AND_LOW' | 'SHORT_AND_FAST';
@@ -13864,7 +14694,13 @@ app.post('/api/agents/spawn', (req, res) => {
     maxDrawdownLimitPct?: number;
     atrSpikeKillMultiplier?: number;
     subscribedFeeds?: string[];
+    notionalUsd?: number;
+    timeframe?: RiskGuardTimeframe;
   };
+
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
 
   const feature = marketFeatures.find((m) => m.symbol === targetSymbol) || marketFeatures[0];
   const resolvedArchetype = archetype || 'SHORT_AND_FAST';
@@ -13891,11 +14727,11 @@ app.post('/api/agents/spawn', (req, res) => {
       publicAllocatedUsd,
     },
     {
-      kalshiCashUsd: liveKalshiCashBalanceUsd ?? 93.15,
-      publicCashUsd: livePublicCashBalance ?? 128.13,
+      kalshiCashUsd: liveKalshiCashBalanceUsd ?? 0,
+      publicCashUsd: livePublicCashBalance ?? 0,
       combinedNlvUsd:
         portfolioNow.combinedMultiVenueEquityUsd ??
-        portfolioNow.totalEquityUsd + (portfolioNow.kalshiTotalEquityUsd ?? 93.15),
+        portfolioNow.totalEquityUsd + (portfolioNow.kalshiTotalEquityUsd ?? 0),
     }
   );
 
@@ -13909,9 +14745,69 @@ app.post('/api/agents/spawn', (req, res) => {
   }
 
   const capital = validation.validated.allocatedCapitalUsd;
+  const assessment = feature.lastAssessment || computeDeterministicAssessment(feature);
+  const isPredictionVenue = feature.venue === 'PREDICTION_MARKET';
+  const resolvedSide: ExecutedOrder['side'] = isPredictionVenue
+    ? assessment.bias_probability_distribution.bullish >=
+      assessment.bias_probability_distribution.bearish
+      ? 'BUY_YES'
+      : 'BUY_NO'
+    : assessment.bias_probability_distribution.bullish >=
+      assessment.bias_probability_distribution.bearish
+    ? 'BUY'
+    : 'SELL';
+  const spawnUnitPrice = isPredictionVenue
+    ? Math.max(0.44, Math.min(0.56, feature.price))
+    : Math.max(0.01, feature.price);
+  const resolvedTf: RiskGuardTimeframe =
+    timeframe || (resolvedArchetype === 'LONG_AND_LOW' ? '1h' : '5m');
+  const requestedNotional =
+    typeof notionalUsd === 'number' && notionalUsd > 0
+      ? notionalUsd
+      : capital * (isPredictionVenue ? 0.35 : 0.45);
+
+  const entryDecision = riskGuard.evaluateEntryOrder({
+    venue: isPredictionVenue ? 'KALSHI' : 'PUBLIC_BROKERAGE',
+    symbol: feature.symbol,
+    side: resolvedSide,
+    strategyId: stratSpec.id,
+    timeframe: resolvedTf,
+    requestedNotionalUsd: requestedNotional,
+    unitPriceUsd: spawnUnitPrice,
+    isIntegerContracts: isPredictionVenue,
+    settledCash: isPredictionVenue
+      ? getKalshiSettledCashSnapshot()
+      : getPublicSettledCashSnapshot(),
+    killSwitchActive: globalKillSwitchActive,
+  });
+
+  if (!entryDecision.ok) {
+    if (entryDecision.duplicateBlocked) {
+      res.status(200).json({
+        status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+        rejected: true,
+        duplicateBlocked: true,
+        code: entryDecision.code,
+        reason: entryDecision.reason,
+        order: null,
+        agents: autonomousAgents,
+        orders: executedOrders,
+        portfolio: computePortfolioSummary(),
+      });
+      return;
+    }
+    res.status(400).json({
+      error: entryDecision.reason,
+      rejected: true,
+      code: entryDecision.code,
+      reason: entryDecision.reason,
+      order: null,
+    });
+    return;
+  }
 
   const newAgent: AutonomousAgent = {
-    id: `agent-${Date.now().toString().slice(-5)}`,
+    id: `agent-${entryDecision.idempotencyHash.slice(0, 6)}`,
     name:
       name && name.trim().length > 0
         ? name.trim()
@@ -13951,7 +14847,7 @@ app.post('/api/agents/spawn', (req, res) => {
         Number(atrSpikeKillMultiplier) || (resolvedArchetype === 'LONG_AND_LOW' ? 2.6 : 2.2),
       stopLossAtrMultiple: stratSpec.stopAtr,
       takeProfitAtrMultiple: stratSpec.tpAtr,
-      maxPositionNotionalUsd: capital,
+      maxPositionNotionalUsd: entryDecision.settledCashCapUsd,
     },
     metrics: {
       allocatedCapitalUsd: capital,
@@ -13966,47 +14862,80 @@ app.post('/api/agents/spawn', (req, res) => {
 
   autonomousAgents.unshift(newAgent);
 
-  const assessment = feature.lastAssessment || computeDeterministicAssessment(feature);
   const decimals = feature.price < 2 ? 4 : 2;
-  const qty =
-    feature.venue === 'PREDICTION_MARKET'
-      ? Math.max(5, Math.round((capital * 0.35) / feature.price))
-      : Math.max(0.05, Number(((capital * 0.45) / feature.price).toFixed(3)));
+  const qty = isPredictionVenue
+    ? entryDecision.approvedContracts
+    : entryDecision.approvedQuantity;
+  let routedOrderId = `ord-${entryDecision.idempotencyHash.slice(0, 8)}`;
+
+  if (isPredictionVenue) {
+    const v2SpawnRes = await submitKalshiV2EventsOrder({
+      ticker: feature.symbol,
+      idempotencySeed: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: stratSpec.id,
+      side: resolvedSide === 'BUY_NO' ? 'ask' : 'bid',
+      contracts: entryDecision.approvedContracts,
+      desiredYesPrice:
+        resolvedSide === 'BUY_NO'
+          ? Number((1.0 - spawnUnitPrice).toFixed(2))
+          : spawnUnitPrice,
+      yesBidDollars: Math.max(0.44, Math.min(0.55, spawnUnitPrice - 0.01)),
+      yesAskDollars: Math.max(0.45, Math.min(0.56, spawnUnitPrice + 0.01)),
+      postOnly: true,
+      reduceOnly: false,
+      timeInForce: 'good_till_canceled',
+      cancelOrderOnPause: true,
+    });
+    if (v2SpawnRes.exchangeOrderId) {
+      routedOrderId = `kalshi-${v2SpawnRes.exchangeOrderId}`;
+    }
+  } else {
+    const pubSpawnRes = await submitPublicOrderWithExponentialRetry({
+      symbol: feature.symbol.replace('-USD', ''),
+      idempotencyKey: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: stratSpec.id,
+      instrumentType: feature.assetClass === 'CRYPTO' ? 'CRYPTO' : 'EQUITY',
+      orderSide: resolvedSide === 'SELL' ? 'SELL' : 'BUY',
+      orderType: 'MARKET',
+      quantity: String(qty),
+      maxRetries: 2,
+    });
+    if (pubSpawnRes.ok) {
+      routedOrderId = pubSpawnRes.orderId;
+    }
+  }
 
   const newOrder: ExecutedOrder = {
-    id: `ord-${Math.floor(1000 + Math.random() * 9000)}`,
+    id: routedOrderId,
+    idempotencyKey: entryDecision.idempotencyHash,
+    notionalUsd: entryDecision.approvedNotionalUsd,
     timestamp: new Date().toISOString(),
     agentId: newAgent.id,
     agentName: newAgent.name,
     symbol: feature.symbol,
     venue: feature.venue,
-    side:
-      feature.venue === 'PREDICTION_MARKET'
-        ? assessment.bias_probability_distribution.bullish >=
-          assessment.bias_probability_distribution.bearish
-          ? 'BUY_YES'
-          : 'BUY_NO'
-        : assessment.bias_probability_distribution.bullish >=
-          assessment.bias_probability_distribution.bearish
-        ? 'BUY'
-        : 'SELL',
+    side: resolvedSide,
     orderType: 'LIMIT_OCO',
     quantity: qty,
-    fillPrice: feature.price,
+    fillPrice: spawnUnitPrice,
     stopLossPrice: Number(
       Math.max(
         0.01,
-        feature.price - feature.atr14 * newAgent.riskGovernance.stopLossAtrMultiple
+        spawnUnitPrice - feature.atr14 * newAgent.riskGovernance.stopLossAtrMultiple
       ).toFixed(decimals)
     ),
     takeProfitPrice: Number(
-      (feature.price + feature.atr14 * newAgent.riskGovernance.takeProfitAtrMultiple).toFixed(
+      (spawnUnitPrice + feature.atr14 * newAgent.riskGovernance.takeProfitAtrMultiple).toFixed(
         decimals
       )
     ),
     regimeAtEntry: assessment.market_regime,
     status: 'WORKING_OCO',
-    rationale: `[${stratSpec.label}] ${assessment.rationale}`,
+    rationale: `[${stratSpec.label} · 3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}] ${assessment.rationale}`,
   };
 
   executedOrders.unshift(newOrder);
@@ -14014,15 +14943,31 @@ app.post('/api/agents/spawn', (req, res) => {
   res.json({
     agent: newAgent,
     order: newOrder,
+    idempotencyKey: entryDecision.idempotencyHash,
+    settledCashCapUsd: entryDecision.settledCashCapUsd,
     agents: autonomousAgents,
     orders: executedOrders,
     portfolio: computePortfolioSummary(),
   });
 });
 
-// API Endpoint: Find & Run the #1 Best Real-Data Strategy + Diversify Agents Across Tickers & Indicators
-app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
-  await syncWithPublicApiGateway(false);
+// API Endpoint: Find & Run the #1 Best Real-Data Strategy + Diversify Agents Across Tickers & Indicators (RiskGuard-enforced)
+app.post('/api/agents/deploy-best-strategy', async (req, res) => {
+  const {
+    symbol: requestedSymbol,
+    notionalUsd: requestedNotionalUsd,
+    timeframe: requestedTimeframe,
+    strategyId: requestedStrategyId,
+  } = (req.body || {}) as {
+    symbol?: string;
+    notionalUsd?: number;
+    timeframe?: RiskGuardTimeframe;
+    strategyId?: string;
+  };
+
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   const tournament = computeStrategyTournament();
   const winner = tournament[0];
 
@@ -14032,8 +14977,10 @@ app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
     const bestForSymbol =
       tournament.find((t) => t.symbol === agent.targetSymbol) || winner;
     seenSymbols.add(agent.targetSymbol);
-    agent.status = 'ACTIVE';
-    agent.killSwitchReason = undefined;
+    agent.status = globalKillSwitchActive ? 'HALTED_BY_KILL_SWITCH' : 'ACTIVE';
+    if (!globalKillSwitchActive) {
+      agent.killSwitchReason = undefined;
+    }
     agent.indicatorStrategyId = bestForSymbol.indicatorStrategyId;
     agent.indicatorStrategyLabel = bestForSymbol.indicatorStrategyLabel;
     agent.entryRules.maAlignment = bestForSymbol.indicatorSignalFormula;
@@ -14044,25 +14991,84 @@ app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
     agent.lastEvaluatedAt = new Date().toISOString();
   }
 
-  // Spawn or promote the #1 Tournament Winner Agent and execute a live OCO order on real data
+  // Spawn or promote the #1 Tournament Winner Agent and execute a RiskGuard-capped live OCO order on real data
   const winnerFeature =
-    marketFeatures.find((m) => m.symbol === winner.symbol) || marketFeatures[0];
+    (requestedSymbol
+      ? marketFeatures.find((m) => m.symbol.toUpperCase() === requestedSymbol.toUpperCase())
+      : undefined) ||
+    marketFeatures.find((m) => m.symbol === winner.symbol) ||
+    marketFeatures[0];
   const assessment =
     winnerFeature.lastAssessment || computeDeterministicAssessment(winnerFeature);
+  const isPredictionVenue = winnerFeature.venue === 'PREDICTION_MARKET';
+  const resolvedSide: ExecutedOrder['side'] = isPredictionVenue ? 'BUY_YES' : 'BUY';
+  const unitPriceUsd = isPredictionVenue
+    ? Math.max(0.44, Math.min(0.56, winnerFeature.price))
+    : Math.max(0.01, winnerFeature.price);
+  const resolvedTf: RiskGuardTimeframe =
+    requestedTimeframe || (winner.archetype === 'LONG_AND_LOW' ? '1h' : '5m');
+  const resolvedStrategyId = requestedStrategyId || winner.indicatorStrategyId;
+
+  const entryDecision = riskGuard.evaluateEntryOrder({
+    venue: isPredictionVenue ? 'KALSHI' : 'PUBLIC_BROKERAGE',
+    symbol: winnerFeature.symbol,
+    side: resolvedSide,
+    strategyId: resolvedStrategyId,
+    timeframe: resolvedTf,
+    requestedNotionalUsd:
+      typeof requestedNotionalUsd === 'number' && requestedNotionalUsd > 0
+        ? requestedNotionalUsd
+        : isPredictionVenue
+        ? 45
+        : 65,
+    unitPriceUsd,
+    isIntegerContracts: isPredictionVenue,
+    settledCash: isPredictionVenue
+      ? getKalshiSettledCashSnapshot()
+      : getPublicSettledCashSnapshot(),
+    killSwitchActive: globalKillSwitchActive,
+  });
+
+  if (!entryDecision.ok) {
+    if (entryDecision.duplicateBlocked) {
+      return res.status(200).json({
+        status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+        rejected: true,
+        duplicateBlocked: true,
+        code: entryDecision.code,
+        reason: entryDecision.reason,
+        executedCount: 0,
+        order: null,
+        winner,
+        strategyTournament: tournament,
+        agents: autonomousAgents,
+        orders: executedOrders,
+        portfolio: computePortfolioSummary(),
+      });
+    }
+    return res.status(400).json({
+      error: entryDecision.reason,
+      rejected: true,
+      code: entryDecision.code,
+      reason: entryDecision.reason,
+      executedCount: 0,
+      order: null,
+    });
+  }
 
   let championAgent = autonomousAgents.find(
     (a) =>
-      a.targetSymbol === winner.symbol &&
+      a.targetSymbol === winnerFeature.symbol &&
       a.indicatorStrategyId === winner.indicatorStrategyId
   );
 
   if (!championAgent) {
     championAgent = {
-      id: `agent-win-${Date.now().toString().slice(-4)}`,
-      name: `#1 Real-Data Winner · ${winner.symbol} ${winner.indicatorStrategyLabel}`,
+      id: `agent-win-${entryDecision.idempotencyHash.slice(0, 6)}`,
+      name: `#1 Real-Data Winner · ${winnerFeature.symbol} ${winner.indicatorStrategyLabel}`,
       archetype: winner.archetype,
-      venue: winner.venue,
-      targetSymbol: winner.symbol,
+      venue: winnerFeature.venue,
+      targetSymbol: winnerFeature.symbol,
       timeframe: winner.archetype === 'LONG_AND_LOW' ? '4H' : '5m',
       status: 'ACTIVE',
       indicatorStrategyId: winner.indicatorStrategyId,
@@ -14080,10 +15086,10 @@ app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
         atrSpikeKillMultiplier: 2.3,
         stopLossAtrMultiple: winner.recommendedStopAtr,
         takeProfitAtrMultiple: winner.recommendedTakeProfitAtr,
-        maxPositionNotionalUsd: 140,
+        maxPositionNotionalUsd: entryDecision.settledCashCapUsd,
       },
       metrics: {
-        allocatedCapitalUsd: 140,
+        allocatedCapitalUsd: entryDecision.settledCashUsd,
         unrealizedPnlUsd: 4.85,
         realizedPnlUsd: 24.6,
         winRatePct: winner.winRatePct,
@@ -14094,44 +15100,99 @@ app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
     };
     autonomousAgents.unshift(championAgent);
   } else {
-    championAgent.name = `#1 Real-Data Winner · ${winner.symbol} ${winner.indicatorStrategyLabel}`;
+    championAgent.name = `#1 Real-Data Winner · ${winnerFeature.symbol} ${winner.indicatorStrategyLabel}`;
     championAgent.status = 'ACTIVE';
+    championAgent.riskGovernance.maxPositionNotionalUsd = entryDecision.settledCashCapUsd;
     championAgent.metrics.tradesExecuted += 1;
   }
 
-  const decimals = winnerFeature.price < 2 ? 4 : 2;
-  const qty =
-    winnerFeature.venue === 'PREDICTION_MARKET'
-      ? Math.max(10, Math.round(45 / winnerFeature.price))
-      : Math.max(0.1, Number((65 / winnerFeature.price).toFixed(3)));
+  const decimals = unitPriceUsd < 2 ? 4 : 2;
+  const qty = isPredictionVenue
+    ? entryDecision.approvedContracts
+    : entryDecision.approvedQuantity;
+  let routedOrderId = `${isPredictionVenue ? 'kalshi' : 'pub'}-${entryDecision.idempotencyHash.slice(0, 8)}`;
+
+  if (isPredictionVenue) {
+    const v2WinnerRes = await submitKalshiV2EventsOrder({
+      ticker: winnerFeature.symbol,
+      idempotencySeed: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: resolvedStrategyId,
+      side: 'bid',
+      contracts: entryDecision.approvedContracts,
+      desiredYesPrice: unitPriceUsd,
+      yesBidDollars: Math.max(0.44, Math.min(0.55, unitPriceUsd - 0.01)),
+      yesAskDollars: Math.max(0.45, Math.min(0.56, unitPriceUsd + 0.01)),
+      postOnly: true,
+      reduceOnly: false,
+      timeInForce: 'good_till_canceled',
+      cancelOrderOnPause: true,
+    });
+    if (!v2WinnerRes.ok) {
+      return res.status(400).json({
+        error: v2WinnerRes.statusLabel,
+        rejected: true,
+        code: v2WinnerRes.statusLabel,
+        reason: v2WinnerRes.statusLabel,
+        order: null,
+      });
+    }
+    routedOrderId = v2WinnerRes.exchangeOrderId
+      ? `kalshi-${v2WinnerRes.exchangeOrderId}`
+      : routedOrderId;
+  } else {
+    const pubWinnerRes = await submitPublicOrderWithExponentialRetry({
+      symbol: winnerFeature.symbol.replace('-USD', ''),
+      idempotencyKey: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: resolvedStrategyId,
+      instrumentType: winnerFeature.assetClass === 'CRYPTO' ? 'CRYPTO' : 'EQUITY',
+      orderSide: 'BUY',
+      orderType: 'MARKET',
+      quantity: String(qty),
+      maxRetries: 2,
+    });
+    if (!pubWinnerRes.ok) {
+      return res.status(400).json({
+        error: pubWinnerRes.lastErrorMessage || pubWinnerRes.failureClassification,
+        rejected: true,
+        code: pubWinnerRes.failureClassification || 'PUBLIC_ORDER_REJECTED',
+        reason: pubWinnerRes.lastErrorMessage || 'Public order rejected',
+        order: null,
+      });
+    }
+    routedOrderId = pubWinnerRes.orderId;
+  }
 
   const order: ExecutedOrder = {
-    id: `${winnerFeature.venue === 'PREDICTION_MARKET' ? 'kalshi' : 'pub'}-${Math.floor(
-      1000 + Math.random() * 9000
-    )}`,
+    id: routedOrderId,
+    idempotencyKey: entryDecision.idempotencyHash,
+    notionalUsd: entryDecision.approvedNotionalUsd,
     timestamp: new Date().toISOString(),
     agentId: championAgent.id,
     agentName: championAgent.name,
     symbol: winnerFeature.symbol,
     venue: winnerFeature.venue,
-    side: winnerFeature.venue === 'PREDICTION_MARKET' ? 'BUY_YES' : 'BUY',
+    side: resolvedSide,
     orderType: 'LIMIT_OCO',
     quantity: qty,
-    fillPrice: winnerFeature.price,
+    fillPrice: unitPriceUsd,
     stopLossPrice: Number(
       Math.max(
         0.01,
-        winnerFeature.price - winnerFeature.atr14 * winner.recommendedStopAtr
+        unitPriceUsd - winnerFeature.atr14 * winner.recommendedStopAtr
       ).toFixed(decimals)
     ),
     takeProfitPrice: Number(
-      (winnerFeature.price + winnerFeature.atr14 * winner.recommendedTakeProfitAtr).toFixed(
+      (unitPriceUsd + winnerFeature.atr14 * winner.recommendedTakeProfitAtr).toFixed(
         decimals
       )
     ),
     regimeAtEntry: assessment.market_regime,
     status: 'WORKING_OCO',
-    rationale: `#1 Real-Data Strategy Winner (+${winner.totalReturnPct.toFixed(
+    rationale: `#1 Real-Data Strategy Winner [3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}] (+${winner.totalReturnPct.toFixed(
       2
     )}% return, Sharpe ${winner.sharpeRatio.toFixed(2)}, ${
       winner.winRatePct
@@ -14144,6 +15205,9 @@ app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
     winner,
     championAgent,
     order,
+    idempotencyKey: entryDecision.idempotencyHash,
+    settledCashCapUsd: entryDecision.settledCashCapUsd,
+    wasCapped: entryDecision.wasCapped,
     strategyTournament: tournament,
     agents: autonomousAgents,
     orders: executedOrders,
@@ -14151,9 +15215,23 @@ app.post('/api/agents/deploy-best-strategy', async (_req, res) => {
   });
 });
 
-// API Endpoint: Backtest All 15-Minute High-Frequency Prediction Markets, Find #1 Top HFT Strategy & Deploy 15m Scalper Fleet
-app.post('/api/agents/deploy-15m-hft-winner', async (_req, res) => {
-  await syncRealMarketBarsAndKalshi(false);
+// API Endpoint: Backtest All 15-Minute High-Frequency Prediction Markets, Find #1 Top HFT Strategy & Deploy 15m Scalper Fleet (RiskGuard-enforced)
+app.post('/api/agents/deploy-15m-hft-winner', async (req, res) => {
+  const {
+    symbol: requestedSymbol,
+    requestedContracts,
+    notionalUsd: requestedNotionalUsd,
+    timeframe: requestedTimeframe,
+  } = (req.body || {}) as {
+    symbol?: string;
+    requestedContracts?: number;
+    notionalUsd?: number;
+    timeframe?: RiskGuardTimeframe;
+  };
+
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncRealMarketBarsAndKalshi(false);
+  }
   const fullTournament = computeStrategyTournament();
   const hft15mEntries = fullTournament.filter((t) => t.is15MinPrediction);
   const top15mWinner = hft15mEntries[0] || fullTournament[0];
@@ -14182,7 +15260,7 @@ app.post('/api/agents/deploy-15m-hft-winner', async (_req, res) => {
     let existingAgent = autonomousAgents.find((a) => a.targetSymbol === f.symbol);
     if (!existingAgent) {
       existingAgent = {
-        id: `agent-hft-15m-${f.symbol.toLowerCase()}-${Date.now().toString().slice(-3)}`,
+        id: `agent-hft-15m-${f.symbol.toLowerCase()}`,
         name: `${f.symbol} · ${stratSpec.label}`,
         archetype: 'SHORT_AND_FAST',
         venue: 'PREDICTION_MARKET',
@@ -14235,6 +15313,9 @@ app.post('/api/agents/deploy-15m-hft-winner', async (_req, res) => {
   });
 
   const winnerFeature =
+    (requestedSymbol
+      ? marketFeatures.find((m) => m.symbol.toUpperCase() === requestedSymbol.toUpperCase())
+      : undefined) ||
     marketFeatures.find((m) => m.symbol === top15mWinner.symbol) ||
     fifteenMinFeatures[0] ||
     marketFeatures[0];
@@ -14248,31 +15329,115 @@ app.post('/api/agents/deploy-15m-hft-winner', async (_req, res) => {
   championAgent.indicatorStrategyId = top15mWinner.indicatorStrategyId;
   championAgent.indicatorStrategyLabel = top15mWinner.indicatorStrategyLabel;
 
-  const qty = Math.max(15, Math.round(35 / Math.max(0.05, winnerFeature.price)));
+  const resolvedSide: 'BUY_YES' | 'BUY_NO' =
+    assessment.bias_probability_distribution.bullish >=
+    assessment.bias_probability_distribution.bearish
+      ? 'BUY_YES'
+      : 'BUY_NO';
+  const entryUnitPrice = Math.max(0.44, Math.min(0.56, winnerFeature.price));
+  const resolvedTf: RiskGuardTimeframe = requestedTimeframe || '15m';
+  const reqNotionalUsd =
+    typeof requestedNotionalUsd === 'number' && requestedNotionalUsd > 0
+      ? requestedNotionalUsd
+      : typeof requestedContracts === 'number' && requestedContracts > 0
+      ? requestedContracts * entryUnitPrice
+      : 35;
+
+  const entryDecision = riskGuard.evaluateEntryOrder({
+    venue: 'KALSHI',
+    symbol: winnerFeature.symbol,
+    side: resolvedSide,
+    strategyId: top15mWinner.indicatorStrategyId,
+    timeframe: resolvedTf,
+    requestedNotionalUsd: reqNotionalUsd,
+    unitPriceUsd: entryUnitPrice,
+    isIntegerContracts: true,
+    settledCash: getKalshiSettledCashSnapshot(),
+    killSwitchActive: globalKillSwitchActive,
+  });
+
+  if (!entryDecision.ok) {
+    if (entryDecision.duplicateBlocked) {
+      return res.status(200).json({
+        status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+        rejected: true,
+        duplicateBlocked: true,
+        code: entryDecision.code,
+        reason: entryDecision.reason,
+        order: null,
+        winner: top15mWinner,
+        championAgent,
+        strategyTournament: fullTournament,
+        hft15mTournament: hft15mEntries,
+        agents: autonomousAgents,
+        orders: executedOrders,
+        portfolio: computePortfolioSummary(),
+      });
+    }
+    return res.status(400).json({
+      error: entryDecision.reason,
+      rejected: true,
+      code: entryDecision.code,
+      reason: entryDecision.reason,
+      order: null,
+    });
+  }
+
+  const v2HftRes = await submitKalshiV2EventsOrder({
+    ticker: winnerFeature.symbol,
+    idempotencySeed: entryDecision.idempotencyHash,
+    riskGuardVerifiedHash: entryDecision.idempotencyHash,
+    timeframe: resolvedTf,
+    strategyId: top15mWinner.indicatorStrategyId,
+    side: resolvedSide === 'BUY_NO' ? 'ask' : 'bid',
+    contracts: entryDecision.approvedContracts,
+    desiredYesPrice:
+      resolvedSide === 'BUY_NO'
+        ? Number((1.0 - entryUnitPrice).toFixed(2))
+        : entryUnitPrice,
+    yesBidDollars: Math.max(0.44, Math.min(0.55, entryUnitPrice - 0.01)),
+    yesAskDollars: Math.max(0.45, Math.min(0.56, entryUnitPrice + 0.01)),
+    postOnly: true,
+    reduceOnly: false,
+    timeInForce: 'good_till_canceled',
+    cancelOrderOnPause: true,
+  });
+
+  if (!v2HftRes.ok) {
+    return res.status(400).json({
+      error: v2HftRes.statusLabel,
+      rejected: true,
+      code: v2HftRes.statusLabel,
+      reason: v2HftRes.statusLabel,
+      order: null,
+    });
+  }
+
+  const qty = entryDecision.approvedContracts;
   const order: ExecutedOrder = {
-    id: `kalshi-15m-${Math.floor(1000 + Math.random() * 9000)}`,
+    id: v2HftRes.exchangeOrderId
+      ? `kalshi-15m-${v2HftRes.exchangeOrderId}`
+      : `kalshi-15m-${entryDecision.idempotencyHash.slice(0, 8)}`,
+    idempotencyKey: entryDecision.idempotencyHash,
+    notionalUsd: entryDecision.approvedNotionalUsd,
     timestamp: new Date().toISOString(),
     agentId: championAgent.id,
     agentName: championAgent.name,
     symbol: winnerFeature.symbol,
     venue: 'PREDICTION_MARKET',
-    side:
-      assessment.bias_probability_distribution.bullish >=
-      assessment.bias_probability_distribution.bearish
-        ? 'BUY_YES'
-        : 'BUY_NO',
+    side: resolvedSide,
     orderType: 'LIMIT_OCO',
     quantity: qty,
-    fillPrice: winnerFeature.price,
+    fillPrice: entryUnitPrice,
     stopLossPrice: Number(
-      Math.max(0.01, winnerFeature.price - winnerFeature.atr14 * top15mWinner.recommendedStopAtr).toFixed(4)
+      Math.max(0.01, entryUnitPrice - winnerFeature.atr14 * top15mWinner.recommendedStopAtr).toFixed(4)
     ),
     takeProfitPrice: Number(
-      Math.min(0.99, winnerFeature.price + winnerFeature.atr14 * top15mWinner.recommendedTakeProfitAtr).toFixed(4)
+      Math.min(0.99, entryUnitPrice + winnerFeature.atr14 * top15mWinner.recommendedTakeProfitAtr).toFixed(4)
     ),
     regimeAtEntry: assessment.market_regime,
     status: 'WORKING_OCO',
-    rationale: `#1 15m HFT Tournament Winner on ${
+    rationale: `#1 15m HFT Tournament Winner [3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}] on ${
       winnerFeature.activeContractTicker || winnerFeature.symbol
     } (+${top15mWinner.totalReturnPct.toFixed(2)}% return, Sharpe ${top15mWinner.sharpeRatio.toFixed(
       2
@@ -14285,6 +15450,9 @@ app.post('/api/agents/deploy-15m-hft-winner', async (_req, res) => {
     winner: top15mWinner,
     championAgent,
     order,
+    idempotencyKey: entryDecision.idempotencyHash,
+    settledCashCapUsd: entryDecision.settledCashCapUsd,
+    wasCapped: entryDecision.wasCapped,
     strategyTournament: fullTournament,
     hft15mTournament: hft15mEntries,
     agents: autonomousAgents,
@@ -14293,18 +15461,78 @@ app.post('/api/agents/deploy-15m-hft-winner', async (_req, res) => {
   });
 });
 
-// API Endpoint: Meta-Agent Dynamic Portfolio Optimizer (Auto-spawns optimal child agent based on real-data tournament)
-app.post('/api/agents/meta-optimize', async (_req, res) => {
-  await syncWithPublicApiGateway(false);
+// API Endpoint: Meta-Agent Dynamic Portfolio Optimizer (Auto-spawns optimal child agent with RiskGuard enforcement)
+app.post('/api/agents/meta-optimize', async (req, res) => {
+  const {
+    notionalUsd: requestedNotionalUsd,
+    timeframe: requestedTimeframe,
+  } = (req.body || {}) as {
+    notionalUsd?: number;
+    timeframe?: RiskGuardTimeframe;
+  };
+
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   const tournament = computeStrategyTournament();
   const topCandidate = tournament[0];
   const selectedFeature =
     marketFeatures.find((f) => f.symbol === topCandidate.symbol) || marketFeatures[0];
   const archetype = topCandidate.archetype;
+  const isPredictionVenue = selectedFeature.venue === 'PREDICTION_MARKET';
+  const resolvedSide: ExecutedOrder['side'] = isPredictionVenue ? 'BUY_YES' : 'BUY';
+  const unitPriceUsd = isPredictionVenue
+    ? Math.max(0.44, Math.min(0.56, selectedFeature.price))
+    : Math.max(0.01, selectedFeature.price);
+  const resolvedTf: RiskGuardTimeframe =
+    requestedTimeframe || (selectedFeature.is15MinPrediction ? '15m' : archetype === 'LONG_AND_LOW' ? '1h' : '5m');
+  const requestedNotional =
+    typeof requestedNotionalUsd === 'number' && requestedNotionalUsd > 0
+      ? requestedNotionalUsd
+      : (archetype === 'LONG_AND_LOW' ? 120 : 95) * (isPredictionVenue ? 0.35 : 0.45);
 
-  const capital = archetype === 'LONG_AND_LOW' ? 120 : 95;
+  const entryDecision = riskGuard.evaluateEntryOrder({
+    venue: isPredictionVenue ? 'KALSHI' : 'PUBLIC_BROKERAGE',
+    symbol: selectedFeature.symbol,
+    side: resolvedSide,
+    strategyId: `META_OPT_${topCandidate.indicatorStrategyId}`,
+    timeframe: resolvedTf,
+    requestedNotionalUsd: requestedNotional,
+    unitPriceUsd,
+    isIntegerContracts: isPredictionVenue,
+    settledCash: isPredictionVenue
+      ? getKalshiSettledCashSnapshot()
+      : getPublicSettledCashSnapshot(),
+    killSwitchActive: globalKillSwitchActive,
+  });
+
+  if (!entryDecision.ok) {
+    if (entryDecision.duplicateBlocked) {
+      return res.status(200).json({
+        status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+        rejected: true,
+        duplicateBlocked: true,
+        code: entryDecision.code,
+        reason: entryDecision.reason,
+        order: null,
+        agents: autonomousAgents,
+        orders: executedOrders,
+        portfolio: computePortfolioSummary(),
+        strategyTournament: tournament,
+      });
+    }
+    return res.status(400).json({
+      error: entryDecision.reason,
+      rejected: true,
+      code: entryDecision.code,
+      reason: entryDecision.reason,
+      order: null,
+    });
+  }
+
+  const capital = entryDecision.settledCashUsd;
   const spawnedAgent: AutonomousAgent = {
-    id: `agent-meta-${Date.now().toString().slice(-4)}`,
+    id: `agent-meta-${entryDecision.idempotencyHash.slice(0, 6)}`,
     name: `Meta-Winner · ${selectedFeature.symbol} ${topCandidate.indicatorStrategyLabel}`,
     archetype,
     venue: selectedFeature.venue,
@@ -14328,7 +15556,7 @@ app.post('/api/agents/meta-optimize', async (_req, res) => {
       atrSpikeKillMultiplier: archetype === 'LONG_AND_LOW' ? 2.5 : 2.2,
       stopLossAtrMultiple: topCandidate.recommendedStopAtr,
       takeProfitAtrMultiple: topCandidate.recommendedTakeProfitAtr,
-      maxPositionNotionalUsd: capital,
+      maxPositionNotionalUsd: entryDecision.settledCashCapUsd,
     },
     metrics: {
       allocatedCapitalUsd: capital,
@@ -14343,36 +15571,76 @@ app.post('/api/agents/meta-optimize', async (_req, res) => {
 
   autonomousAgents.unshift(spawnedAgent);
 
-  const decimals = selectedFeature.price < 2 ? 4 : 2;
-  const qty =
-    selectedFeature.venue === 'PREDICTION_MARKET'
-      ? Math.max(10, Math.round((capital * 0.35) / selectedFeature.price))
-      : Math.max(0.1, Number(((capital * 0.45) / selectedFeature.price).toFixed(3)));
+  const decimals = unitPriceUsd < 2 ? 4 : 2;
+  const qty = isPredictionVenue
+    ? entryDecision.approvedContracts
+    : entryDecision.approvedQuantity;
+  let routedOrderId = `ord-${entryDecision.idempotencyHash.slice(0, 8)}`;
+
+  if (isPredictionVenue) {
+    const v2MetaRes = await submitKalshiV2EventsOrder({
+      ticker: selectedFeature.symbol,
+      idempotencySeed: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: `META_OPT_${topCandidate.indicatorStrategyId}`,
+      side: 'bid',
+      contracts: entryDecision.approvedContracts,
+      desiredYesPrice: unitPriceUsd,
+      yesBidDollars: Math.max(0.44, Math.min(0.55, unitPriceUsd - 0.01)),
+      yesAskDollars: Math.max(0.45, Math.min(0.56, unitPriceUsd + 0.01)),
+      postOnly: true,
+      reduceOnly: false,
+      timeInForce: 'good_till_canceled',
+      cancelOrderOnPause: true,
+    });
+    if (v2MetaRes.exchangeOrderId) {
+      routedOrderId = `kalshi-${v2MetaRes.exchangeOrderId}`;
+    }
+  } else {
+    const pubMetaRes = await submitPublicOrderWithExponentialRetry({
+      symbol: selectedFeature.symbol.replace('-USD', ''),
+      idempotencyKey: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: `META_OPT_${topCandidate.indicatorStrategyId}`,
+      instrumentType: selectedFeature.assetClass === 'CRYPTO' ? 'CRYPTO' : 'EQUITY',
+      orderSide: 'BUY',
+      orderType: 'MARKET',
+      quantity: String(qty),
+      maxRetries: 2,
+    });
+    if (pubMetaRes.ok) {
+      routedOrderId = pubMetaRes.orderId;
+    }
+  }
 
   const order: ExecutedOrder = {
-    id: `ord-${Math.floor(1000 + Math.random() * 9000)}`,
+    id: routedOrderId,
+    idempotencyKey: entryDecision.idempotencyHash,
+    notionalUsd: entryDecision.approvedNotionalUsd,
     timestamp: new Date().toISOString(),
     agentId: spawnedAgent.id,
     agentName: spawnedAgent.name,
     symbol: selectedFeature.symbol,
     venue: selectedFeature.venue,
-    side: selectedFeature.venue === 'PREDICTION_MARKET' ? 'BUY_YES' : 'BUY',
+    side: resolvedSide,
     orderType: 'LIMIT_OCO',
     quantity: qty,
-    fillPrice: selectedFeature.price,
+    fillPrice: unitPriceUsd,
     stopLossPrice: Number(
       (
-        selectedFeature.lastAssessment?.support_level || selectedFeature.price * 0.96
+        selectedFeature.lastAssessment?.support_level || unitPriceUsd * 0.96
       ).toFixed(decimals)
     ),
     takeProfitPrice: Number(
       (
-        selectedFeature.lastAssessment?.resistance_level || selectedFeature.price * 1.05
+        selectedFeature.lastAssessment?.resistance_level || unitPriceUsd * 1.05
       ).toFixed(decimals)
     ),
     regimeAtEntry: selectedFeature.lastAssessment?.market_regime || 'TRENDING_BULL',
     status: 'WORKING_OCO',
-    rationale: `Real-Data Tournament #1 (${topCandidate.indicatorStrategyLabel}, +${topCandidate.totalReturnPct}% return): ${selectedFeature.lastAssessment?.rationale}`,
+    rationale: `Real-Data Tournament #1 [3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}] (${topCandidate.indicatorStrategyLabel}, +${topCandidate.totalReturnPct}% return): ${selectedFeature.lastAssessment?.rationale}`,
   };
 
   executedOrders.unshift(order);
@@ -14380,6 +15648,8 @@ app.post('/api/agents/meta-optimize', async (_req, res) => {
   res.json({
     spawnedAgent,
     order,
+    idempotencyKey: entryDecision.idempotencyHash,
+    settledCashCapUsd: entryDecision.settledCashCapUsd,
     agents: autonomousAgents,
     orders: executedOrders,
     portfolio: computePortfolioSummary(),
@@ -14890,6 +16160,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     const pubExec = await submitPublicOrderWithExponentialRetry({
       symbol: cleanSym,
       idempotencyKey: `agent-pub-${cleanSym}-${idempotencyDigest}`,
+      preValidatedByExecuteTrade: true,
       instrumentType: instType,
       orderSide: 'BUY',
       orderType: 'MARKET',
@@ -14932,6 +16203,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
         const v2Order = await submitKalshiV2EventsOrder({
           ticker: targetKalshiTicker,
           idempotencySeed: `agent-exec-${targetKalshiTicker}-${idempotencyDigest}`,
+          preValidatedByExecuteTrade: true,
           side: eventsSide,
           contracts: kalshiQty,
           desiredYesPrice: desiredYesPx,
@@ -14958,6 +16230,7 @@ app.post('/api/agents/execute-trade', async (req, res) => {
     const pubEvExec = await submitPublicOrderWithExponentialRetry({
       symbol: publicEvSymbol,
       idempotencyKey: `agent-ev-${publicEvSymbol}-${idempotencyDigest}`,
+      preValidatedByExecuteTrade: true,
       instrumentType: 'EVENTCONTRACT',
       orderSide: 'BUY',
       orderType: 'LIMIT',
@@ -15087,7 +16360,9 @@ app.post('/api/agents/update-allocation', async (req, res) => {
     return;
   }
 
-  await syncWithPublicApiGateway(false);
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   const portfolioNow = computePortfolioSummary();
   const validation = validateServerSideCapitalAllocation(
     {
@@ -15096,11 +16371,11 @@ app.post('/api/agents/update-allocation', async (req, res) => {
       publicAllocatedUsd,
     },
     {
-      kalshiCashUsd: liveKalshiCashBalanceUsd ?? 93.15,
-      publicCashUsd: livePublicCashBalance ?? 128.13,
+      kalshiCashUsd: liveKalshiCashBalanceUsd ?? 0,
+      publicCashUsd: livePublicCashBalance ?? 0,
       combinedNlvUsd:
         portfolioNow.combinedMultiVenueEquityUsd ??
-        portfolioNow.totalEquityUsd + (portfolioNow.kalshiTotalEquityUsd ?? 93.15),
+        portfolioNow.totalEquityUsd + (portfolioNow.kalshiTotalEquityUsd ?? 0),
     }
   );
 
@@ -15245,12 +16520,14 @@ app.post('/api/agents/fund-top-agent', async (req, res) => {
     routeLiveOrder?: boolean;
   };
 
-  await syncWithPublicApiGateway(false);
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
   const portfolioBefore = computePortfolioSummary();
   const combinedNlv = Math.max(
     450,
     portfolioBefore.combinedMultiVenueEquityUsd ??
-      portfolioBefore.totalEquityUsd + (portfolioBefore.kalshiTotalEquityUsd ?? 93.15)
+      portfolioBefore.totalEquityUsd + (portfolioBefore.kalshiTotalEquityUsd ?? 0)
   );
   // Critical Risk Guardrail: Single-asset exposure must remain strictly <= 12.0% of portfolio NLV
   const maxSafeSingleAssetUsd = Number((combinedNlv * 0.118).toFixed(2));
@@ -15267,8 +16544,8 @@ app.post('/api/agents/fund-top-agent', async (req, res) => {
         publicAllocatedUsd: reqPublicUsd,
       },
       {
-        kalshiCashUsd: liveKalshiCashBalanceUsd ?? 93.15,
-        publicCashUsd: livePublicCashBalance ?? 128.13,
+        kalshiCashUsd: liveKalshiCashBalanceUsd ?? 0,
+        publicCashUsd: livePublicCashBalance ?? 0,
         combinedNlvUsd: combinedNlv,
       }
     );
@@ -15317,7 +16594,7 @@ app.post('/api/agents/fund-top-agent', async (req, res) => {
   const finalAllocatedUsd = Number(
     Math.min(
       desiredCap,
-      (liveKalshiCashBalanceUsd ?? 93.15) + (livePublicCashBalance ?? 128.13),
+      (liveKalshiCashBalanceUsd ?? 0) + (livePublicCashBalance ?? 0),
       Math.floor(combinedNlv * 0.1185 * 100) / 100
     ).toFixed(2)
   );
@@ -15376,6 +16653,22 @@ app.post('/api/agents/fund-top-agent', async (req, res) => {
       contractsPerOrder: heatMode === 'HIGH_HEAT' ? 10 : 8,
       routePublicMirror: true,
     });
+    if (
+      burst.rejected &&
+      !burst.duplicateBlocked &&
+      (burst.code === 'BALANCE_UNVERIFIED_BLOCK' ||
+        burst.code === 'INSUFFICIENT_SETTLED_CASH' ||
+        burst.code === 'SETTLED_CASH_3PCT_CAP_ZERO' ||
+        burst.code === 'GLOBAL_KILL_SWITCH_ACTIVE')
+    ) {
+      return res.status(400).json({
+        error: burst.reason,
+        rejected: true,
+        code: burst.code,
+        reason: burst.reason,
+        order: null,
+      });
+    }
     lastAutoKalshiHftPulseMs = Date.now();
     if (burst.kalshiOrders.length > 0) {
       routedOrder = burst.kalshiOrders[0];
@@ -16951,15 +18244,15 @@ async function mcpToolRouteToDlq(args: Record<string, any>): Promise<Record<stri
   const severity: 'CRITICAL' | 'WARNING' =
     String(args.severity || 'CRITICAL').toUpperCase() === 'WARNING' ? 'WARNING' : 'CRITICAL';
 
-  const dlqId = `dlq-${crypto
+  const dlqDigest = crypto
     .createHash('sha256')
-    .update(idempotencyKey || `${failedTool}-${Date.now()}`)
-    .digest('hex')
-    .slice(0, 8)}`;
+    .update(idempotencyKey || `${failedTool}:${payloadJson}:${errorReason}`)
+    .digest('hex');
+  const dlqId = `dlq-${dlqDigest.slice(0, 8)}`;
 
   const entry: McpDlqEntry = {
     dlqId,
-    idempotencyKey: idempotencyKey || `auto-dlq-${Date.now()}`,
+    idempotencyKey: idempotencyKey || `auto-dlq-${dlqDigest.slice(0, 12)}`,
     failedTool,
     payloadJson,
     errorReason,
@@ -16984,10 +18277,13 @@ async function mcpToolRouteToDlq(args: Record<string, any>): Promise<Record<stri
 }
 
 async function mcpToolGetKalshiLiveBalance(args: Record<string, any>): Promise<Record<string, any>> {
-  if (args.forceRefresh !== false) {
+  if (args.forceRefresh !== false && process.env.QUANTPULSE_TEST_MODE !== 'true') {
     await syncLiveKalshiPortfolio(2);
   }
   const portfolio = computePortfolioSummary();
+  const cashBal = portfolio.kalshiCashBalanceUsd ?? 0;
+  const portVal = portfolio.kalshiPortfolioValueUsd ?? 0;
+  const totalEq = portfolio.kalshiTotalEquityUsd ?? 0;
   return {
     venue: 'KALSHI_TRADE_API_V2_OCT2026',
     transport: 'http',
@@ -16996,9 +18292,9 @@ async function mcpToolGetKalshiLiveBalance(args: Record<string, any>): Promise<R
     endpoint: `${KALSHI_REST_BASE_URL}/portfolio/balance`,
     authMethod: portfolio.kalshiAuthMethod || kalshiAuthMethod,
     keyIdPreview: portfolio.kalshiKeyIdPreview,
-    cashBalanceUsd: portfolio.kalshiCashBalanceUsd ?? 459.34,
-    portfolioValueUsd: portfolio.kalshiPortfolioValueUsd ?? 111.75,
-    totalKalshiEquityUsd: portfolio.kalshiTotalEquityUsd ?? 571.09,
+    cashBalanceUsd: cashBal,
+    portfolioValueUsd: portVal,
+    totalKalshiEquityUsd: totalEq,
     balanceBreakdown: portfolio.kalshiBalanceBreakdown ?? [],
     openPositionsCount: portfolio.kalshiPositions?.length ?? 0,
     openPositions: portfolio.kalshiPositions ?? [],
@@ -17015,8 +18311,8 @@ async function mcpToolGetKalshiLiveBalance(args: Record<string, any>): Promise<R
       haltedTickers: Array.from(kalshiWsState.haltedTickers),
       seqGapEvents: kalshiWsState.seqGapEvents.slice(0, 5),
     },
-    dataQualityWarning: false,
-    rationale: `Kalshi Oct 2026 v2 equity $${(portfolio.kalshiTotalEquityUsd ?? 571.09).toFixed(2)} ($${(portfolio.kalshiCashBalanceUsd ?? 459.34).toFixed(2)} cash, ${portfolio.kalshiPositions?.length ?? 8} contracts) verified via ${kalshiAuthMethod}.`,
+    dataQualityWarning: !kalshiCashLastSyncOk,
+    rationale: `Kalshi Oct 2026 v2 equity $${totalEq.toFixed(2)} ($${cashBal.toFixed(2)} cash, ${portfolio.kalshiPositions?.length ?? 0} contracts) verified via ${kalshiAuthMethod}.`,
     syncedAt: new Date().toISOString(),
   };
 }
@@ -17342,18 +18638,59 @@ async function mcpToolExecuteKalshiOrPublicOrder(args: Record<string, any>): Pro
   }
 
   const assessment = feature.lastAssessment || computeDeterministicAssessment(feature);
-  const notional = Math.min(
-    LEAD_LAG_PARAMS.maxRiskUsd,
-    Math.max(5, Number(args.notionalUsd) || LEAD_LAG_PARAMS.maxRiskUsd)
-  );
+  const rawNotional = Math.max(0.5, Number(args.notionalUsd) || LEAD_LAG_PARAMS.maxRiskUsd);
   const decimals = feature.price < 2 ? 4 : 2;
-  const qty =
-    feature.venue === 'PREDICTION_MARKET'
-      ? Math.min(
-          LEAD_LAG_PARAMS.maxContracts,
-          Math.max(1, Math.floor(notional / (askPrice + LEAD_LAG_PARAMS.feePerContract)))
-        )
-      : Math.max(0.05, Number((notional / askPrice).toFixed(3)));
+  const isPredictionVenue = feature.venue === 'PREDICTION_MARKET';
+  const effectiveKey =
+    idempotencyKey ||
+    riskGuard.deriveDeterministicKey({
+      symbol: feature.symbol,
+      side,
+      strategyId: 'MCP_EXECUTE_ORDER',
+      timeframe: '15m',
+    }).idempotencyHash;
+
+  const entryDecision =
+    side === 'SELL'
+      ? null
+      : riskGuard.evaluateEntryOrder({
+          venue: isPredictionVenue ? 'KALSHI' : 'PUBLIC_BROKERAGE',
+          symbol: feature.symbol,
+          side,
+          strategyId: 'MCP_EXECUTE_ORDER',
+          timeframe: '15m',
+          requestedNotionalUsd: rawNotional,
+          unitPriceUsd: askPrice,
+          isIntegerContracts: isPredictionVenue,
+          settledCash: isPredictionVenue
+            ? getKalshiSettledCashSnapshot()
+            : getPublicSettledCashSnapshot(),
+          killSwitchActive: globalKillSwitchActive,
+        });
+
+  if (entryDecision && !entryDecision.ok) {
+    return {
+      status: entryDecision.code,
+      rejected: true,
+      duplicateBlocked: entryDecision.duplicateBlocked,
+      code: entryDecision.code,
+      reason: entryDecision.reason,
+      idempotencyKey: effectiveKey,
+      symbol: feature.symbol,
+      venue: feature.venue,
+      dataQualityWarning: false,
+      rationale: entryDecision.reason,
+    };
+  }
+
+  const notional = entryDecision ? entryDecision.approvedNotionalUsd : rawNotional;
+  const qty = entryDecision
+    ? isPredictionVenue
+      ? entryDecision.approvedContracts
+      : entryDecision.approvedQuantity
+    : isPredictionVenue
+    ? Math.max(1, Math.floor(notional / Math.max(0.01, askPrice)))
+    : Math.max(0.05, Number((notional / Math.max(0.01, askPrice)).toFixed(3)));
 
   const strikeVal = Number(args.strike) || Math.floor(resolvedSpot / 100) * 100;
   const spotToStrikeBps = strikeVal > 0 ? Number((((resolvedSpot - strikeVal) / strikeVal) * 10000).toFixed(2)) : 0;
@@ -17390,7 +18727,7 @@ async function mcpToolExecuteKalshiOrPublicOrder(args: Record<string, any>): Pro
     realized_outcome: null,
   });
 
-  const ordHash = crypto.createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 6);
+  const ordHash = crypto.createHash('sha256').update(effectiveKey).digest('hex').slice(0, 6);
   const publicEventContractSymbol =
     feature.venue === 'PREDICTION_MARKET'
       ? `KALSHI.${feature.activeContractTicker || feature.symbol}.${side === 'BUY_NO' ? 'N' : 'Y'}`
@@ -17399,7 +18736,10 @@ async function mcpToolExecuteKalshiOrPublicOrder(args: Record<string, any>): Pro
   const targetPubSymbol = publicEventContractSymbol || feature.symbol.replace('-USD', '');
   const retryResult = await submitPublicOrderWithExponentialRetry({
     symbol: targetPubSymbol,
-    idempotencyKey,
+    idempotencyKey: effectiveKey,
+    riskGuardVerifiedHash: entryDecision?.idempotencyHash,
+    timeframe: '15m',
+    strategyId: 'MCP_EXECUTE_ORDER',
     instrumentType:
       feature.venue === 'PREDICTION_MARKET'
         ? 'EVENTCONTRACT'
@@ -17999,8 +19339,13 @@ async function handleMcpToolCall(
   // Step 1 Gate: Enforce required `idempotency_key: str` on all mutating tools
   if (isMutating) {
     if (!idempotencyKey) {
+      const missingDigest = crypto
+        .createHash('sha256')
+        .update(`${toolName}:${JSON.stringify(args || {})}`)
+        .digest('hex')
+        .slice(0, 12);
       const dlqEntry = await mcpToolRouteToDlq({
-        idempotency_key: `missing-key-${Date.now()}`,
+        idempotency_key: `missing-key-${missingDigest}`,
         failed_tool: toolName,
         payload_json: JSON.stringify(args),
         error_reason: `Missing required idempotency_key: str parameter on mutating tool '${toolName}'`,
@@ -18038,9 +19383,9 @@ async function handleMcpToolCall(
       const kalshiBal = await mcpToolGetKalshiLiveBalance(args);
       const pubPort = await mcpToolGetPublicBrokeragePortfolio(args);
       const topAgent = autonomousAgents[0];
-      const combinedNlv = pubPort.combinedMultiVenueEquityUsd || 555.81;
+      const combinedNlv = pubPort.combinedMultiVenueEquityUsd || 0;
       const topExposurePct = Number(
-        (((topAgent?.metrics.allocatedCapitalUsd || 65) / Math.max(1, combinedNlv)) * 100).toFixed(2)
+        (((topAgent?.metrics.allocatedCapitalUsd || 0) / Math.max(1, combinedNlv)) * 100).toFixed(2)
       );
       structuredData = {
         ...kalshiBal,
@@ -19058,8 +20403,13 @@ async function mcpToolReadMarketQuery(args: Record<string, any> = {}): Promise<R
   if (!firstAttempt.valid) {
     // Circuit Breaker: Attempt 1 corrective retry if caller enabled auto-remediation or if forcePoisonPill is not set
     if (args.simulate_unrecoverable_sql_fault) {
+      const sqlFaultHash = crypto
+        .createHash('sha256')
+        .update(`${assetPair}:${sqlQuery}`)
+        .digest('hex')
+        .slice(0, 10);
       const dlqEntry = await mcpToolRouteToDlq({
-        idempotency_key: `sql-fault-${Date.now()}`,
+        idempotency_key: `sql-fault-${sqlFaultHash}`,
         failed_tool: 'read_market_query',
         payload_json: JSON.stringify(args),
         error_reason: `PostgreSQL 16 schema validation failed after 1 corrective retry: ${firstAttempt.error}`,
@@ -19212,8 +20562,19 @@ async function mcpToolFetchLiveOrderbook(args: Record<string, any> = {}): Promis
 
 async function mcpToolProposeOrExecuteStrategy(args: Record<string, any> = {}): Promise<Record<string, any>> {
   const ticker = String(args.ticker || 'KXBTC15M').toUpperCase();
-  const idempotencyKey = String(args.idempotency_key || `orch-${Date.now()}`);
-  const clientOrderId = String(args.client_order_id || crypto.randomUUID());
+  const idempotencyKey = String(
+    args.idempotency_key ||
+      riskGuard.deriveDeterministicKey({
+        symbol: ticker,
+        side: 'BUY_YES',
+        strategyId: 'MCP_ORCHESTRATOR_PROPOSE',
+        timeframe: '15m',
+      }).idempotencyHash
+  );
+  const clientOrderId = String(
+    args.client_order_id ||
+      generateDeterministicUuidV4FromSeed(`orch-coid:${idempotencyKey}:${ticker}`)
+  );
   const convictionTier = (args.conviction_tier || 'HIGH') as OrchestratorConvictionTier;
   const priceDollars = Math.min(0.99, Math.max(0.01, Number(args.price_dollars) || 0.58));
   const pTrue = Math.min(0.99, Math.max(0.01, Number(args.p_true) || 0.645));
@@ -19244,7 +20605,7 @@ async function mcpToolProposeOrExecuteStrategy(args: Record<string, any> = {}): 
   }
 
   const portfolio = computePortfolioSummary();
-  const combinedNlv = Math.max(100, portfolio.combinedMultiVenueEquityUsd || 555.81);
+  const combinedNlv = Math.max(0, portfolio.combinedMultiVenueEquityUsd || 0);
   const topAgent = autonomousAgents[0];
   const currentSingleAssetExpPct = Number(
     (((topAgent?.metrics.allocatedCapitalUsd || 48) / combinedNlv) * 100).toFixed(2)
@@ -19344,7 +20705,15 @@ async function mcpToolProposeOrExecuteStrategy(args: Record<string, any> = {}): 
 }
 
 async function mcpToolExecuteRiskMitigation(args: Record<string, any> = {}): Promise<Record<string, any>> {
-  const idempotencyKey = String(args.idempotency_key || `mitigate-${Date.now()}`);
+  const idempotencyKey = String(
+    args.idempotency_key ||
+      riskGuard.deriveDeterministicKey({
+        symbol: 'GLOBAL_RISK',
+        side: 'SELL',
+        strategyId: 'MCP_RISK_MITIGATION',
+        timeframe: '5m',
+      }).idempotencyHash
+  );
   const breachReason = String(
     args.breach_reason || 'Single-asset exposure > 12.0% NLV or intraday drawdown >= 250 bps'
   );
@@ -19357,7 +20726,7 @@ async function mcpToolExecuteRiskMitigation(args: Record<string, any> = {}): Pro
   }
 
   const portfolio = computePortfolioSummary();
-  const combinedNlv = Math.max(100, portfolio.combinedMultiVenueEquityUsd || 555.81);
+  const combinedNlv = Math.max(0, portfolio.combinedMultiVenueEquityUsd || 0);
   const safeCapUsd = Number((combinedNlv * 0.115).toFixed(2)); // Reduce below 12% NLV cap to 11.5%
 
   for (const agent of autonomousAgents) {
@@ -19370,7 +20739,7 @@ async function mcpToolExecuteRiskMitigation(args: Record<string, any> = {}): Pro
   }
 
   riskEvents.unshift({
-    id: `risk-mitigation-${Date.now().toString().slice(-5)}`,
+    id: `risk-mitigation-${idempotencyKey.slice(0, 6)}`,
     timestamp: new Date().toISOString(),
     eventType: 'MAX_DRAWDOWN_BREACH',
     severity: 'CRITICAL',
@@ -19425,7 +20794,7 @@ const orchestratorCycleHistory: OrchestratorOutputContract[] = [latestOrchestrat
 
 function buildOrchestratorCycleTelemetry(): OrchestratorCycleTelemetry {
   const portfolio = computePortfolioSummary();
-  const combinedNlv = Math.max(100, portfolio.combinedMultiVenueEquityUsd || 555.81);
+  const combinedNlv = Math.max(0, portfolio.combinedMultiVenueEquityUsd || 0);
   const topAgent = autonomousAgents[0];
   const singleAssetExpPct = Number(
     (((topAgent?.metrics.allocatedCapitalUsd || 58.0) / combinedNlv) * 100).toFixed(2)
@@ -19534,9 +20903,14 @@ app.post('/api/orchestrator/run-cycle', async (req, res) => {
   };
 
   const invokedTools: OrchestratorMcpToolInvocation[] = [];
-  const timeWindowBucket = Math.floor(Date.now() / 15000);
-  const idempotencyKey = `tp-orch-${scenario.toLowerCase()}-${ticker.toLowerCase()}-${timeWindowBucket}`;
-  const clientOrderId = crypto.randomUUID();
+  const orchKeyInfo = riskGuard.deriveDeterministicKey({
+    symbol: ticker,
+    side: 'BUY_YES',
+    strategyId: `ORCH_${scenario}`,
+    timeframe: '5m',
+  });
+  const idempotencyKey = orchKeyInfo.idempotencyHash;
+  const clientOrderId = generateDeterministicUuidV4FromSeed(`orch-cycle:${idempotencyKey}`);
 
   // Strictly enforce the 4-call MCP budget per user turn
   // If Phase 1 is not pre-hydrated (<1500ms), we batch Phase 1 + Phase 2 in parallel (3 calls) leaving 1 call for Phase 3 execution (total = 4 calls).
@@ -19896,7 +21270,7 @@ function evaluateMarketRegimeVolatilityWeight(atrBaselineMult: number): {
 
 function buildParallelFiveSeriesLeadLagMatrix(): ParallelSeriesLeadLagRow[] {
   const portfolio = computePortfolioSummary();
-  const combinedNlv = Math.max(100, portfolio.combinedMultiVenueEquityUsd || 555.81);
+  const combinedNlv = Math.max(0, portfolio.combinedMultiVenueEquityUsd || 0);
   const workingBankroll = getDeployableWorkingKalshiBankrollUsd();
 
   const specs: Array<{
@@ -20456,7 +21830,7 @@ function buildCapitalRecoveryGuardrailState(): CapitalRecoveryGuardrailState {
     },
   ];
 
-  const availablePublicBp = Number((livePublicBuyingPower ?? 2614.42).toFixed(2));
+  const availablePublicBp = Number((livePublicCashOnlyBuyingPower ?? livePublicCashBalance ?? 0).toFixed(2));
   const activeEtfBudget = Number((availablePublicBp * 0.35).toFixed(2));
 
   const publicEtfRotation: PublicEtfRotationPlan = {
@@ -20738,6 +22112,8 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
     makerTakeProfitTicksCents,
     autoSweepDust = true,
     simulateHighLatencyReject = false,
+    requestedContracts,
+    timeframe,
   } = (req.body || {}) as {
     seriesTicker?: 'KXBTC15M' | 'KXETH15M' | 'KXSOL15M' | 'KXXRP15M' | 'KXDOGE15M' | 'ALL_ELIGIBLE';
     exitMode?: 'POST_ONLY_MAKER_TP' | 'IOC_LATENCY_DECAY_FLATTEN';
@@ -20746,6 +22122,8 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
     makerTakeProfitTicksCents?: number;
     autoSweepDust?: boolean;
     simulateHighLatencyReject?: boolean;
+    requestedContracts?: number;
+    timeframe?: RiskGuardTimeframe;
   };
 
   if (typeof maxEntryLatencyMs === 'number' && maxEntryLatencyMs >= 50 && maxEntryLatencyMs <= 500) {
@@ -20760,6 +22138,36 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
     makerTakeProfitTicksCents <= 10
   ) {
     zeroHoldScalpConfig.makerTakeProfitTicksCents = makerTakeProfitTicksCents;
+  }
+
+  const killState = await evaluateGlobalKillSwitch({
+    memoryKillSwitchActive: globalKillSwitchActive,
+    fiveGateLocked: fiveGateKillSwitchState.locked,
+  });
+  if (killState.active) {
+    return res.status(400).json({
+      error: killState.reason,
+      rejected: true,
+      code: 'GLOBAL_KILL_SWITCH_ACTIVE',
+      reason: killState.reason,
+      executedCount: 0,
+      executedScalps: [],
+    });
+  }
+
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncLiveKalshiPortfolio(0);
+  }
+  const kalshiCashCheck = riskGuard.verifySettledCash(getKalshiSettledCashSnapshot());
+  if (!kalshiCashCheck.verified) {
+    return res.status(400).json({
+      error: kalshiCashCheck.reason,
+      rejected: true,
+      code: kalshiCashCheck.code,
+      reason: kalshiCashCheck.reason,
+      executedCount: 0,
+      executedScalps: [],
+    });
   }
 
   // Optional Auto-Sweep of idle brokerage fractional dust into active scalping float
@@ -20798,10 +22206,63 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
   }
 
   const executedRecords: ZeroHoldScalpExecutionRecord[] = [];
+  let blockedCode: string | undefined;
+  let blockedReason: string | undefined;
+  let anyDuplicateBlocked = false;
+
   for (const row of targets) {
     if (!row.latencyGatePassed) continue;
-    const contracts = row.recommendedContracts;
-    const entryPrice = row.yesBidDollars;
+    const reqQty =
+      typeof requestedContracts === 'number' && requestedContracts > 0
+        ? Math.round(requestedContracts)
+        : row.recommendedContracts;
+    const entryPrice = Math.max(0.44, Math.min(0.56, row.yesBidDollars));
+    const resolvedTf: RiskGuardTimeframe = timeframe || '5m';
+
+    const entryDecision = riskGuard.evaluateEntryOrder({
+      venue: 'KALSHI',
+      symbol: row.seriesTicker,
+      side: 'BUY_YES',
+      strategyId: 'ZERO_HOLD_LEAD_LAG_SCALP',
+      timeframe: resolvedTf,
+      requestedNotionalUsd: reqQty * entryPrice,
+      unitPriceUsd: entryPrice,
+      isIntegerContracts: true,
+      settledCash: getKalshiSettledCashSnapshot(),
+      killSwitchActive: globalKillSwitchActive,
+    });
+    if (!entryDecision.ok) {
+      blockedCode = entryDecision.code;
+      blockedReason = entryDecision.reason;
+      if (entryDecision.duplicateBlocked) {
+        anyDuplicateBlocked = true;
+      }
+      continue;
+    }
+
+    const v2ScalpRes = await submitKalshiV2EventsOrder({
+      ticker: row.seriesTicker,
+      idempotencySeed: entryDecision.idempotencyHash,
+      riskGuardVerifiedHash: entryDecision.idempotencyHash,
+      timeframe: resolvedTf,
+      strategyId: 'ZERO_HOLD_LEAD_LAG_SCALP',
+      side: 'bid',
+      contracts: entryDecision.approvedContracts,
+      desiredYesPrice: entryPrice,
+      yesBidDollars: entryPrice,
+      yesAskDollars: Math.min(0.56, entryPrice + 0.02),
+      postOnly: true,
+      reduceOnly: false,
+      timeInForce: 'good_till_canceled',
+      cancelOrderOnPause: true,
+    });
+    if (!v2ScalpRes.ok) {
+      blockedCode = v2ScalpRes.statusLabel;
+      blockedReason = v2ScalpRes.statusLabel;
+      continue;
+    }
+
+    const contracts = entryDecision.approvedContracts;
     const tpTicks = zeroHoldScalpConfig.makerTakeProfitTicksCents / 100;
     const exitPrice =
       exitMode === 'POST_ONLY_MAKER_TP'
@@ -20840,7 +22301,7 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
     );
 
     const rec: ZeroHoldScalpExecutionRecord = {
-      scalpId: `zh-scalp-${totalZeroHoldScalpsCompleted}-${crypto.randomUUID().slice(0, 4)}-${row.seriesTicker.slice(2, 5).toLowerCase()}`,
+      scalpId: `zh-scalp-${entryDecision.idempotencyHash.slice(0, 8)}-${row.seriesTicker.slice(2, 5).toLowerCase()}`,
       timestamp: new Date().toISOString(),
       seriesTicker: row.seriesTicker,
       spotPair: row.spotPair,
@@ -20860,24 +22321,26 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
       heldInventoryAfterExit: 0,
       rationale:
         exitMode === 'POST_ONLY_MAKER_TP'
-          ? `${row.seriesTicker} (${row.spotToClobLatencyMs}ms <= ${zeroHoldScalpConfig.maxEntryLatencyMs}ms): filled ${contracts}x @ $${entryPrice.toFixed(2)} -> exited via resting post_only Maker TP @ $${exitPrice.toFixed(2)} ($0 fee) in ${holdSec}s; vaulted $${vaulted75.toFixed(2)} (75%), inventory = 0.`
-          : `${row.seriesTicker} (${row.spotToClobLatencyMs}ms): latency time-stop reached at ${holdSec}s; fired IoC reduce_only flatten @ $${exitPrice.toFixed(2)} (+$${netProfitUsd.toFixed(2)} net); inventory = 0.`,
+          ? `${row.seriesTicker} (${row.spotToClobLatencyMs}ms <= ${zeroHoldScalpConfig.maxEntryLatencyMs}ms · 3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}): filled ${contracts}x @ $${entryPrice.toFixed(2)} -> exited via resting post_only Maker TP @ $${exitPrice.toFixed(2)} ($0 fee) in ${holdSec}s; vaulted $${vaulted75.toFixed(2)} (75%), inventory = 0.`
+          : `${row.seriesTicker} (${row.spotToClobLatencyMs}ms · 3%Cap=$${entryDecision.settledCashCapUsd.toFixed(2)}): latency time-stop reached at ${holdSec}s; fired IoC reduce_only flatten @ $${exitPrice.toFixed(2)} (+$${netProfitUsd.toFixed(2)} net); inventory = 0.`,
     };
 
     recentZeroHoldScalpExecutions.unshift(rec);
     executedRecords.push(rec);
 
     executedOrders.unshift({
-      id: `ord-${rec.scalpId}`,
+      id: v2ScalpRes.exchangeOrderId ? `kalshi-${v2ScalpRes.exchangeOrderId}` : `ord-${rec.scalpId}`,
+      idempotencyKey: entryDecision.idempotencyHash,
+      notionalUsd: entryDecision.approvedNotionalUsd,
       timestamp: rec.timestamp,
       agentId: autonomousAgents[0]?.id || 'agent-btc-lead-lag',
       agentName: 'Zero-Hold Latency Lead-Lag Micro-Scalper',
       symbol: row.seriesTicker,
       venue: 'PREDICTION_MARKET',
-      side: 'SELL_YES',
+      side: 'BUY_YES',
       orderType: exitMode === 'POST_ONLY_MAKER_TP' ? 'LIMIT_OCO' : 'MARKET_IOC',
       quantity: contracts,
-      fillPrice: exitPrice,
+      fillPrice: entryPrice,
       stopLossPrice: Number(Math.max(0.05, entryPrice - 0.03).toFixed(2)),
       takeProfitPrice: exitPrice,
       regimeAtEntry: 'LOW_VOLATILITY_COMPRESSION',
@@ -20888,6 +22351,34 @@ app.post('/api/lead-lag/execute-zero-hold-scalp', async (req, res) => {
 
   if (recentZeroHoldScalpExecutions.length > 25) {
     recentZeroHoldScalpExecutions.length = 25;
+  }
+
+  if (executedRecords.length === 0 && blockedCode) {
+    if (anyDuplicateBlocked) {
+      return res.status(200).json({
+        status: 'DUPLICATE_ORDER_IDEMPOTENCY_BLOCK',
+        rejected: true,
+        duplicateBlocked: true,
+        code: blockedCode,
+        reason: blockedReason,
+        executedCount: 0,
+        executedScalps: [],
+        heldInventoryContracts: 0,
+        zeroHoldLeadLagState: buildZeroHoldLeadLagSystemState(),
+        profitLockState: globalProfitLockState,
+        cleanupAudit: playbookCleanupAudit,
+        orders: executedOrders,
+        portfolio: computePortfolioSummary(),
+      });
+    }
+    return res.status(400).json({
+      error: blockedReason,
+      rejected: true,
+      code: blockedCode,
+      reason: blockedReason,
+      executedCount: 0,
+      executedScalps: [],
+    });
   }
 
   res.json({
@@ -22174,12 +23665,14 @@ app.post('/api/meta-learning/run-closed-loop', async (_req, res) => {
   }
 });
 
-// Reset to Trade with the ~$100 ($92.75–$99.50) in Kalshi + Allocate All Remaining Funds Across Kalshi & Public.com ($128.13 Cash / $368.55 Equity)
+// Reset Kalshi & Allocate Accounts strictly from verified live balances (zero hardcoded balance fallbacks)
 async function resetTo100KalshiAndAllocateRemainingAccounts(options?: {
   preserveActiveRestingOrders?: boolean;
 }) {
-  // 1. Sync live Kalshi and Public.com ($128.13 cash / $368.55 equity)
-  await syncWithPublicApiGateway(false);
+  // 1. Sync live Kalshi and Public.com
+  if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+    await syncWithPublicApiGateway(false);
+  }
 
   // 2. On manual reset, cancel stale resting orders; on warm container boot, preserve valid in-window resting orders (90s recycler handles stale ones)
   const cancelledExchangeOrders = options?.preserveActiveRestingOrders
@@ -22189,10 +23682,10 @@ async function resetTo100KalshiAndAllocateRemainingAccounts(options?: {
   // 3. Purge duplicate or expired WORKING_OCO orders from the local execution ledger
   const purgedDuplicates = purgeDuplicateAndExpiredWorkingOrders();
 
-  // 4. Calibrate Kalshi $100.00 Bankroll & 75% Profit Vault Lock ($80.00 Active Working Sleeve + $20.00 Protected Vault Reserve)
-  const kalshiCash = Number((liveKalshiCashBalanceUsd ?? 100.00).toFixed(2));
-  const kalshiReserveVault = Number(Math.max(20.00, Number((kalshiCash - 80.00).toFixed(2))).toFixed(2));
-  const kalshiActiveWorking = Number(Math.max(20.0, kalshiCash - kalshiReserveVault).toFixed(2));
+  // 4. Read verified Kalshi & Public cash without hardcoded balance fallbacks
+  const kalshiCash = Number((liveKalshiCashBalanceUsd ?? 0).toFixed(2));
+  const kalshiReserveVault = Number(Math.max(0, Number((kalshiCash - 80.00).toFixed(2))).toFixed(2));
+  const kalshiActiveWorking = Number(Math.max(0, kalshiCash - kalshiReserveVault).toFixed(2));
 
   globalProfitLockState.realTimeRoiTriggerEnabled = true;
   globalProfitLockState.realTimeRoiTriggerPct = 6.0;
@@ -22208,8 +23701,8 @@ async function resetTo100KalshiAndAllocateRemainingAccounts(options?: {
   globalProfitLockState.lastEvaluatedAt = new Date().toISOString();
 
   // 5. Update base strategy labels and non-15m Public.com allocations before running Closed-Loop Meta-Learning Bandit Cycle
-  const publicCash = Number((livePublicCashBalance ?? 128.13).toFixed(2));
-  const publicEquity = Number((livePublicEquity ?? 368.55).toFixed(2));
+  const publicCash = Number((livePublicCashOnlyBuyingPower ?? livePublicCashBalance ?? 0).toFixed(2));
+  const publicEquity = Number((livePublicEquity ?? 0).toFixed(2));
   const dynamicMaxContracts = getDynamicProfitScaledMaxContracts();
   const dynamicMaxNotionalUsd = Number((dynamicMaxContracts * 0.58).toFixed(2));
 
@@ -22349,13 +23842,18 @@ async function resetTo100KalshiAndAllocateRemainingAccounts(options?: {
     },
   ];
 
+  const resetDigest = crypto
+    .createHash('sha256')
+    .update(`reset:${kalshiCash}:${publicCash}:${purgedDuplicates.purgedCount}`)
+    .digest('hex')
+    .slice(0, 6);
   globalProfitLockState.recentEvents.unshift({
-    id: `pl-reset-100-${Date.now().toString().slice(-5)}`,
+    id: `pl-reset-${resetDigest}`,
     timestamp: new Date().toISOString(),
     triggerType: 'PROFIT_VAULT_75PCT_SWEEP',
     symbol: 'KALSHI-$100-META-LEARNING-RESET',
     venue: 'PREDICTION_MARKET',
-    orderId: `reset-alloc-${Date.now().toString().slice(-5)}`,
+    orderId: `reset-alloc-${resetDigest}`,
     entryPrice: 0.56,
     observedPrice: 0.64,
     peakHighWaterMarkPrice: 0.64,
@@ -22491,11 +23989,15 @@ async function runCloudAutonomousDaemonTick(options?: {
     cloudDaemonTelemetry.totalPulsesRun += 1;
 
     // 1. Refresh live Coinbase spot ticks + 5m OHLCV candles (BTC, ETH, SOL, XRP, DOGE) and Kalshi L2 orderbooks
-    await syncRealMarketBarsAndKalshi(options?.forceSyncBars ?? true).catch(() => {});
+    if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+      await syncRealMarketBarsAndKalshi(options?.forceSyncBars ?? true).catch(() => {});
+    }
     cloudDaemonTelemetry.lastDataSyncAt = new Date().toISOString();
 
     // 2. Sync Public.com brokerage account & Kalshi portfolio
-    await syncWithPublicApiGateway(false).catch(() => {});
+    if (process.env.QUANTPULSE_TEST_MODE !== 'true') {
+      await syncWithPublicApiGateway(false).catch(() => {});
+    }
 
     // 3. Run Closed-Loop Meta-Learning Bandit Cycle & auto-tune all 13 agents
     const metaLearning = await runClosedLoopMetaLearningCycle().catch(() => lastMetaLearningSummary);
@@ -22536,8 +24038,44 @@ async function runCloudAutonomousDaemonTick(options?: {
         row.netMakerEdgeBps >= 150
     );
     for (const targetRow of goldilocksTargets) {
-      const contracts = Math.min(28, targetRow.recommendedContracts);
-      const entryPrice = targetRow.yesBidDollars;
+      const entryPrice = Math.max(0.44, Math.min(0.56, targetRow.yesBidDollars));
+      const daemonDecision = riskGuard.evaluateEntryOrder({
+        venue: 'KALSHI',
+        symbol: targetRow.seriesTicker,
+        side: 'BUY_YES',
+        strategyId: 'CLOUD_DAEMON_ZERO_HOLD_SCALP',
+        timeframe: '5m',
+        requestedNotionalUsd: targetRow.recommendedContracts * entryPrice,
+        unitPriceUsd: entryPrice,
+        isIntegerContracts: true,
+        settledCash: getKalshiSettledCashSnapshot(),
+        killSwitchActive: globalKillSwitchActive,
+      });
+      if (!daemonDecision.ok) {
+        continue;
+      }
+
+      const v2DaemonRes = await submitKalshiV2EventsOrder({
+        ticker: targetRow.seriesTicker,
+        idempotencySeed: daemonDecision.idempotencyHash,
+        riskGuardVerifiedHash: daemonDecision.idempotencyHash,
+        timeframe: '5m',
+        strategyId: 'CLOUD_DAEMON_ZERO_HOLD_SCALP',
+        side: 'bid',
+        contracts: daemonDecision.approvedContracts,
+        desiredYesPrice: entryPrice,
+        yesBidDollars: entryPrice,
+        yesAskDollars: Math.min(0.56, entryPrice + 0.02),
+        postOnly: true,
+        reduceOnly: false,
+        timeInForce: 'good_till_canceled',
+        cancelOrderOnPause: true,
+      });
+      if (!v2DaemonRes.ok) {
+        continue;
+      }
+
+      const contracts = daemonDecision.approvedContracts;
       const exitPrice = Number(
         Math.min(0.98, entryPrice + zeroHoldScalpConfig.makerTakeProfitTicksCents / 100).toFixed(2)
       );
@@ -22558,7 +24096,7 @@ async function runCloudAutonomousDaemonTick(options?: {
       );
 
       const autoRec: ZeroHoldScalpExecutionRecord = {
-        scalpId: `zh-auto-${totalZeroHoldScalpsCompleted}-${crypto.randomUUID().slice(0, 4)}-${targetRow.seriesTicker.slice(2, 5).toLowerCase()}`,
+        scalpId: `zh-auto-${daemonDecision.idempotencyHash.slice(0, 8)}-${targetRow.seriesTicker.slice(2, 5).toLowerCase()}`,
         timestamp: new Date().toISOString(),
         seriesTicker: targetRow.seriesTicker,
         spotPair: targetRow.spotPair,
@@ -22576,7 +24114,7 @@ async function runCloudAutonomousDaemonTick(options?: {
         vaulted75PctUsd: vaulted75,
         reinvested25PctFloatUsd: float25,
         heldInventoryAfterExit: 0,
-        rationale: `[AUTO DAEMON · ATR ${targetRow.atrBaselineMultiplier.toFixed(2)}x GOLDILOCKS · UCB1 ${targetRow.ucbScore.toFixed(3)}] ${targetRow.seriesTicker} (${targetRow.spotToClobLatencyMs}ms <= 250ms): ${contracts}x @ $${entryPrice.toFixed(2)} -> Maker TP @ $${exitPrice.toFixed(2)} (+$${netProfitUsd.toFixed(2)} net, 75% vaulted, inventory = 0).`,
+        rationale: `[AUTO DAEMON · 3%Cap=$${daemonDecision.settledCashCapUsd.toFixed(2)} · ATR ${targetRow.atrBaselineMultiplier.toFixed(2)}x GOLDILOCKS · UCB1 ${targetRow.ucbScore.toFixed(3)}] ${targetRow.seriesTicker} (${targetRow.spotToClobLatencyMs}ms <= 250ms): ${contracts}x @ $${entryPrice.toFixed(2)} -> Maker TP @ $${exitPrice.toFixed(2)} (+$${netProfitUsd.toFixed(2)} net, 75% vaulted, inventory = 0).`,
       };
       recentZeroHoldScalpExecutions.unshift(autoRec);
       cloudDaemonTelemetry.totalOrdersRoutedByDaemon += 1;
@@ -22753,6 +24291,13 @@ export {
   runCloudAutonomousDaemonTick,
   computePortfolioSummary,
   executionVault,
+  riskGuard,
+  submitKalshiV2EventsOrder,
+  submitPublicOrderWithExponentialRetry,
+  submitSingleKalshiSellOrder,
+  executeLiveKalshiHftPulse,
+  executeLivePublicBrokeragePulse,
+  placePublicTakeProfitSellOrders,
   evaluatePortfolioCorrelationAndCap,
   getLossFraction,
   evaluateRegimeAndLiquidity,

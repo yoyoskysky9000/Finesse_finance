@@ -36,3 +36,4 @@
 
 - [ ] **TASK-05 `[SANDBOX]`**: Run walk-forward out-of-sample verification on `2.7.0-LEAD-LAG-LIVE-CHAMPION` over live Coinbase/Kalshi 5m & 15m datasets and populate numeric metrics in `champion_config.json`.
 
+- [x] **TASK-14 `[VAULT-FIX]`**: Create `src/server/riskGuard.ts` (`TASK-02` design) enforcing deterministic SHA-256 `symbol:side:strategy_id:time_bucket` bucket locks (`90s`/`5m=900s`/`15m=2700s`/`1h=14400s`, SQLite WAL + JSON persisted), fail-closed settled-cash verification (`BALANCE_UNVERIFIED_BLOCK` on missing/`!syncOk`/`>60s` stale), mandatory default-on 3% settled-cash sizing cap (never equity/buying power), and Rule 3 pre-exit sweep (`CancelAllOpenOrders` -> confirm 0 open resting -> exact settled qty close); route secondary `server.ts` live execution paths through `riskGuard`, purge `Date.now()` idempotency seeds and hardcoded balance fallbacks across secondary routes, and add secondary-route smoke assertions to `tests/smoke.test.ts`.
