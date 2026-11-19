@@ -125,6 +125,7 @@
   },
   "lead_lag_triggers": {
     "version": "2.7.0-LEAD-LAG-LIVE-CHAMPION",
+    "mode": "shadow",
     "envelope": "2.6.0-PORTFOLIO-GUARD-CHAMPION",
     "envelope_gates": {
       "chop_14_max": 50.0,

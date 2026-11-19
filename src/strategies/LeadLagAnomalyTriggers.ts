@@ -67,6 +67,8 @@ export interface Svb60TriggerInput {
   fairValueProb: number;
   /** Live Kalshi contract ask price in dollars [0.01, 0.99] */
   kalshiAskDollars: number;
+  /** Optional 14-bar probability ATR in dollars for single-drag hurdle max(0.18, 0.12 + 1.1 * atr14ProbUsd) */
+  atr14ProbUsd?: number;
   /** Minutes remaining until 15m contract settlement */
   minutesRemaining: number;
   /** Spot feed telemetry latency (ms) */
@@ -91,6 +93,8 @@ export interface Svb60EvaluationResult {
   kalshiAskMove10sDollars: number;
   kalshiAskMovePassed: boolean;
   fvMinusAskDollars: number;
+  netEdgeAfterDragDollars: number;
+  requiredGrossEdgeDollars: number;
   fvEdgePassed: boolean;
   windowMinutesPassed: boolean;
   settledCashCapFraction: 0.03;
@@ -130,6 +134,8 @@ export interface Gkx5TriggerInput {
   fairValueProb: number;
   /** Live Kalshi contract ask price in dollars [0.01, 0.99] */
   kalshiAskDollars: number;
+  /** Optional 14-bar probability ATR in dollars for single-drag hurdle max(0.18, 0.12 + 1.1 * atr14ProbUsd) */
+  atr14ProbUsd?: number;
   /** 5m candle finalization latency (ms) */
   candleFinalizationLatencyMs: number;
   /** Kalshi CLOB feed latency (ms) */
@@ -163,6 +169,8 @@ export interface Gkx5EvaluationResult {
   deltaFvProjDollars: number;
   deltaFvProjPassed: boolean;
   fvMinusAskDollars: number;
+  netEdgeAfterDragDollars: number;
+  requiredGrossEdgeDollars: number;
   fvEdgePassed: boolean;
   settledCashCapFraction: 0.03;
   stopLossDeltaDollars: number;
@@ -198,6 +206,8 @@ export interface XvdTriggerInput {
   leadingVenueProb?: number;
   /** Lagging venue executable ask price in dollars [0.01, 0.99] */
   laggingVenueAskDollars: number;
+  /** Optional 14-bar probability ATR in dollars for single-drag hurdle max(0.18, 0.12 + 1.1 * atr14ProbUsd) */
+  atr14ProbUsd?: number;
   /** Individual feed latencies (ms): any feed > 1000ms trips breaker */
   kalshiLatencyMs: number;
   polymarketLatencyMs: number;
@@ -220,6 +230,8 @@ export interface XvdEvaluationResult {
   spotToLeadingVenueGapDollars: number;
   spotConfirmsLeadingVenue: boolean;
   fvMinusLaggingAskDollars: number;
+  netEdgeAfterDragDollars: number;
+  requiredGrossEdgeDollars: number;
   fvEdgePassed: boolean;
   settledCashCapFraction: 0.015;
   direction: 'BUY_YES' | 'BUY_NO';
@@ -300,7 +312,74 @@ export const LEAD_LAG_DEFAULT_CONFIG = {
     maxAnyFeedLatencyMs: 1000,
     maxInterVenueSkewMs: 500,
   },
+  edgeGate: {
+    stressedDragFloorUsd: 0.12 as const,
+    minGrossEdgeFloorUsd: 0.18 as const,
+    minNetEdgeAfterDragFloorUsd: 0.06 as const,
+    atrMultiplier: 1.1 as const,
+  },
 } as const;
+
+export const STRESSED_DRAG_FLOOR_USD = 0.12 as const;
+export const MIN_GROSS_EDGE_FLOOR_USD = 0.18 as const;
+export const MIN_NET_EDGE_AFTER_DRAG_FLOOR_USD = 0.06 as const;
+export const EDGE_ATR_MULTIPLIER = 1.1 as const;
+
+export interface SingleDragEdgeGateResult {
+  grossEdgeDollars: number;
+  stressedDragDollars: number;
+  netEdgeAfterDragDollars: number;
+  requiredGrossEdgeDollars: number;
+  requiredNetEdgeAfterDragDollars: number;
+  atr14ProbUsd: number;
+  passed: boolean;
+}
+
+/**
+ * SECTION-74-FIX: Single drag deduction net-edge gate.
+ * Charges the $0.12/contract stressed drag floor exactly once:
+ *   grossEdge = FV - ask
+ *   pass <=> grossEdge >= Math.max(0.18, 0.12 + 1.1 * atr14ProbUsd)
+ *   equiv <=> netEdgeAfterDrag = grossEdge - 0.12 >= Math.max(0.06, 1.1 * atr14ProbUsd)
+ * When explicit reserves exceed $0.12, the higher reserve is deducted once without double-counting.
+ */
+export function evaluateSingleDragEdgeGate(
+  fairValueProb: number,
+  askDollars: number,
+  atr14ProbUsd: number = 0,
+  stressedDragUsd: number = STRESSED_DRAG_FLOOR_USD,
+): SingleDragEdgeGateResult {
+  const safeAtr = Number.isFinite(atr14ProbUsd) && atr14ProbUsd > 0 ? atr14ProbUsd : 0;
+  const safeDrag =
+    Number.isFinite(stressedDragUsd) && stressedDragUsd > STRESSED_DRAG_FLOOR_USD
+      ? stressedDragUsd
+      : STRESSED_DRAG_FLOOR_USD;
+
+  const grossEdgeDollars = Number((fairValueProb - askDollars).toFixed(6));
+  const netEdgeAfterDragDollars = Number((grossEdgeDollars - safeDrag).toFixed(6));
+  const requiredNetEdgeAfterDragDollars = Number(
+    Math.max(MIN_NET_EDGE_AFTER_DRAG_FLOOR_USD, EDGE_ATR_MULTIPLIER * safeAtr).toFixed(6),
+  );
+  const requiredGrossEdgeDollars = Number(
+    (safeDrag + requiredNetEdgeAfterDragDollars).toFixed(6),
+  );
+
+  const passed =
+    Number.isFinite(grossEdgeDollars) &&
+    Number.isFinite(netEdgeAfterDragDollars) &&
+    grossEdgeDollars >= requiredGrossEdgeDollars - 1e-9 &&
+    netEdgeAfterDragDollars >= requiredNetEdgeAfterDragDollars - 1e-9;
+
+  return {
+    grossEdgeDollars,
+    stressedDragDollars: safeDrag,
+    netEdgeAfterDragDollars,
+    requiredGrossEdgeDollars,
+    requiredNetEdgeAfterDragDollars,
+    atr14ProbUsd: safeAtr,
+    passed,
+  };
+}
 
 /**
  * Computes deterministic 900s idempotency key for a Lead-Lag trigger:
@@ -492,11 +571,16 @@ export function evaluateSvb60Trigger(input: Svb60TriggerInput): Svb60EvaluationR
     );
   }
 
-  const fvMinusAskDollars = Number((input.fairValueProb - input.kalshiAskDollars).toFixed(4));
-  const fvEdgePassed = Number.isFinite(fvMinusAskDollars) && fvMinusAskDollars >= 0.18 - 1e-9;
+  const edgeGate = evaluateSingleDragEdgeGate(
+    input.fairValueProb,
+    input.kalshiAskDollars,
+    input.atr14ProbUsd ?? 0,
+  );
+  const fvMinusAskDollars = Number(edgeGate.grossEdgeDollars.toFixed(4));
+  const fvEdgePassed = edgeGate.passed;
   if (!fvEdgePassed) {
     blockedReasons.push(
-      `SVB60_INSUFFICIENT_FV_EDGE: FV - ask = $${fvMinusAskDollars.toFixed(3)} < $0.18`,
+      `SVB60_INSUFFICIENT_FV_EDGE: grossEdge(FV-ask)=$${edgeGate.grossEdgeDollars.toFixed(3)} < required $${edgeGate.requiredGrossEdgeDollars.toFixed(3)} (netAfterDrag=$${edgeGate.netEdgeAfterDragDollars.toFixed(3)} < $${edgeGate.requiredNetEdgeAfterDragDollars.toFixed(3)})`,
     );
   }
 
@@ -533,12 +617,14 @@ export function evaluateSvb60Trigger(input: Svb60TriggerInput): Svb60EvaluationR
     kalshiAskMove10sDollars: absKalshiMove,
     kalshiAskMovePassed,
     fvMinusAskDollars,
+    netEdgeAfterDragDollars: Number(edgeGate.netEdgeAfterDragDollars.toFixed(4)),
+    requiredGrossEdgeDollars: Number(edgeGate.requiredGrossEdgeDollars.toFixed(4)),
     fvEdgePassed,
     windowMinutesPassed,
     settledCashCapFraction: 0.03,
     blockedReasons,
     rationale: triggered
-      ? `SVB-60 FIRED (${direction}): z_v=[${previousZVelocity.toFixed(2)}, ${latestZVelocity.toFixed(2)}]>=2.75, |CB-Kraken|=$${dualVenueSpotSpreadUsd.toFixed(2)}<=$15, askMove=$${absKalshiMove.toFixed(3)}<=$0.01, FV-ask=$${fvMinusAskDollars.toFixed(2)}>=$0.18.`
+      ? `SVB-60 FIRED (${direction}): z_v=[${previousZVelocity.toFixed(2)}, ${latestZVelocity.toFixed(2)}]>=2.75, |CB-Kraken|=$${dualVenueSpotSpreadUsd.toFixed(2)}<=$15, askMove=$${absKalshiMove.toFixed(3)}<=$0.01, FV-ask=$${fvMinusAskDollars.toFixed(2)}>=$${edgeGate.requiredGrossEdgeDollars.toFixed(2)} (netAfterDrag=$${edgeGate.netEdgeAfterDragDollars.toFixed(2)}).`
       : `SVB-60 HOLD: ${blockedReasons.join('; ')}`,
   };
 }
@@ -637,10 +723,17 @@ export function evaluateGkx5Trigger(input: Gkx5TriggerInput): Gkx5EvaluationResu
     );
   }
 
-  const fvMinusAskDollars = Number((input.fairValueProb - input.kalshiAskDollars).toFixed(4));
-  const fvEdgePassed = Number.isFinite(fvMinusAskDollars) && fvMinusAskDollars >= 0.18 - 1e-9;
+  const edgeGate = evaluateSingleDragEdgeGate(
+    input.fairValueProb,
+    input.kalshiAskDollars,
+    input.atr14ProbUsd ?? 0,
+  );
+  const fvMinusAskDollars = Number(edgeGate.grossEdgeDollars.toFixed(4));
+  const fvEdgePassed = edgeGate.passed;
   if (!fvEdgePassed) {
-    blockedReasons.push(`GKX5_INSUFFICIENT_FV_EDGE: FV - ask = $${fvMinusAskDollars.toFixed(3)} < $0.18`);
+    blockedReasons.push(
+      `GKX5_INSUFFICIENT_FV_EDGE: grossEdge(FV-ask)=$${edgeGate.grossEdgeDollars.toFixed(3)} < required $${edgeGate.requiredGrossEdgeDollars.toFixed(3)} (netAfterDrag=$${edgeGate.netEdgeAfterDragDollars.toFixed(3)} < $${edgeGate.requiredNetEdgeAfterDragDollars.toFixed(3)})`,
+    );
   }
 
   const minute1StopTightening = evaluateGkx5Minute1StopTightening(
@@ -672,13 +765,15 @@ export function evaluateGkx5Trigger(input: Gkx5TriggerInput): Gkx5EvaluationResu
     deltaFvProjDollars: input.deltaFvProjDollars,
     deltaFvProjPassed,
     fvMinusAskDollars,
+    netEdgeAfterDragDollars: Number(edgeGate.netEdgeAfterDragDollars.toFixed(4)),
+    requiredGrossEdgeDollars: Number(edgeGate.requiredGrossEdgeDollars.toFixed(4)),
     fvEdgePassed,
     settledCashCapFraction: 0.03,
     stopLossDeltaDollars: minute1StopTightening.tightenedStopLossDeltaDollars,
     minute1StopTightening,
     blockedReasons,
     rationale: triggered
-      ? `GKX-5 FIRED (${direction}): R_GK=${resolvedRGk.toFixed(2)}>=1.60, z_v5=${input.zVelocity5m.toFixed(2)} (stable sign), deltaFV=$${input.deltaFvProjDollars.toFixed(2)}>=$0.24, FV-ask=$${fvMinusAskDollars.toFixed(2)}>=$0.18, SL=${minute1StopTightening.tightenedStopLossDeltaDollars.toFixed(2)}.`
+      ? `GKX-5 FIRED (${direction}): R_GK=${resolvedRGk.toFixed(2)}>=1.60, z_v5=${input.zVelocity5m.toFixed(2)} (stable sign), deltaFV=$${input.deltaFvProjDollars.toFixed(2)}>=$0.24, FV-ask=$${fvMinusAskDollars.toFixed(2)}>=$${edgeGate.requiredGrossEdgeDollars.toFixed(2)} (netAfterDrag=$${edgeGate.netEdgeAfterDragDollars.toFixed(2)}), SL=${minute1StopTightening.tightenedStopLossDeltaDollars.toFixed(2)}.`
       : `GKX-5 HOLD: ${blockedReasons.join('; ')}`,
   };
 }
@@ -763,13 +858,16 @@ export function evaluateXvdTrigger(input: XvdTriggerInput): XvdEvaluationResult 
     );
   }
 
-  const fvMinusLaggingAskDollars = Number(
-    (input.spotFairValueProb - input.laggingVenueAskDollars).toFixed(4),
+  const edgeGate = evaluateSingleDragEdgeGate(
+    input.spotFairValueProb,
+    input.laggingVenueAskDollars,
+    input.atr14ProbUsd ?? 0,
   );
-  const fvEdgePassed = Number.isFinite(fvMinusLaggingAskDollars) && fvMinusLaggingAskDollars >= 0.18 - 1e-9;
+  const fvMinusLaggingAskDollars = Number(edgeGate.grossEdgeDollars.toFixed(4));
+  const fvEdgePassed = edgeGate.passed;
   if (!fvEdgePassed) {
     blockedReasons.push(
-      `XVD_INSUFFICIENT_LAG_EDGE: FV - ask_lag = $${fvMinusLaggingAskDollars.toFixed(3)} < $0.18`,
+      `XVD_INSUFFICIENT_LAG_EDGE: grossEdge(FV-ask_lag)=$${edgeGate.grossEdgeDollars.toFixed(3)} < required $${edgeGate.requiredGrossEdgeDollars.toFixed(3)} (netAfterDrag=$${edgeGate.netEdgeAfterDragDollars.toFixed(3)} < $${edgeGate.requiredNetEdgeAfterDragDollars.toFixed(3)})`,
     );
   }
 
@@ -797,12 +895,14 @@ export function evaluateXvdTrigger(input: XvdTriggerInput): XvdEvaluationResult 
     spotToLeadingVenueGapDollars,
     spotConfirmsLeadingVenue,
     fvMinusLaggingAskDollars,
+    netEdgeAfterDragDollars: Number(edgeGate.netEdgeAfterDragDollars.toFixed(4)),
+    requiredGrossEdgeDollars: Number(edgeGate.requiredGrossEdgeDollars.toFixed(4)),
     fvEdgePassed,
     settledCashCapFraction: 0.015,
     direction,
     blockedReasons,
     rationale: triggered
-      ? `XVD FIRED (${direction}, half-cap 1.5% settled cash): |P_K-P_PM|>=$${minObservedDivergenceDollars.toFixed(2)} across ${snapshotCount} snaps (${persistenceDurationMs}ms), |FV-lead|=$${spotToLeadingVenueGapDollars.toFixed(3)}<=$0.03, FV-ask_lag=$${fvMinusLaggingAskDollars.toFixed(2)}>=$0.18.`
+      ? `XVD FIRED (${direction}, half-cap 1.5% settled cash): |P_K-P_PM|>=$${minObservedDivergenceDollars.toFixed(2)} across ${snapshotCount} snaps (${persistenceDurationMs}ms), |FV-lead|=$${spotToLeadingVenueGapDollars.toFixed(3)}<=$0.03, FV-ask_lag=$${fvMinusLaggingAskDollars.toFixed(2)}>=$${edgeGate.requiredGrossEdgeDollars.toFixed(2)} (netAfterDrag=$${edgeGate.netEdgeAfterDragDollars.toFixed(2)}).`
       : `XVD HOLD: ${blockedReasons.join('; ')}`,
   };
 }
@@ -834,9 +934,10 @@ export interface Snapshot {
   crossSourceSkewMs?: number;
   clockOffsetMs?: number;
 
-  // 2. Net Edge After Reserves Floor (fv - ask >= 0.18)
+  // 2. Single-Drag Net Edge Floor (grossEdge >= max(0.18, 0.12 + 1.1 * atr14ProbUsd); netAfterDrag >= max(0.06, 1.1 * atr14ProbUsd))
   fv: number;
   ask: number;
+  atr14ProbUsd?: number;
   feesPerShare?: number;
   slippagePerShare?: number;
   modelReservePerShare?: number;
@@ -903,16 +1004,22 @@ export function evaluateOrderFlowToxicityAndBasis(
   s: Snapshot,
 ): OrderFlowToxicityAndBasisVerdict {
   const trigger: LeadLagTriggerId = s.trigger ?? 'SVB-60';
-  const rawEdge = Number((s.fv - s.ask).toFixed(6));
-  const netEdgeAfterReserves = Number(
-    (
-      s.fv -
-      s.ask -
-      (s.feesPerShare ?? 0) -
-      (s.slippagePerShare ?? 0) -
-      (s.modelReservePerShare ?? 0)
-    ).toFixed(6),
+  const explicitReservesUsd =
+    (s.feesPerShare ?? 0) + (s.slippagePerShare ?? 0) + (s.modelReservePerShare ?? 0);
+  const effectiveDragUsd = Math.max(
+    STRESSED_DRAG_FLOOR_USD,
+    Number.isFinite(explicitReservesUsd) && explicitReservesUsd > 0
+      ? explicitReservesUsd
+      : STRESSED_DRAG_FLOOR_USD,
   );
+  const edgeGate = evaluateSingleDragEdgeGate(
+    s.fv,
+    s.ask,
+    s.atr14ProbUsd ?? 0,
+    effectiveDragUsd,
+  );
+  const rawEdge = edgeGate.grossEdgeDollars;
+  const netEdgeAfterReserves = edgeGate.netEdgeAfterDragDollars;
 
   const reject = (code: string): OrderFlowToxicityAndBasisVerdict => ({
     allowed: false,
@@ -946,13 +1053,8 @@ export function evaluateOrderFlowToxicityAndBasis(
     return reject('STALE_OR_UNALIGNED');
   }
 
-  // 2. Net Edge After Reserves Floor (fv - ask >= 0.18)
-  if (
-    !Number.isFinite(rawEdge) ||
-    rawEdge < 0.18 - 1e-9 ||
-    !Number.isFinite(netEdgeAfterReserves) ||
-    netEdgeAfterReserves < 0.18 - 1e-9
-  ) {
+  // 2. Single-Drag Net Edge Floor (deducts $0.12 stressed drag once, never double-counted)
+  if (!edgeGate.passed) {
     return reject('EDGE_BELOW_FLOOR');
   }
 
@@ -1120,9 +1222,25 @@ export function evaluateOrderFlowToxicityAndBasis(
 export function evaluateLeadLagAnomalyTriggers(
   input: LeadLagCombinedEvaluationInput,
 ): LeadLagCombinedEvaluationResult {
-  const svb60Result = input.svb60 ? evaluateSvb60Trigger(input.svb60) : undefined;
-  const gkx5Result = input.gkx5 ? evaluateGkx5Trigger(input.gkx5) : undefined;
-  const xvdResult = input.xvd ? evaluateXvdTrigger(input.xvd) : undefined;
+  const envelopeAtr = input.envelope.atrDollar;
+  const svb60Result = input.svb60
+    ? evaluateSvb60Trigger({
+        ...input.svb60,
+        atr14ProbUsd: input.svb60.atr14ProbUsd ?? envelopeAtr,
+      })
+    : undefined;
+  const gkx5Result = input.gkx5
+    ? evaluateGkx5Trigger({
+        ...input.gkx5,
+        atr14ProbUsd: input.gkx5.atr14ProbUsd ?? envelopeAtr,
+      })
+    : undefined;
+  const xvdResult = input.xvd
+    ? evaluateXvdTrigger({
+        ...input.xvd,
+        atr14ProbUsd: input.xvd.atr14ProbUsd ?? envelopeAtr,
+      })
+    : undefined;
 
   const triggeredIds: LeadLagTriggerId[] = [];
   if (svb60Result?.triggered) triggeredIds.push('SVB-60');

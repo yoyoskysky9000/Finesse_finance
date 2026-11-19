@@ -188,6 +188,8 @@ export interface RegimeAndLiquidityVerdict {
   regimeFlipPause: boolean;
   adxPause: boolean;
   entryEdgeRequiredUsd: number;
+  requiredGrossEdgeUsd: number;
+  observedGrossEdgeUsd: number;
   observedNetEdgeUsd: number;
   metrics: RegimeMetricsSnapshot;
   liquidity: LiquidityHealthResult;
@@ -464,17 +466,29 @@ export function evaluateRegimeAndLiquidity(
   const blockReasons: string[] = [];
   const pauseReasons: string[] = [];
 
-  // Entry edge & gate checks
-  const entryEdgeRequiredUsd = Number(
+  // Entry edge & gate checks (SECTION-74-FOLLOWUP: single drag deduction matching LeadLagAnomalyTriggers)
+  // grossEdge = FV - ask; pass requires grossEdge >= max(0.18, 0.12 + 1.1 * atr14Usd)
+  // equivalently netEdgeAfterDrag = grossEdge - dragFloor >= max(0.06, 1.1 * atr14Usd)
+  const safeAtr14Usd = Number.isFinite(input.atr14Usd) && input.atr14Usd > 0 ? input.atr14Usd : 0;
+  const dragFloor = Math.max(
+    entryCfg.drag_floor_usd,
+    typeof input.dragUsd === 'number' && Number.isFinite(input.dragUsd)
+      ? input.dragUsd
+      : entryCfg.drag_floor_usd
+  );
+  const minNetEdgeAfterDragFloorUsd = 0.06; // $0.18 gross floor minus $0.12 stressed drag floor
+  const requiredNetEdgeAfterDragUsd = Number(
     Math.max(
-      entryCfg.min_edge_floor_usd,
-      entryCfg.min_edge_base_usd + entryCfg.min_edge_atr_mult * Math.max(0, input.atr14Usd)
-    ).toFixed(4)
+      minNetEdgeAfterDragFloorUsd,
+      entryCfg.min_edge_atr_mult * safeAtr14Usd
+    ).toFixed(6)
   );
-  const dragFloor = Math.max(entryCfg.drag_floor_usd, input.dragUsd ?? entryCfg.drag_floor_usd);
-  const observedNetEdgeUsd = Number(
-    (input.fairValueUsd - input.askPriceUsd - dragFloor).toFixed(4)
+  const requiredGrossEdgeUsd = Number(
+    (dragFloor + requiredNetEdgeAfterDragUsd).toFixed(6)
   );
+  const observedGrossEdgeUsd = Number((input.fairValueUsd - input.askPriceUsd).toFixed(6));
+  const observedNetEdgeUsd = Number((observedGrossEdgeUsd - dragFloor).toFixed(6));
+  const entryEdgeRequiredUsd = Number(requiredNetEdgeAfterDragUsd.toFixed(4));
 
   if (
     input.askPriceUsd < entryCfg.ask_gate[0] ||
@@ -492,9 +506,14 @@ export function evaluateRegimeAndLiquidity(
       `Window T-${input.minutesRemaining.toFixed(1)}m outside [${entryCfg.window_minutes[0]}, ${entryCfg.window_minutes[1]}]m`
     );
   }
-  if (observedNetEdgeUsd < entryEdgeRequiredUsd) {
+  const edgeGatePassed =
+    Number.isFinite(observedGrossEdgeUsd) &&
+    Number.isFinite(observedNetEdgeUsd) &&
+    observedGrossEdgeUsd >= requiredGrossEdgeUsd - 1e-9 &&
+    observedNetEdgeUsd >= requiredNetEdgeAfterDragUsd - 1e-9;
+  if (!edgeGatePassed) {
     blockReasons.push(
-      `Net edge $${observedNetEdgeUsd.toFixed(4)} (after $${dragFloor.toFixed(2)} drag floor) < required $${entryEdgeRequiredUsd.toFixed(4)}`
+      `Edge below floor: gross $${observedGrossEdgeUsd.toFixed(4)} < required $${requiredGrossEdgeUsd.toFixed(4)} (net $${observedNetEdgeUsd.toFixed(4)} after $${dragFloor.toFixed(2)} drag < required $${requiredNetEdgeAfterDragUsd.toFixed(4)})`
     );
   }
 
@@ -553,7 +572,9 @@ export function evaluateRegimeAndLiquidity(
     regimeFlipPause,
     adxPause,
     entryEdgeRequiredUsd,
-    observedNetEdgeUsd,
+    requiredGrossEdgeUsd: Number(requiredGrossEdgeUsd.toFixed(4)),
+    observedGrossEdgeUsd: Number(observedGrossEdgeUsd.toFixed(4)),
+    observedNetEdgeUsd: Number(observedNetEdgeUsd.toFixed(4)),
     metrics,
     liquidity,
     blockReasons,

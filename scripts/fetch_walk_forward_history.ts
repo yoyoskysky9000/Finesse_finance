@@ -38,12 +38,50 @@ export const PURGE_BARS_5M = PURGE_GAP_MINUTES / 5; // 12 bars
 export const OOS_BARS_5M = (OOS_DAYS * 24 * 60) / 5; // 2,016 bars
 export const TOTAL_BARS_5M = TRAIN_BARS_5M + PURGE_BARS_5M + OOS_BARS_5M; // 10,668 bars
 
+export const INSUFFICIENT_REAL_HISTORY_CODE = 'INSUFFICIENT_REAL_HISTORY' as const;
+
 const COINBASE_CANDLES_URL = 'https://api.exchange.coinbase.com/products/BTC-USD/candles';
 const KALSHI_BASE_URLS = [
   'https://api.elections.kalshi.com/trade-api/v2',
   'https://trading-api.kalshi.com/trade-api/v2',
 ];
 const KALSHI_SERIES_TICKER = 'KXBTC15M';
+
+export interface InsufficientHistoryGap {
+  code: typeof INSUFFICIENT_REAL_HISTORY_CODE;
+  source: 'COINBASE' | 'KALSHI' | 'ALIGNMENT';
+  ticker: string;
+  windowStartIso: string;
+  windowEndIso: string;
+  expectedBars: number;
+  observedBars: number;
+  missingBars: number;
+  detail: string;
+}
+
+export class InsufficientRealHistoryError extends Error {
+  readonly code = INSUFFICIENT_REAL_HISTORY_CODE;
+  readonly ticker: string;
+  readonly gaps: InsufficientHistoryGap[];
+  readonly generatedBarsCount = 0;
+
+  constructor(ticker: string, gaps: InsufficientHistoryGap[], message?: string) {
+    const summary =
+      message ??
+      `${INSUFFICIENT_REAL_HISTORY_CODE} [${ticker}]: ${gaps
+        .map((g) => `${g.source}:${g.ticker} (${g.observedBars}/${g.expectedBars}, missing=${g.missingBars} — ${g.detail})`)
+        .join('; ')}`;
+    super(summary);
+    this.name = 'InsufficientRealHistoryError';
+    this.ticker = ticker;
+    this.gaps = gaps;
+  }
+}
+
+export interface FetchHistoryOptions {
+  fetchFn?: typeof fetch;
+  rateLimitDelayMs?: number;
+}
 
 export interface KalshiCandlestickBar {
   endPeriodTs: number;
@@ -57,6 +95,13 @@ export interface KalshiCandlestickBar {
   ticker: string;
 }
 
+export interface KalshiUniverseFetchResult {
+  candles: Map<number, KalshiCandlestickBar>;
+  tickersQueried: string[];
+  marketPagesFetched: number;
+  gaps: InsufficientHistoryGap[];
+}
+
 export interface AlignedWalkForwardBar extends OHLCVBar {
   tsSec: number;
   kalshiBidUsd: number;
@@ -64,7 +109,18 @@ export interface AlignedWalkForwardBar extends OHLCVBar {
   kalshiCloseUsd: number;
   kalshiVolume: number;
   kalshiTicker: string;
-  hasLiveKalshiCandle: boolean;
+  hasLiveKalshiCandle: true;
+  /** Optional real Polymarket probability if supplied by a real venue feed (never synthesized). */
+  polymarketProb?: number;
+}
+
+export interface AlignedWalkForwardResult {
+  status: 'OK' | typeof INSUFFICIENT_REAL_HISTORY_CODE;
+  code: 'OK' | typeof INSUFFICIENT_REAL_HISTORY_CODE;
+  alignedBars: AlignedWalkForwardBar[];
+  skippedSteps: number;
+  gaps: InsufficientHistoryGap[];
+  generatedBarsCount: 0;
 }
 
 export interface TriggerTradeRecord {
@@ -99,6 +155,7 @@ export interface WalkForwardWindowMetrics {
   period_start: string;
   period_end: string;
   bars_tested: number;
+  skipped_missing_quote_steps: number;
   trades: number;
   total_trades: number;
   net_return_pct: number;
@@ -113,7 +170,33 @@ export interface WalkForwardWindowMetrics {
   by_trigger: Record<LeadLagTriggerId, TriggerSummaryMetrics>;
 }
 
+export interface WalkForwardRunOptions extends FetchHistoryOptions {
+  startSec?: number;
+  endSec?: number;
+  requiredCoinbaseBars?: number;
+  requiredAlignedTrainBars?: number;
+  requiredAlignedOosBars?: number;
+  writeConfig?: boolean;
+  throwOnInsufficient?: boolean;
+}
+
+export interface WalkForwardRunResult {
+  status: 'COMPLETED' | typeof INSUFFICIENT_REAL_HISTORY_CODE;
+  code: 'OK' | typeof INSUFFICIENT_REAL_HISTORY_CODE;
+  generatedBarsCount: 0;
+  coinbaseBarsCount: number;
+  kalshiCandlesCount: number;
+  tickersQueriedCount: number;
+  alignedBarsCount: number;
+  skippedSteps: number;
+  gaps: InsufficientHistoryGap[];
+  baseline_metrics: WalkForwardWindowMetrics | null;
+  oos_metrics: WalkForwardWindowMetrics | null;
+  lead_lag_mode: 'shadow';
+}
+
 export function sleep(ms: number): Promise<void> {
+  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -164,12 +247,16 @@ export function normalCdf(x: number): number {
 
 /**
  * Fetches paginated 5-minute BTC-USD candles from Coinbase public REST
- * (`GET /products/BTC-USD/candles?granularity=300`) with 250ms rate-limit pacing.
+ * (`GET /products/BTC-USD/candles?granularity=300`) with rate-limit pacing.
+ * Returns strictly real exchange bars — never invents or backfills bars.
  */
 export async function fetchPaginatedCoinbase5mCandles(
   startSec: number,
-  endSec: number
+  endSec: number,
+  options: FetchHistoryOptions = {}
 ): Promise<OHLCVBar[]> {
+  const fetchImpl = options.fetchFn ?? fetch;
+  const paceMs = options.rateLimitDelayMs ?? RATE_LIMIT_DELAY_MS;
   const stepSeconds = COINBASE_MAX_BARS_PER_REQUEST * GRANULARITY_SECONDS;
   const byTimestamp = new Map<number, OHLCVBar>();
 
@@ -185,12 +272,12 @@ export async function fetchPaginatedCoinbase5mCandles(
     )}&end=${encodeURIComponent(endIso)}`;
 
     if (pageCount > 0) {
-      await sleep(RATE_LIMIT_DELAY_MS);
+      await sleep(paceMs);
     }
     pageCount += 1;
 
     try {
-      const response = await fetch(url, {
+      const response = await fetchImpl(url, {
         headers: {
           Accept: 'application/json',
           'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
@@ -216,7 +303,8 @@ export async function fetchPaginatedCoinbase5mCandles(
                 Number.isFinite(low) &&
                 Number.isFinite(close) &&
                 open > 0 &&
-                close > 0
+                close > 0 &&
+                high >= low
               ) {
                 byTimestamp.set(tsSec, {
                   timestamp: new Date(tsSec * 1000).toISOString(),
@@ -233,7 +321,7 @@ export async function fetchPaginatedCoinbase5mCandles(
         }
       }
     } catch {
-      // Continue pagination; missing pages handled after loop
+      // Fail closed after pagination completes: missing bars are recorded as INSUFFICIENT_REAL_HISTORY.
     }
 
     cursorStart = cursorEnd;
@@ -260,23 +348,40 @@ function parseKalshiDollarField(val: unknown, fallbackCentsVal?: unknown): numbe
 }
 
 /**
- * Fetches Kalshi `KXBTC15M` market candlesticks with 250ms rate-limit pacing.
+ * Fetches Kalshi `KXBTC15M` market candlesticks across the FULL requested universe
+ * (no artificial page or 40-ticker truncation cap) with rate-limit pacing.
+ * Never synthesizes missing bid/ask/close quotes — skips incomplete candlesticks
+ * and records `INSUFFICIENT_REAL_HISTORY` gaps with ticker and detail.
  */
 export async function fetchPaginatedKalshiKxbtc15mCandles(
   startSec: number,
-  endSec: number
-): Promise<Map<number, KalshiCandlestickBar>> {
+  endSec: number,
+  options: FetchHistoryOptions = {}
+): Promise<KalshiUniverseFetchResult> {
+  const fetchImpl = options.fetchFn ?? fetch;
+  const paceMs = options.rateLimitDelayMs ?? RATE_LIMIT_DELAY_MS;
   const candleMap = new Map<number, KalshiCandlestickBar>();
+  const gaps: InsufficientHistoryGap[] = [];
+  const queriedTickers: string[] = [];
+  let totalMarketPagesFetched = 0;
+
+  const windowStartIso = new Date(startSec * 1000).toISOString();
+  const windowEndIso = new Date(endSec * 1000).toISOString();
 
   for (const baseUrl of KALSHI_BASE_URLS) {
     try {
       let cursor: string | undefined;
-      const tickers: string[] = [];
+      const seenCursors = new Set<string>();
+      const tickerSet = new Set<string>();
       let marketPages = 0;
 
-      while (marketPages < 6) {
-        await sleep(RATE_LIMIT_DELAY_MS);
+      // Paginate the entire requested market universe without artificial truncation
+      while (true) {
+        if (marketPages > 0) {
+          await sleep(paceMs);
+        }
         marketPages += 1;
+        totalMarketPagesFetched += 1;
 
         const qs = new URLSearchParams({
           series_ticker: KALSHI_SERIES_TICKER,
@@ -284,13 +389,26 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
         });
         if (cursor) qs.set('cursor', cursor);
 
-        const mktRes = await fetch(`${baseUrl}/markets?${qs.toString()}`, {
+        const mktRes = await fetchImpl(`${baseUrl}/markets?${qs.toString()}`, {
           headers: {
             Accept: 'application/json',
             'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
           },
         });
-        if (!mktRes.ok) break;
+        if (!mktRes.ok) {
+          gaps.push({
+            code: INSUFFICIENT_REAL_HISTORY_CODE,
+            source: 'KALSHI',
+            ticker: KALSHI_SERIES_TICKER,
+            windowStartIso,
+            windowEndIso,
+            expectedBars: Math.max(1, Math.floor((endSec - startSec) / GRANULARITY_SECONDS)),
+            observedBars: candleMap.size,
+            missingBars: Math.max(1, Math.floor((endSec - startSec) / GRANULARITY_SECONDS)),
+            detail: `Kalshi markets pagination returned HTTP ${mktRes.status} on page ${marketPages} (${baseUrl})`,
+          });
+          break;
+        }
 
         const body = (await mktRes.json()) as {
           markets?: Array<{
@@ -313,21 +431,26 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
           if (Number.isFinite(closeMs)) {
             const closeSec = Math.floor(closeMs / 1000);
             if (closeSec >= startSec - 3600 && closeSec <= endSec + 3600) {
-              tickers.push(m.ticker);
+              tickerSet.add(m.ticker);
             }
           } else {
-            tickers.push(m.ticker);
+            tickerSet.add(m.ticker);
           }
         }
 
-        if (!body.cursor || markets.length === 0) break;
-        cursor = body.cursor;
+        const nextCursor = typeof body.cursor === 'string' && body.cursor.length > 0 ? body.cursor : undefined;
+        if (!nextCursor || markets.length === 0 || seenCursors.has(nextCursor)) {
+          break;
+        }
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
       }
 
-      const maxTickersToQuery = Math.min(tickers.length, 40);
-      for (let i = 0; i < maxTickersToQuery; i += 1) {
-        const ticker = tickers[i];
-        await sleep(RATE_LIMIT_DELAY_MS);
+      const uniqueTickers = Array.from(tickerSet);
+      for (let i = 0; i < uniqueTickers.length; i += 1) {
+        const ticker = uniqueTickers[i];
+        queriedTickers.push(ticker);
+        await sleep(paceMs);
 
         const candleQs = new URLSearchParams({
           period_interval: '5',
@@ -338,35 +461,55 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
           ticker
         )}/candlesticks?${candleQs.toString()}`;
 
-        const cRes = await fetch(candleUrl, {
+        const cRes = await fetchImpl(candleUrl, {
           headers: {
             Accept: 'application/json',
             'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
           },
         });
-        if (!cRes.ok) continue;
+        if (!cRes.ok) {
+          gaps.push({
+            code: INSUFFICIENT_REAL_HISTORY_CODE,
+            source: 'KALSHI',
+            ticker,
+            windowStartIso,
+            windowEndIso,
+            expectedBars: 1,
+            observedBars: 0,
+            missingBars: 1,
+            detail: `Kalshi candlesticks endpoint returned HTTP ${cRes.status} for ticker ${ticker}`,
+          });
+          continue;
+        }
 
         const cBody = (await cRes.json()) as {
           candlesticks?: Array<Record<string, unknown>>;
         };
         const sticks = Array.isArray(cBody.candlesticks) ? cBody.candlesticks : [];
+        let validForTicker = 0;
+        let incompleteForTicker = 0;
+
         for (const stick of sticks) {
           const endTs = Number(stick.end_period_ts ?? stick.start_period_ts ?? 0);
-          if (!Number.isFinite(endTs) || endTs <= 0) continue;
+          if (!Number.isFinite(endTs) || endTs <= 0) {
+            incompleteForTicker += 1;
+            continue;
+          }
           const alignedTs = Math.floor(endTs / GRANULARITY_SECONDS) * GRANULARITY_SECONDS;
 
           const yesBidObj = (stick.yes_bid ?? {}) as Record<string, unknown>;
           const yesAskObj = (stick.yes_ask ?? {}) as Record<string, unknown>;
           const priceObj = (stick.price ?? {}) as Record<string, unknown>;
 
-          const closePrice =
-            parseKalshiDollarField(priceObj.close_dollars, priceObj.close) ?? 0.58;
-          const yesBid =
-            parseKalshiDollarField(yesBidObj.close_dollars, yesBidObj.close) ??
-            Math.max(0.01, closePrice - 0.01);
-          const yesAsk =
-            parseKalshiDollarField(yesAskObj.close_dollars, yesAskObj.close) ??
-            Math.min(0.99, closePrice + 0.01);
+          const yesBid = parseKalshiDollarField(yesBidObj.close_dollars, yesBidObj.close);
+          const yesAsk = parseKalshiDollarField(yesAskObj.close_dollars, yesAskObj.close);
+          const closePrice = parseKalshiDollarField(priceObj.close_dollars, priceObj.close);
+
+          // Fail closed on missing real bid/ask/close quotes — never substitute defaults or +/- 0.01 estimates
+          if (yesBid === null || yesAsk === null || closePrice === null || yesBid > yesAsk) {
+            incompleteForTicker += 1;
+            continue;
+          }
 
           candleMap.set(alignedTs, {
             endPeriodTs: alignedTs,
@@ -379,8 +522,26 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
             priceLow:
               parseKalshiDollarField(priceObj.low_dollars, priceObj.low) ?? closePrice,
             priceClose: Number(closePrice.toFixed(4)),
-            volume: Number(stick.volume ?? 0),
+            volume: Number.isFinite(Number(stick.volume)) ? Number(stick.volume) : 0,
             ticker,
+          });
+          validForTicker += 1;
+        }
+
+        if (incompleteForTicker > 0 || validForTicker === 0) {
+          gaps.push({
+            code: INSUFFICIENT_REAL_HISTORY_CODE,
+            source: 'KALSHI',
+            ticker,
+            windowStartIso,
+            windowEndIso,
+            expectedBars: Math.max(1, sticks.length),
+            observedBars: validForTicker,
+            missingBars: Math.max(validForTicker === 0 ? 1 : 0, incompleteForTicker),
+            detail:
+              validForTicker === 0
+                ? `No complete real Kalshi bid/ask/close candlesticks returned for ${ticker}`
+                : `Skipped ${incompleteForTicker} candlesticks with missing real bid/ask/close quotes for ${ticker}`,
           });
         }
       }
@@ -388,60 +549,117 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
       if (candleMap.size > 0) {
         break;
       }
-    } catch {
-      // Try next Kalshi base URL if current endpoint fails
+    } catch (err) {
+      gaps.push({
+        code: INSUFFICIENT_REAL_HISTORY_CODE,
+        source: 'KALSHI',
+        ticker: KALSHI_SERIES_TICKER,
+        windowStartIso,
+        windowEndIso,
+        expectedBars: Math.max(1, Math.floor((endSec - startSec) / GRANULARITY_SECONDS)),
+        observedBars: candleMap.size,
+        missingBars: Math.max(1, Math.floor((endSec - startSec) / GRANULARITY_SECONDS)),
+        detail: `Kalshi request failed against ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`,
+      });
     }
   }
 
-  return candleMap;
+  return {
+    candles: candleMap,
+    tickersQueried: queriedTickers,
+    marketPagesFetched: totalMarketPagesFetched,
+    gaps,
+  };
 }
 
 /**
- * Aligns 5m Coinbase BTC-USD bars with Kalshi `KXBTC15M` candlesticks.
+ * Aligns strictly real 5m Coinbase BTC-USD bars with real Kalshi `KXBTC15M` candlesticks.
+ * Never synthesizes Kalshi bid/ask/close quotes from z-scores or any model.
+ * Any step missing a real Kalshi quote is skipped and recorded as `INSUFFICIENT_REAL_HISTORY`.
  */
-export function buildAlignedWalkForwardBars(
+export function alignRealWalkForwardBars(
   coinbaseBars: OHLCVBar[],
   kalshiCandles: Map<number, KalshiCandlestickBar>
-): AlignedWalkForwardBar[] {
-  const aligned: AlignedWalkForwardBar[] = [];
+): AlignedWalkForwardResult {
+  const alignedBars: AlignedWalkForwardBar[] = [];
+  const gaps: InsufficientHistoryGap[] = [];
+  let skippedSteps = 0;
+  let firstMissingTsSec: number | null = null;
+  let lastMissingTsSec: number | null = null;
 
   for (let i = 0; i < coinbaseBars.length; i += 1) {
     const bar = coinbaseBars[i];
     const tsSec = Math.floor(Date.parse(bar.timestamp) / 1000);
+    if (!Number.isFinite(tsSec) || tsSec <= 0) {
+      skippedSteps += 1;
+      continue;
+    }
     const roundedTs = Math.floor(tsSec / GRANULARITY_SECONDS) * GRANULARITY_SECONDS;
     const kalshiStick = kalshiCandles.get(roundedTs);
 
-    const prevBar = i >= 1 ? coinbaseBars[i - 1] : bar;
-    const ret5m = (bar.close - prevBar.close) / Math.max(1e-8, prevBar.close);
-    const gkVol = Math.max(1e-4, computeGarmanKlassVolatility(bar));
-    const zImp = Math.max(-3.5, Math.min(3.5, ret5m / gkVol));
+    if (
+      !kalshiStick ||
+      !Number.isFinite(kalshiStick.yesBidClose) ||
+      !Number.isFinite(kalshiStick.yesAskClose) ||
+      !Number.isFinite(kalshiStick.priceClose) ||
+      kalshiStick.yesBidClose <= 0 ||
+      kalshiStick.yesAskClose <= 0 ||
+      kalshiStick.yesBidClose > kalshiStick.yesAskClose
+    ) {
+      skippedSteps += 1;
+      if (firstMissingTsSec === null) firstMissingTsSec = roundedTs;
+      lastMissingTsSec = roundedTs;
+      continue;
+    }
 
-    // When a specific 5m Kalshi candlestick is not present in the API response,
-    // derive the lagging CLOB ask/bid from prior bar fair value inside the active 15m strike cycle.
-    const laggedClose = Number(
-      Math.max(0.08, Math.min(0.92, 0.5 + 0.065 * zImp)).toFixed(2)
-    );
-    const defaultBid = Number(Math.max(0.01, laggedClose - 0.01).toFixed(2));
-    const defaultAsk = Number(Math.min(0.99, laggedClose + 0.01).toFixed(2));
-
-    aligned.push({
+    alignedBars.push({
       ...bar,
       tsSec: roundedTs,
-      kalshiBidUsd: kalshiStick ? kalshiStick.yesBidClose : defaultBid,
-      kalshiAskUsd: kalshiStick ? kalshiStick.yesAskClose : defaultAsk,
-      kalshiCloseUsd: kalshiStick ? kalshiStick.priceClose : laggedClose,
-      kalshiVolume: kalshiStick ? kalshiStick.volume : Math.round(bar.volume * 12),
-      kalshiTicker:
-        kalshiStick?.ticker ??
-        `${KALSHI_SERIES_TICKER}-${new Date(roundedTs * 1000)
-          .toISOString()
-          .slice(0, 16)
-          .replace(/[-:T]/g, '')}`,
-      hasLiveKalshiCandle: Boolean(kalshiStick),
+      kalshiBidUsd: kalshiStick.yesBidClose,
+      kalshiAskUsd: kalshiStick.yesAskClose,
+      kalshiCloseUsd: kalshiStick.priceClose,
+      kalshiVolume: kalshiStick.volume,
+      kalshiTicker: kalshiStick.ticker,
+      hasLiveKalshiCandle: true,
     });
   }
 
-  return aligned;
+  if (skippedSteps > 0 || alignedBars.length === 0) {
+    const startIso =
+      firstMissingTsSec !== null
+        ? new Date(firstMissingTsSec * 1000).toISOString()
+        : coinbaseBars.length > 0
+          ? coinbaseBars[0].timestamp
+          : new Date(0).toISOString();
+    const endIso =
+      lastMissingTsSec !== null
+        ? new Date(lastMissingTsSec * 1000).toISOString()
+        : coinbaseBars.length > 0
+          ? coinbaseBars[coinbaseBars.length - 1].timestamp
+          : new Date(0).toISOString();
+
+    gaps.push({
+      code: INSUFFICIENT_REAL_HISTORY_CODE,
+      source: 'ALIGNMENT',
+      ticker: KALSHI_SERIES_TICKER,
+      windowStartIso: startIso,
+      windowEndIso: endIso,
+      expectedBars: coinbaseBars.length,
+      observedBars: alignedBars.length,
+      missingBars: skippedSteps > 0 ? skippedSteps : Math.max(1, coinbaseBars.length),
+      detail: `Skipped ${skippedSteps} steps lacking real ${KALSHI_SERIES_TICKER} bid/ask candlesticks; 0 synthetic quotes generated`,
+    });
+  }
+
+  const status = alignedBars.length > 0 && skippedSteps === 0 ? 'OK' : INSUFFICIENT_REAL_HISTORY_CODE;
+  return {
+    status,
+    code: status,
+    alignedBars,
+    skippedSteps,
+    gaps,
+    generatedBarsCount: 0,
+  };
 }
 
 export interface TrainCalibrationStats {
@@ -453,7 +671,7 @@ export interface TrainCalibrationStats {
 
 /**
  * Calibrates 30-day Time-of-Day Garman-Klass volatility medians and return std
- * strictly on the 30-day Train split (zero lookahead into Purge or OOS).
+ * strictly on the Train split (zero lookahead into Purge or OOS).
  */
 export function calibrateOnTrainWindow(
   trainBars: AlignedWalkForwardBar[]
@@ -517,13 +735,30 @@ export function calibrateOnTrainWindow(
   };
 }
 
+function computeProbabilityAtr14(historySlice: AlignedWalkForwardBar[]): number {
+  if (historySlice.length < 2) return 0;
+  const window = historySlice.slice(-15);
+  let sumTr = 0;
+  let count = 0;
+  for (let i = 1; i < window.length; i += 1) {
+    const curr = window[i];
+    const prev = window[i - 1];
+    const tr = Math.max(
+      Math.abs(curr.kalshiAskUsd - curr.kalshiBidUsd),
+      Math.abs(curr.kalshiCloseUsd - prev.kalshiCloseUsd)
+    );
+    if (Number.isFinite(tr)) {
+      sumTr += tr;
+      count += 1;
+    }
+  }
+  return count > 0 ? Number((sumTr / count).toFixed(6)) : 0;
+}
+
 /**
  * Evaluates a walk-forward window (Train or OOS) across `SVB-60`, `GKX-5`, and `XVD`
- * inside the `2.6.0-PORTFOLIO-GUARD-CHAMPION` envelope with:
- * - Exact Kalshi quadratic taker fee `Math.ceil(100 * 0.07 * C * P * (1 - P) - 1e-9) / 100`
- * - $0.00 maker fee for `MAKER_POST_ONLY`
- * - $0.12 stressed round-trip drag floor
- * - 900s deterministic idempotency cooldown
+ * strictly over real aligned Coinbase + Kalshi quotes inside the `2.6.0-PORTFOLIO-GUARD-CHAMPION`
+ * envelope with single-drag net-edge gating, exact Kalshi quadratic fee math, and 900s idempotency.
  */
 export function evaluateWalkForwardWindow(
   bars: AlignedWalkForwardBar[],
@@ -536,6 +771,7 @@ export function evaluateWalkForwardWindow(
   let peakEquityUsd = initialSettledCashUsd;
   let maxDrawdownPct = 0;
   let totalFeesUsd = 0;
+  let skippedMissingQuoteSteps = 0;
 
   const seenIdempotencyBuckets = new Set<string>();
   const trades: TriggerTradeRecord[] = [];
@@ -544,13 +780,27 @@ export function evaluateWalkForwardWindow(
   for (let i = 30; i < bars.length - 3; i += 1) {
     const bar = bars[i];
     const prevBar = bars[i - 1];
+
+    // Fail closed on any step without real Kalshi bid/ask quotes
+    if (
+      !bar.hasLiveKalshiCandle ||
+      !Number.isFinite(bar.kalshiAskUsd) ||
+      !Number.isFinite(bar.kalshiBidUsd) ||
+      bar.kalshiAskUsd <= 0 ||
+      bar.kalshiBidUsd <= 0 ||
+      bar.kalshiBidUsd > bar.kalshiAskUsd
+    ) {
+      skippedMissingQuoteSteps += 1;
+      barReturns.push(0);
+      continue;
+    }
+
     const historySlice = bars.slice(Math.max(0, i - 60), i + 1);
 
-    // Compute trailing 14-bar CHOP and ADX on 5m candles
-    const rawChop14 = computeChop14(historySlice, 14);
-    const rawAdx14 = computeWilderAdx(historySlice, 14);
-    const chop14 = Math.min(48.5, rawChop14);
-    const adx14 = Math.max(25.5, rawAdx14);
+    // Compute real trailing 14-bar CHOP and ADX on 5m candles (never artificially clamped)
+    const chop14 = computeChop14(historySlice, 14);
+    const adx14 = computeWilderAdx(historySlice, 14);
+    const atr14ProbUsd = computeProbabilityAtr14(historySlice);
 
     // Rolling 14-bar return volatility for z-score standardization
     const recentLogRets: number[] = [];
@@ -591,39 +841,44 @@ export function evaluateWalkForwardWindow(
     const rawFvYes = normalCdf(d2);
     const effectiveFv =
       direction === 'BUY_YES'
-        ? Math.max(0.55, Math.min(0.96, rawFvYes))
-        : Math.max(0.55, Math.min(0.96, 1 - rawFvYes));
+        ? Math.max(0.01, Math.min(0.99, rawFvYes))
+        : Math.max(0.01, Math.min(0.99, 1 - rawFvYes));
 
-    // Lagging Kalshi contract ask/bid inside [0.52, 0.74] gate before repricing catches up
-    const baseContractAsk = bar.hasLiveKalshiCandle
-      ? Math.max(0.54, Math.min(0.72, bar.kalshiAskUsd))
-      : Number(
-          Math.max(0.54, Math.min(0.70, effectiveFv - 0.085 * Math.min(3.2, absZ))).toFixed(2)
-        );
-    const baseContractBid = Number(Math.max(0.52, baseContractAsk - 0.02).toFixed(2));
+    // Use real observed Kalshi ask/bid quotes directly (never synthesized)
+    const baseContractAsk = bar.kalshiAskUsd;
+    const baseContractBid = bar.kalshiBidUsd;
 
     const liq = computeLiquidityHealthScore({
       bestBidUsd: baseContractBid,
       bestAskUsd: baseContractAsk,
-      bboDepthUsd: 6500,
+      bboDepthUsd: Math.max(1, bar.kalshiVolume * baseContractAsk),
       obiSamples: [
-        { tsMs: bar.tsSec * 1000 - 400, bidDepthUsd: 3500, askDepthUsd: 3000 },
-        { tsMs: bar.tsSec * 1000, bidDepthUsd: 3600, askDepthUsd: 2900 },
+        {
+          tsMs: bar.tsSec * 1000 - 400,
+          bidDepthUsd: Math.max(1, bar.kalshiVolume * baseContractBid * 0.5),
+          askDepthUsd: Math.max(1, bar.kalshiVolume * baseContractAsk * 0.5),
+        },
+        {
+          tsMs: bar.tsSec * 1000,
+          bidDepthUsd: Math.max(1, bar.kalshiVolume * baseContractBid * 0.5),
+          askDepthUsd: Math.max(1, bar.kalshiVolume * baseContractAsk * 0.5),
+        },
       ],
       nowMs: bar.tsSec * 1000,
     });
 
-    // Intra-bar 60s burst velocity z-score (scaled by sqrt(5) for 60s impulse concentration)
+    // Intra-bar 60s burst velocity z-score
     const burstZ = zV5 * 1.28;
     const prevBurstZ = Math.sign(burstZ) * Math.abs(burstZ) * 0.96;
 
     const svb60Eval = evaluateSvb60Trigger({
       zVelocityChecks5s: [prevBurstZ, burstZ],
       coinbaseSpotUsd: bar.close,
-      krakenSpotUsd: bar.close * (1 - 0.00004),
-      kalshiAskMove10sDollars: 0.005,
+      krakenSpotUsd: bar.close,
+      kalshiAskMove10sDollars: Math.abs(bar.kalshiAskUsd - prevBar.kalshiAskUsd),
       fairValueProb: effectiveFv,
       kalshiAskDollars: baseContractAsk,
+      atr14ProbUsd,
       minutesRemaining,
       spotLatencyMs: 180,
       kalshiLatencyMs: 240,
@@ -646,49 +901,53 @@ export function evaluateWalkForwardWindow(
       deltaFvProjDollars: deltaFvProj,
       fairValueProb: effectiveFv,
       kalshiAskDollars: baseContractAsk,
+      atr14ProbUsd,
       candleFinalizationLatencyMs: 320,
       kalshiLatencyMs: 240,
     });
 
-    // Cross-Venue Divergence (XVD) when 3 consecutive sub-bar snapshots diverge >= $0.10
-    const leadingPolymarketProb = Number(
-      Math.max(0.05, Math.min(0.97, effectiveFv - 0.01)).toFixed(4)
-    );
-    const xvdDiv = Math.abs(leadingPolymarketProb - baseContractAsk);
-    const xvdEval = evaluateXvdTrigger({
-      snapshots: [
-        {
-          timestampMs: bar.tsSec * 1000 - 3200,
-          kalshiProb: baseContractAsk,
-          polymarketProb: leadingPolymarketProb,
-        },
-        {
-          timestampMs: bar.tsSec * 1000 - 1600,
-          kalshiProb: baseContractAsk,
-          polymarketProb: leadingPolymarketProb,
-        },
-        {
-          timestampMs: bar.tsSec * 1000,
-          kalshiProb: baseContractAsk,
-          polymarketProb: leadingPolymarketProb,
-        },
-      ],
-      persistenceDurationMs: 3200,
-      identicalSettlementSource: xvdDiv >= 0.10 && absZ >= 2.35 && rGkRatio >= 1.35,
-      spotFairValueProb: effectiveFv,
-      leadingVenueProb: leadingPolymarketProb,
-      laggingVenueAskDollars: baseContractAsk,
-      kalshiLatencyMs: 220,
-      polymarketLatencyMs: 260,
-      spotLatencyMs: 180,
-      interVenueSkewMs: 65,
-    });
+    // Cross-Venue Divergence (XVD) is evaluated ONLY when real Polymarket quotes are supplied
+    const xvdTriggered =
+      bar.polymarketProb !== undefined && Number.isFinite(bar.polymarketProb)
+        ? evaluateXvdTrigger({
+            snapshots: [
+              {
+                timestampMs: bar.tsSec * 1000 - 3200,
+                kalshiProb: baseContractAsk,
+                polymarketProb: bar.polymarketProb,
+              },
+              {
+                timestampMs: bar.tsSec * 1000 - 1600,
+                kalshiProb: baseContractAsk,
+                polymarketProb: bar.polymarketProb,
+              },
+              {
+                timestampMs: bar.tsSec * 1000,
+                kalshiProb: baseContractAsk,
+                polymarketProb: bar.polymarketProb,
+              },
+            ],
+            persistenceDurationMs: 3200,
+            identicalSettlementSource:
+              Math.abs(bar.polymarketProb - baseContractAsk) >= 0.10 &&
+              absZ >= 2.35 &&
+              rGkRatio >= 1.35,
+            spotFairValueProb: effectiveFv,
+            leadingVenueProb: bar.polymarketProb,
+            laggingVenueAskDollars: baseContractAsk,
+            atr14ProbUsd,
+            kalshiLatencyMs: 220,
+            polymarketLatencyMs: 260,
+            spotLatencyMs: 180,
+            interVenueSkewMs: 65,
+          }).triggered
+        : false;
 
     const activeTrigger: LeadLagTriggerId | null = svb60Eval.triggered
       ? 'SVB-60'
       : gkx5Eval.triggered
         ? 'GKX-5'
-        : xvdEval.triggered
+        : xvdTriggered
           ? 'XVD'
           : null;
 
@@ -700,13 +959,13 @@ export function evaluateWalkForwardWindow(
     const capFraction = activeTrigger === 'XVD' ? 0.015 : 0.03;
     const envelope = evaluateChampion260Envelope(
       {
-        symbol: 'KXBTC15M',
+        symbol: bar.kalshiTicker,
         side: direction,
         chop14,
         adx14,
         lhs: liq.lhs,
         ask: baseContractAsk,
-        atrDollar: 0.065,
+        atrDollar: atr14ProbUsd > 0 ? atr14ProbUsd : 0.065,
         settledCashUsd,
         timestampMs: bar.tsSec * 1000,
       },
@@ -732,9 +991,8 @@ export function evaluateWalkForwardWindow(
 
     const entryFeeUsd = computeExactKalshiFeeUsd(contracts, entryPriceUsd, entryMode);
 
-    // Evaluate subsequent 3 bars (15m settlement horizon)
+    // Evaluate subsequent 3 real bars (15m settlement horizon)
     const b1 = bars[i + 1];
-    const b2 = bars[i + 2];
     const b3 = bars[i + 3];
 
     const min1LogRet = Math.log(Math.max(1e-8, b1.close) / Math.max(1e-8, bar.close));
@@ -745,44 +1003,17 @@ export function evaluateWalkForwardWindow(
       Math.sign(min1Z) !== Math.sign(zV5) &&
       Math.abs(min1Z) >= 0.65;
 
-    // Forward 15m spot return in the direction of the trigger
-    const forwardRet15m =
-      ((b3.close - bar.close) / Math.max(1e-8, bar.close)) *
-      (direction === 'BUY_YES' ? 1 : -1);
-    const maxFavorableRet =
-      Math.max(
-        ((b1.high - bar.close) / bar.close) * (direction === 'BUY_YES' ? 1 : -1),
-        ((b2.high - bar.close) / bar.close) * (direction === 'BUY_YES' ? 1 : -1),
-        ((b3.high - bar.close) / bar.close) * (direction === 'BUY_YES' ? 1 : -1)
-      );
-
-    // Stressed round-trip drag floor ($0.12 minimum per contract in edge gate; actual realized slippage/spread drag on exit)
     const spreadUsd = Math.max(0.01, baseContractAsk - baseContractBid);
     let exitPriceUsd: number;
     let settledAtExpiry = false;
 
     if (signFlippedMin1) {
-      // GKX-5 minute-1 sign flip tightens stop-loss to -$0.03
-      exitPriceUsd = Math.max(0.01, Number((entryPriceUsd - 0.03).toFixed(4)));
-    } else if (forwardRet15m >= 0.0005 || (maxFavorableRet >= 0.0012 && forwardRet15m >= -0.0002)) {
-      // Momentum continuation converges contract toward spot-implied fair value / ITM settlement
-      const repricingGain = Math.min(
-        0.98 - entryPriceUsd,
-        Math.max(0.16, Math.abs(effectiveFv - entryPriceUsd) * 0.88)
-      );
-      exitPriceUsd = Number(Math.min(0.98, entryPriceUsd + repricingGain).toFixed(4));
-      settledAtExpiry = exitPriceUsd >= 0.85;
-    } else if (forwardRet15m >= -0.0006) {
-      // Partial convergence / 6m time-stop near fair value
-      exitPriceUsd = Number(
-        Math.min(0.95, entryPriceUsd + Math.max(0.05, (effectiveFv - entryPriceUsd) * 0.42)).toFixed(4)
-      );
+      exitPriceUsd = Math.max(0.01, Number(Math.min(b1.kalshiBidUsd, entryPriceUsd - 0.03).toFixed(4)));
     } else {
-      // Confirmed 2x15s inversion stop-loss (-$0.07 floor)
-      exitPriceUsd = Math.max(0.01, Number((entryPriceUsd - 0.07).toFixed(4)));
+      exitPriceUsd = Number(Math.max(0.01, Math.min(0.99, b3.kalshiBidUsd)).toFixed(4));
+      settledAtExpiry = exitPriceUsd >= 0.85;
     }
 
-    // Zero-fee settlement hold when deep ITM (>= 0.85); otherwise taker exit fee
     const exitFeeUsd = settledAtExpiry
       ? 0.0
       : computeExactKalshiFeeUsd(contracts, exitPriceUsd, 'TAKER');
@@ -793,7 +1024,6 @@ export function evaluateWalkForwardWindow(
       2 * perContractFeeDrag + spreadUsd
     );
 
-    // Apply half of stressed round-trip microstructure drag (spread + adverse selection cushion) on non-settlement exits
     const realizedSlippageUsd = settledAtExpiry ? 0 : contracts * (spreadUsd * 0.5);
     const grossPnlUsd = Number((contracts * (exitPriceUsd - entryPriceUsd)).toFixed(4));
     const netPnlUsd = Number(
@@ -856,10 +1086,9 @@ export function evaluateWalkForwardWindow(
         ? 9.99
         : 0.0;
 
-  // Compute annualized Sharpe ratio from trade/bar return stream
   const activeReturns = trades.map((t) => t.returnPctOfCash / 100);
   let sharpe = 0;
-  if (activeReturns.length >= 2) {
+  if (activeReturns.length >= 2 && bars.length >= 2) {
     const meanRet =
       activeReturns.reduce((a, b) => a + b, 0) / activeReturns.length;
     const stdRet = Math.sqrt(
@@ -897,11 +1126,11 @@ export function evaluateWalkForwardWindow(
   const periodStartIso =
     bars.length > 0
       ? new Date(bars[0].tsSec * 1000).toISOString()
-      : new Date().toISOString();
+      : new Date(0).toISOString();
   const periodEndIso =
     bars.length > 0
       ? new Date(bars[bars.length - 1].tsSec * 1000).toISOString()
-      : new Date().toISOString();
+      : new Date(0).toISOString();
 
   return {
     status:
@@ -913,6 +1142,7 @@ export function evaluateWalkForwardWindow(
     period_start: periodStartIso,
     period_end: periodEndIso,
     bars_tested: bars.length,
+    skipped_missing_quote_steps: skippedMissingQuoteSteps,
     trades: totalTrades,
     total_trades: totalTrades,
     net_return_pct: netReturnPct,
@@ -933,65 +1163,15 @@ export function evaluateWalkForwardWindow(
 }
 
 /**
- * Generates deterministic fallback 5m BTC-USD bars if public REST is unreachable in an offline container,
- * preserving exact 5m granularity and realistic BTC volatility regimes so the script never writes nulls.
- */
-function buildDeterministicFallbackBars(
-  startSec: number,
-  totalBars: number
-): OHLCVBar[] {
-  const bars: OHLCVBar[] = [];
-  let price = 88450.0;
-
-  for (let i = 0; i < totalBars; i += 1) {
-    const tsSec = startSec + i * GRANULARITY_SECONDS;
-    const wave1 = Math.sin(i * 0.073) * 0.0011;
-    const wave2 = Math.cos(i * 0.019) * 0.0008;
-    // Periodic volatility expansion impulses every ~42 bars
-    const isImpulse = i % 42 === 15 || i % 67 === 22;
-    const impulseSign = i % 84 < 42 ? 1 : -1;
-    const ret = isImpulse ? impulseSign * 0.0044 : wave1 + wave2;
-
-    const open = Number(price.toFixed(2));
-    const close = Number((open * (1 + ret)).toFixed(2));
-    const rangeSpan = Math.abs(close - open) * (isImpulse ? 1.45 : 1.35) + open * 0.0007;
-    const high = Number((Math.max(open, close) + rangeSpan * 0.55).toFixed(2));
-    const low = Number((Math.min(open, close) - rangeSpan * 0.45).toFixed(2));
-    const volume = Number((42 + (i % 19) * 6.5 + (isImpulse ? 185 : 0)).toFixed(2));
-
-    bars.push({
-      timestamp: new Date(tsSec * 1000).toISOString(),
-      open,
-      high,
-      low,
-      close,
-      volume,
-      vwap: Number(((high + low + close) / 3).toFixed(2)),
-    });
-    price = close;
-  }
-
-  return bars;
-}
-
-/**
- * Atomically updates `champion_config.json` with `baseline_metrics`, `oos_metrics`,
- * and sets `lead_lag_triggers.mode` based on `oos_metrics.sharpe > 1.0 && oos_metrics.max_drawdown_pct < 3.5`.
+ * Atomically updates `champion_config.json` with `baseline_metrics` and `oos_metrics`
+ * while keeping `lead_lag_triggers.mode = "shadow"` and `task07c.live_enabled = false` locked.
  */
 export function atomicallyWriteChampionConfig(
   baselineMetrics: WalkForwardWindowMetrics,
   oosMetrics: WalkForwardWindowMetrics
-): { promotedToLive: boolean; mode: 'live' | 'shadow' } {
+): { promotedToLive: false; mode: 'shadow' } {
   const rawContent = fs.readFileSync(CHAMPION_CONFIG_PATH, 'utf-8');
   const config = JSON.parse(rawContent) as Record<string, unknown>;
-
-  const promotedToLive =
-    Number.isFinite(oosMetrics.sharpe) &&
-    Number.isFinite(oosMetrics.max_drawdown_pct) &&
-    oosMetrics.sharpe > 1.0 &&
-    oosMetrics.max_drawdown_pct < 3.5;
-
-  const targetMode: 'live' | 'shadow' = promotedToLive ? 'live' : 'shadow';
 
   config.updated_at = new Date().toISOString();
   config.baseline_metrics = baselineMetrics;
@@ -999,72 +1179,147 @@ export function atomicallyWriteChampionConfig(
 
   if (config.lead_lag_triggers && typeof config.lead_lag_triggers === 'object') {
     const leadLagObj = config.lead_lag_triggers as Record<string, unknown>;
-    leadLagObj.mode = targetMode;
+    leadLagObj.mode = 'shadow';
+  }
+  if (config.task07c && typeof config.task07c === 'object') {
+    const task07cObj = config.task07c as Record<string, unknown>;
+    task07cObj.mode = 'shadow';
+    task07cObj.live_enabled = false;
   }
 
   const tmpPath = `${CHAMPION_CONFIG_PATH}.tmp.${process.pid}`;
   fs.writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
   fs.renameSync(tmpPath, CHAMPION_CONFIG_PATH);
 
-  return { promotedToLive, mode: targetMode };
+  return { promotedToLive: false, mode: 'shadow' };
 }
 
-export async function runWalkForwardEvaluation(): Promise<{
-  baseline_metrics: WalkForwardWindowMetrics;
-  oos_metrics: WalkForwardWindowMetrics;
-  lead_lag_mode: 'live' | 'shadow';
-}> {
-  const nowSec =
+/**
+ * Runs the walk-forward history fetcher and evaluator strictly over REAL Coinbase + Kalshi data.
+ * Fails closed with `INSUFFICIENT_REAL_HISTORY` (and `generatedBarsCount: 0`) whenever
+ * real Coinbase bars or Kalshi market quotes are missing or short — never fabricates prices.
+ */
+export async function runWalkForwardEvaluation(
+  options: WalkForwardRunOptions = {}
+): Promise<WalkForwardRunResult> {
+  const endSec =
+    options.endSec ??
     Math.floor(Date.now() / 1000 / GRANULARITY_SECONDS) * GRANULARITY_SECONDS;
   const totalWindowSeconds = TOTAL_BARS_5M * GRANULARITY_SECONDS;
-  const startSec = nowSec - totalWindowSeconds;
+  const startSec = options.startSec ?? endSec - totalWindowSeconds;
 
-  console.log(
-    `[TASK-05/11] Fetching 37d+60m 5m BTC-USD candles from Coinbase (${new Date(
-      startSec * 1000
-    ).toISOString()} -> ${new Date(nowSec * 1000).toISOString()}) with ${RATE_LIMIT_DELAY_MS}ms pacing...`
+  const expectedRangeBars = Math.max(
+    1,
+    Math.floor((endSec - startSec) / GRANULARITY_SECONDS)
   );
+  const requiredCoinbaseBars = options.requiredCoinbaseBars ?? Math.min(TOTAL_BARS_5M, expectedRangeBars);
+  const requiredAlignedTrainBars = options.requiredAlignedTrainBars ?? Math.min(TRAIN_BARS_5M, Math.max(35, Math.floor(expectedRangeBars * 0.7)));
+  const requiredAlignedOosBars = options.requiredAlignedOosBars ?? Math.min(OOS_BARS_5M, Math.max(35, Math.floor(expectedRangeBars * 0.15)));
+  const writeConfig = options.writeConfig ?? true;
 
-  let coinbaseBars = await fetchPaginatedCoinbase5mCandles(startSec, nowSec);
+  const windowStartIso = new Date(startSec * 1000).toISOString();
+  const windowEndIso = new Date(endSec * 1000).toISOString();
+
+  const gaps: InsufficientHistoryGap[] = [];
+
+  const coinbaseBars = await fetchPaginatedCoinbase5mCandles(startSec, endSec, options);
   const liveCoinbaseBarCount = coinbaseBars.length;
 
-  if (coinbaseBars.length < TOTAL_BARS_5M) {
-    const missingCount = TOTAL_BARS_5M - coinbaseBars.length;
-    const firstExistingSec =
-      coinbaseBars.length > 0
-        ? Math.floor(Date.parse(coinbaseBars[0].timestamp) / 1000)
-        : nowSec;
-    const backfillStartSec = firstExistingSec - missingCount * GRANULARITY_SECONDS;
-    const fallbackBars = buildDeterministicFallbackBars(backfillStartSec, missingCount);
-    coinbaseBars = [...fallbackBars, ...coinbaseBars].slice(-TOTAL_BARS_5M);
-  } else if (coinbaseBars.length > TOTAL_BARS_5M) {
-    coinbaseBars = coinbaseBars.slice(-TOTAL_BARS_5M);
+  if (liveCoinbaseBarCount < requiredCoinbaseBars) {
+    gaps.push({
+      code: INSUFFICIENT_REAL_HISTORY_CODE,
+      source: 'COINBASE',
+      ticker: 'BTC-USD',
+      windowStartIso,
+      windowEndIso,
+      expectedBars: requiredCoinbaseBars,
+      observedBars: liveCoinbaseBarCount,
+      missingBars: requiredCoinbaseBars - liveCoinbaseBarCount,
+      detail: `Coinbase returned ${liveCoinbaseBarCount}/${requiredCoinbaseBars} real 5m BTC-USD bars; fail-closed with 0 generated bars`,
+    });
   }
 
-  const oosStartSec =
-    Math.floor(
-      Date.parse(coinbaseBars[TRAIN_BARS_5M + PURGE_BARS_5M].timestamp) / 1000
-    );
-  console.log(
-    `[TASK-05/11] Fetching Kalshi ${KALSHI_SERIES_TICKER} candlesticks across OOS window with ${RATE_LIMIT_DELAY_MS}ms pacing...`
-  );
-  const kalshiCandles = await fetchPaginatedKalshiKxbtc15mCandles(oosStartSec, nowSec);
+  const kalshiResult = await fetchPaginatedKalshiKxbtc15mCandles(startSec, endSec, options);
+  gaps.push(...kalshiResult.gaps);
 
-  const alignedBars = buildAlignedWalkForwardBars(coinbaseBars, kalshiCandles);
+  if (kalshiResult.candles.size === 0) {
+    gaps.push({
+      code: INSUFFICIENT_REAL_HISTORY_CODE,
+      source: 'KALSHI',
+      ticker: KALSHI_SERIES_TICKER,
+      windowStartIso,
+      windowEndIso,
+      expectedBars: expectedRangeBars,
+      observedBars: 0,
+      missingBars: expectedRangeBars,
+      detail: `Kalshi returned 0 complete real ${KALSHI_SERIES_TICKER} candlesticks across ${kalshiResult.tickersQueried.length} queried tickers`,
+    });
+  }
 
-  const trainBars = alignedBars.slice(0, TRAIN_BARS_5M);
-  const purgeBars = alignedBars.slice(
-    TRAIN_BARS_5M,
-    TRAIN_BARS_5M + PURGE_BARS_5M
+  const alignedResult = alignRealWalkForwardBars(coinbaseBars, kalshiResult.candles);
+  gaps.push(...alignedResult.gaps);
+
+  const alignedBars = alignedResult.alignedBars;
+  const minTotalAlignedNeeded =
+    requiredAlignedTrainBars + PURGE_BARS_5M + requiredAlignedOosBars;
+
+  const hasSufficientRealHistory =
+    liveCoinbaseBarCount >= requiredCoinbaseBars &&
+    kalshiResult.candles.size > 0 &&
+    alignedBars.length >= minTotalAlignedNeeded;
+
+  if (!hasSufficientRealHistory) {
+    if (gaps.length === 0) {
+      gaps.push({
+        code: INSUFFICIENT_REAL_HISTORY_CODE,
+        source: 'ALIGNMENT',
+        ticker: KALSHI_SERIES_TICKER,
+        windowStartIso,
+        windowEndIso,
+        expectedBars: minTotalAlignedNeeded,
+        observedBars: alignedBars.length,
+        missingBars: Math.max(0, minTotalAlignedNeeded - alignedBars.length),
+        detail: `Aligned real Coinbase+Kalshi bars (${alignedBars.length}) below required minimum (${minTotalAlignedNeeded})`,
+      });
+    }
+
+    const err = new InsufficientRealHistoryError(KALSHI_SERIES_TICKER, gaps);
+    console.error(`[TASK-05/11] ${err.message}`);
+
+    if (options.throwOnInsufficient) {
+      throw err;
+    }
+
+    return {
+      status: INSUFFICIENT_REAL_HISTORY_CODE,
+      code: INSUFFICIENT_REAL_HISTORY_CODE,
+      generatedBarsCount: 0,
+      coinbaseBarsCount: liveCoinbaseBarCount,
+      kalshiCandlesCount: kalshiResult.candles.size,
+      tickersQueriedCount: kalshiResult.tickersQueried.length,
+      alignedBarsCount: alignedBars.length,
+      skippedSteps: alignedResult.skippedSteps,
+      gaps,
+      baseline_metrics: null,
+      oos_metrics: null,
+      lead_lag_mode: 'shadow',
+    };
+  }
+
+  const trimmedAligned = alignedBars.slice(-minTotalAlignedNeeded);
+  const trainBars = trimmedAligned.slice(0, requiredAlignedTrainBars);
+  const purgeBars = trimmedAligned.slice(
+    requiredAlignedTrainBars,
+    requiredAlignedTrainBars + PURGE_BARS_5M
   );
-  const oosBars = alignedBars.slice(
-    TRAIN_BARS_5M + PURGE_BARS_5M,
-    TRAIN_BARS_5M + PURGE_BARS_5M + OOS_BARS_5M
+  const oosBars = trimmedAligned.slice(
+    requiredAlignedTrainBars + PURGE_BARS_5M,
+    requiredAlignedTrainBars + PURGE_BARS_5M + requiredAlignedOosBars
   );
 
-  const dataSourceLabel = `Coinbase REST GET /products/BTC-USD/candles?granularity=300 (${liveCoinbaseBarCount} live bars) + Kalshi ${KALSHI_SERIES_TICKER} candlesticks (${kalshiCandles.size} sticks) | 30d Train / ${
+  const dataSourceLabel = `Coinbase REST GET /products/BTC-USD/candles?granularity=300 (${liveCoinbaseBarCount} real bars) + Kalshi ${KALSHI_SERIES_TICKER} candlesticks (${kalshiResult.candles.size} real sticks across ${kalshiResult.tickersQueried.length} tickers) | ${trainBars.length} Train / ${
     purgeBars.length * 5
-  }m Purge / 7d OOS`;
+  }m Purge / ${oosBars.length} OOS`;
 
   const calibration = calibrateOnTrainWindow(trainBars);
 
@@ -1082,25 +1337,23 @@ export async function runWalkForwardEvaluation(): Promise<{
     dataSourceLabel
   );
 
-  const { mode } = atomicallyWriteChampionConfig(baselineMetrics, oosMetrics);
-
-  console.log(
-    JSON.stringify(
-      {
-        status: 'COMPLETED',
-        lead_lag_triggers_mode: mode,
-        baseline_metrics: baselineMetrics,
-        oos_metrics: oosMetrics,
-      },
-      null,
-      2
-    )
-  );
+  if (writeConfig) {
+    atomicallyWriteChampionConfig(baselineMetrics, oosMetrics);
+  }
 
   return {
+    status: 'COMPLETED',
+    code: 'OK',
+    generatedBarsCount: 0,
+    coinbaseBarsCount: liveCoinbaseBarCount,
+    kalshiCandlesCount: kalshiResult.candles.size,
+    tickersQueriedCount: kalshiResult.tickersQueried.length,
+    alignedBarsCount: alignedBars.length,
+    skippedSteps: alignedResult.skippedSteps,
+    gaps,
     baseline_metrics: baselineMetrics,
     oos_metrics: oosMetrics,
-    lead_lag_mode: mode,
+    lead_lag_mode: 'shadow',
   };
 }
 
@@ -1109,8 +1362,15 @@ const isMainModule =
   path.resolve(process.argv[1]) === path.resolve(__filename);
 
 if (isMainModule) {
-  runWalkForwardEvaluation().catch((err) => {
-    console.error('[TASK-05/11] Walk-forward evaluation failed:', err);
-    process.exitCode = 1;
-  });
+  runWalkForwardEvaluation()
+    .then((result) => {
+      console.log(JSON.stringify(result, null, 2));
+      if (result.status === INSUFFICIENT_REAL_HISTORY_CODE) {
+        process.exitCode = 1;
+      }
+    })
+    .catch((err) => {
+      console.error('[TASK-05/11] Walk-forward evaluation failed:', err);
+      process.exitCode = 1;
+    });
 }

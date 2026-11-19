@@ -1953,7 +1953,428 @@ async function runSmokeSuite() {
       livePublicPositions.splice(0, livePublicPositions.length, ...savedPubPositions);
     }
 
-    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER + TASK-14-RISK-GUARD PASSED.');
+    // -------------------------------------------------------------------------
+    // SECTION-74-FIX [VAULT-FIX]: Single-Drag Net-Edge Gate, Fail-Closed Fetcher, Shadow Lock
+    // -------------------------------------------------------------------------
+    const {
+      evaluateSingleDragEdgeGate,
+      evaluateOrderFlowToxicityAndBasis,
+    } = await import('../src/strategies/LeadLagAnomalyTriggers');
+
+    // (a) Net-edge single deduction: $0.12 stressed drag charged exactly once
+    // grossEdge = $0.20 with small atr14ProbUsd = $0.04 (0.12 + 1.1*0.04 = 0.164 < 0.20, floor 0.18 <= 0.20) -> PASS
+    // grossEdge = $0.15 with small atr14ProbUsd = $0.02 (0.15 < 0.18) -> FAIL
+    // grossEdge = $0.20 with large atr14ProbUsd = $0.10 (0.12 + 1.1*0.10 = 0.23 > 0.20) -> FAIL
+    const gatePass20 = evaluateSingleDragEdgeGate(0.80, 0.60, 0.04);
+    assert.equal(gatePass20.passed, true);
+    assert.equal(gatePass20.grossEdgeDollars, 0.2);
+    assert.equal(gatePass20.netEdgeAfterDragDollars, 0.08);
+    assert.equal(gatePass20.requiredGrossEdgeDollars, 0.18);
+
+    const gateFail15 = evaluateSingleDragEdgeGate(0.75, 0.60, 0.02);
+    assert.equal(gateFail15.passed, false);
+    assert.equal(gateFail15.grossEdgeDollars, 0.15);
+    assert.equal(gateFail15.netEdgeAfterDragDollars, 0.03);
+
+    const gateFailHighAtr = evaluateSingleDragEdgeGate(0.80, 0.60, 0.10);
+    assert.equal(gateFailHighAtr.passed, false);
+    assert.equal(gateFailHighAtr.requiredGrossEdgeDollars, 0.23);
+
+    // SVB-60 single-drag check
+    const svbPass20 = evaluateSvb60Trigger({
+      zVelocityChecks5s: [2.85, 3.02],
+      coinbaseSpotUsd: 91250,
+      krakenSpotUsd: 91244,
+      kalshiAskMove10sDollars: 0.005,
+      fairValueProb: 0.80,
+      kalshiAskDollars: 0.60,
+      atr14ProbUsd: 0.04,
+      minutesRemaining: 9.0,
+      spotLatencyMs: 120,
+      kalshiLatencyMs: 220,
+      interVenueSkewMs: 35,
+    });
+    assert.equal(svbPass20.fvEdgePassed, true);
+    assert.equal(svbPass20.triggered, true);
+    assert.equal(svbPass20.netEdgeAfterDragDollars, 0.08);
+
+    const svbFail15 = evaluateSvb60Trigger({
+      zVelocityChecks5s: [2.85, 3.02],
+      coinbaseSpotUsd: 91250,
+      krakenSpotUsd: 91244,
+      kalshiAskMove10sDollars: 0.005,
+      fairValueProb: 0.75,
+      kalshiAskDollars: 0.60,
+      atr14ProbUsd: 0.02,
+      minutesRemaining: 9.0,
+      spotLatencyMs: 120,
+      kalshiLatencyMs: 220,
+      interVenueSkewMs: 35,
+    });
+    assert.equal(svbFail15.fvEdgePassed, false);
+    assert.equal(svbFail15.triggered, false);
+
+    // GKX-5 single-drag check
+    const gkxPass20 = evaluateGkx5Trigger({
+      rGkRatio: 1.78,
+      zVelocity5m: 2.3,
+      intraCandleVelocitySigns: [0.9, 1.5, 2.3],
+      deltaFvProjDollars: 0.26,
+      fairValueProb: 0.80,
+      kalshiAskDollars: 0.60,
+      atr14ProbUsd: 0.04,
+      candleFinalizationLatencyMs: 350,
+      kalshiLatencyMs: 240,
+    });
+    assert.equal(gkxPass20.fvEdgePassed, true);
+    assert.equal(gkxPass20.triggered, true);
+    assert.equal(gkxPass20.netEdgeAfterDragDollars, 0.08);
+
+    const gkxFail15 = evaluateGkx5Trigger({
+      rGkRatio: 1.78,
+      zVelocity5m: 2.3,
+      intraCandleVelocitySigns: [0.9, 1.5, 2.3],
+      deltaFvProjDollars: 0.26,
+      fairValueProb: 0.75,
+      kalshiAskDollars: 0.60,
+      atr14ProbUsd: 0.02,
+      candleFinalizationLatencyMs: 350,
+      kalshiLatencyMs: 240,
+    });
+    assert.equal(gkxFail15.fvEdgePassed, false);
+    assert.equal(gkxFail15.triggered, false);
+
+    // XVD single-drag check
+    const xvdPass20 = evaluateXvdTrigger({
+      snapshots: [
+        { timestampMs: 1000, kalshiProb: 0.60, polymarketProb: 0.79 },
+        { timestampMs: 2600, kalshiProb: 0.60, polymarketProb: 0.79 },
+        { timestampMs: 4200, kalshiProb: 0.60, polymarketProb: 0.79 },
+      ],
+      identicalSettlementSource: true,
+      spotFairValueProb: 0.80,
+      leadingVenueProb: 0.79,
+      laggingVenueAskDollars: 0.60,
+      atr14ProbUsd: 0.04,
+      kalshiLatencyMs: 200,
+      polymarketLatencyMs: 220,
+      spotLatencyMs: 90,
+      interVenueSkewMs: 80,
+    });
+    assert.equal(xvdPass20.fvEdgePassed, true);
+    assert.equal(xvdPass20.triggered, true);
+    assert.equal(xvdPass20.netEdgeAfterDragDollars, 0.08);
+
+    const xvdFail15 = evaluateXvdTrigger({
+      snapshots: [
+        { timestampMs: 1000, kalshiProb: 0.60, polymarketProb: 0.74 },
+        { timestampMs: 2600, kalshiProb: 0.60, polymarketProb: 0.74 },
+        { timestampMs: 4200, kalshiProb: 0.60, polymarketProb: 0.74 },
+      ],
+      identicalSettlementSource: true,
+      spotFairValueProb: 0.75,
+      leadingVenueProb: 0.74,
+      laggingVenueAskDollars: 0.60,
+      atr14ProbUsd: 0.02,
+      kalshiLatencyMs: 200,
+      polymarketLatencyMs: 220,
+      spotLatencyMs: 90,
+      interVenueSkewMs: 80,
+    });
+    assert.equal(xvdFail15.fvEdgePassed, false);
+    assert.equal(xvdFail15.triggered, false);
+
+    // Order-flow toxicity helper single-drag check (previously double-counted reserves against 0.18)
+    const toxPass20 = evaluateOrderFlowToxicityAndBasis({
+      trigger: 'SVB-60',
+      feedAgeMs: 120,
+      fv: 0.80,
+      ask: 0.60,
+      atr14ProbUsd: 0.04,
+      feesPerShare: 0.12,
+      basisBp: 4,
+      vpin: [0.42, 0.45],
+    });
+    assert.equal(toxPass20.allowed, true);
+    assert.equal(toxPass20.code, 'OK');
+    assert.equal(toxPass20.netEdgeAfterReserves, 0.08);
+
+    const toxFail15 = evaluateOrderFlowToxicityAndBasis({
+      trigger: 'SVB-60',
+      feedAgeMs: 120,
+      fv: 0.75,
+      ask: 0.60,
+      atr14ProbUsd: 0.02,
+      feesPerShare: 0.12,
+      basisBp: 4,
+      vpin: [0.42, 0.45],
+    });
+    assert.equal(toxFail15.allowed, false);
+    assert.equal(toxFail15.code, 'EDGE_BELOW_FLOOR');
+
+    console.log(
+      'PASS [SECTION-74-FIX (a)]: Single drag deduction verified across evaluateSingleDragEdgeGate, SVB-60, GKX-5, XVD, and evaluateOrderFlowToxicityAndBasis ($0.20 gross / small ATR passes; $0.15 gross fails; high ATR hurdle fails).'
+    );
+
+    // (b) Fetcher fail-closed: missing real history yields INSUFFICIENT_REAL_HISTORY and 0 generated bars
+    const {
+      runWalkForwardEvaluation,
+      alignRealWalkForwardBars,
+      fetchPaginatedKalshiKxbtc15mCandles,
+    } = await import('../scripts/fetch_walk_forward_history');
+
+    const emptyFetchMock: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('coinbase.com')) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ markets: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const wfEndSec = 1_763_424_000;
+    const wfStartSec = wfEndSec - 300 * 10;
+    const missingHistRes = await runWalkForwardEvaluation({
+      startSec: wfStartSec,
+      endSec: wfEndSec,
+      requiredCoinbaseBars: 10,
+      fetchFn: emptyFetchMock,
+      rateLimitDelayMs: 0,
+      writeConfig: false,
+    });
+    assert.equal(missingHistRes.status, 'INSUFFICIENT_REAL_HISTORY');
+    assert.equal(missingHistRes.code, 'INSUFFICIENT_REAL_HISTORY');
+    assert.equal(missingHistRes.generatedBarsCount, 0);
+    assert.equal(missingHistRes.coinbaseBarsCount, 0);
+    assert.equal(missingHistRes.kalshiCandlesCount, 0);
+    assert.equal(missingHistRes.alignedBarsCount, 0);
+    assert.equal(missingHistRes.baseline_metrics, null);
+    assert.equal(missingHistRes.oos_metrics, null);
+    assert(
+      missingHistRes.gaps.some((g) => g.ticker === 'BTC-USD' && g.code === 'INSUFFICIENT_REAL_HISTORY'),
+      'Expected INSUFFICIENT_REAL_HISTORY gap recorded for BTC-USD'
+    );
+    assert(
+      missingHistRes.gaps.some((g) => g.ticker === 'KXBTC15M' && g.code === 'INSUFFICIENT_REAL_HISTORY'),
+      'Expected INSUFFICIENT_REAL_HISTORY gap recorded for KXBTC15M'
+    );
+
+    // Alignment with real Coinbase bars but missing Kalshi quotes must skip all steps and generate 0 synthetic quotes
+    const sampleRealCbBars = Array.from({ length: 5 }, (_, idx) => ({
+      timestamp: new Date((wfStartSec + idx * 300) * 1000).toISOString(),
+      open: 90000 + idx * 10,
+      high: 90050 + idx * 10,
+      low: 89950 + idx * 10,
+      close: 90020 + idx * 10,
+      volume: 15,
+      vwap: 90006.67,
+    }));
+    const alignMissingKalshi = alignRealWalkForwardBars(sampleRealCbBars, new Map());
+    assert.equal(alignMissingKalshi.status, 'INSUFFICIENT_REAL_HISTORY');
+    assert.equal(alignMissingKalshi.alignedBars.length, 0);
+    assert.equal(alignMissingKalshi.skippedSteps, 5);
+    assert.equal(alignMissingKalshi.generatedBarsCount, 0);
+    assert.equal(alignMissingKalshi.gaps[0]?.ticker, 'KXBTC15M');
+
+    // Verify artificial 40-ticker cap is removed: 45 tickers across 2 cursor pages must all be queried
+    const page1Markets = Array.from({ length: 25 }, (_, idx) => ({
+      ticker: `KXBTC15M-UNIV-${String(idx + 1).padStart(2, '0')}`,
+      close_time: new Date(wfEndSec * 1000).toISOString(),
+    }));
+    const page2Markets = Array.from({ length: 20 }, (_, idx) => ({
+      ticker: `KXBTC15M-UNIV-${String(idx + 26).padStart(2, '0')}`,
+      close_time: new Date(wfEndSec * 1000).toISOString(),
+    }));
+    const paginationFetchMock: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('/markets?')) {
+        const isPage2 = url.includes('cursor=page2');
+        return new Response(
+          JSON.stringify(
+            isPage2
+              ? { markets: page2Markets }
+              : { markets: page1Markets, cursor: 'page2' }
+          ),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('KXBTC15M-UNIV-45')) {
+        // Deliberately omit yes_bid/yes_ask to prove no synthetic 0.58 quote is fabricated
+        return new Response(
+          JSON.stringify({
+            candlesticks: [{ end_period_ts: wfEndSec, price: {} }],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          candlesticks: [
+            {
+              end_period_ts: wfStartSec + 300,
+              yes_bid: { close_dollars: '0.57' },
+              yes_ask: { close_dollars: '0.59' },
+              price: { close_dollars: '0.58' },
+              volume: 120,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+    const kalshiUniverse = await fetchPaginatedKalshiKxbtc15mCandles(wfStartSec, wfEndSec, {
+      fetchFn: paginationFetchMock,
+      rateLimitDelayMs: 0,
+    });
+    assert.equal(
+      kalshiUniverse.tickersQueried.length,
+      45,
+      `Expected all 45 Kalshi tickers across paginated universe to be queried (no 40-ticker cap), got ${kalshiUniverse.tickersQueried.length}`
+    );
+    assert(
+      kalshiUniverse.gaps.some((g) => g.ticker === 'KXBTC15M-UNIV-45' && g.code === 'INSUFFICIENT_REAL_HISTORY'),
+      'Expected incomplete candlestick on KXBTC15M-UNIV-45 to record INSUFFICIENT_REAL_HISTORY without fabricating 0.58 quote'
+    );
+
+    console.log(
+      'PASS [SECTION-74-FIX (b)]: Walk-forward history fetcher fails closed with INSUFFICIENT_REAL_HISTORY, generates 0 synthetic bars/quotes, and paginates full ticker universe (>40 tickers).'
+    );
+
+    // (c) Shadow lock in champion_config.json
+    const freshChampionConfig = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), 'champion_config.json'), 'utf-8')
+    ) as Record<string, any>;
+    assert.equal(
+      freshChampionConfig.lead_lag_triggers?.mode,
+      'shadow',
+      `Expected champion_config.json lead_lag_triggers.mode === 'shadow', got ${freshChampionConfig.lead_lag_triggers?.mode}`
+    );
+    assert.equal(
+      freshChampionConfig.task07c?.live_enabled,
+      false,
+      `Expected champion_config.json task07c.live_enabled === false, got ${freshChampionConfig.task07c?.live_enabled}`
+    );
+    assert.equal(
+      freshChampionConfig.task07c?.mode,
+      'shadow',
+      `Expected champion_config.json task07c.mode === 'shadow', got ${freshChampionConfig.task07c?.mode}`
+    );
+    console.log(
+      'PASS [SECTION-74-FIX (c)]: champion_config.json shadow lock verified (lead_lag_triggers.mode="shadow", task07c.live_enabled=false).'
+    );
+
+    // -------------------------------------------------------------------------
+    // SECTION-74-FOLLOWUP [VAULT-FIX]: regimeLiquidityFilter.ts Single-Drag Gate & Parity
+    // -------------------------------------------------------------------------
+    const followupNowMs = Date.now();
+    const followupHealthyObi = [
+      { tsMs: followupNowMs - 600, bidDepthUsd: 3400, askDepthUsd: 3100 },
+      { tsMs: followupNowMs - 200, bidDepthUsd: 3500, askDepthUsd: 3000 },
+    ];
+    const followupHealthyMetrics = {
+      chop14: 42.0,
+      adx: 30.0,
+      kaufmanEr10: 0.45,
+      bbwPercentile125: 0.45,
+      atrRatioPercentile125: 0.40,
+      garmanKlassVrpPercentile: 0.55,
+    };
+    const evalRegimeEdgeCase = (grossEdge: number, atr14Usd: number) =>
+      evaluateRegimeAndLiquidity({
+        timeframe: '15m',
+        askPriceUsd: 0.60,
+        bestBidUsd: 0.58,
+        bestAskUsd: 0.60,
+        fairValueUsd: Number((0.60 + grossEdge).toFixed(6)),
+        atr14Usd,
+        minutesRemaining: 8.5,
+        bboDepthUsd: 6500,
+        obiSamples: followupHealthyObi,
+        nowMs: followupNowMs,
+        metricsOverride: followupHealthyMetrics,
+      });
+
+    // (a) Single drag deduction in evaluateRegimeAndLiquidity:
+    // grossEdge = $0.20, atr14 = $0.04 (0.12 + 1.1*0.04 = 0.164 < 0.20, floor $0.18 <= 0.20) -> PASS
+    const regPass20 = evalRegimeEdgeCase(0.20, 0.04);
+    assert.equal(
+      regPass20.approved,
+      true,
+      `Expected grossEdge=$0.20 / atr=$0.04 to PASS evaluateRegimeAndLiquidity, got blockReasons=${regPass20.blockReasons.join('; ')}`
+    );
+    assert.equal(regPass20.observedGrossEdgeUsd, 0.2);
+    assert.equal(regPass20.observedNetEdgeUsd, 0.08);
+    assert.equal(regPass20.requiredGrossEdgeUsd, 0.18);
+    assert.equal(regPass20.entryEdgeRequiredUsd, 0.06);
+
+    // grossEdge = $0.15, atr14 = $0.02 -> FAIL
+    const regFail15 = evalRegimeEdgeCase(0.15, 0.02);
+    assert.equal(regFail15.approved, false);
+    assert.equal(regFail15.observedGrossEdgeUsd, 0.15);
+    assert.equal(regFail15.observedNetEdgeUsd, 0.03);
+    assert(
+      regFail15.blockReasons.some((r) => r.includes('Edge below floor')),
+      `Expected edge block reason on grossEdge=$0.15, got ${regFail15.blockReasons.join('; ')}`
+    );
+
+    // grossEdge = $0.20, atr14 = $0.10 (0.12 + 1.1*0.10 = 0.23 > 0.20) -> FAIL
+    const regFailHighAtr = evalRegimeEdgeCase(0.20, 0.10);
+    assert.equal(regFailHighAtr.approved, false);
+    assert.equal(regFailHighAtr.requiredGrossEdgeUsd, 0.23);
+
+    console.log(
+      'PASS [SECTION-74-FOLLOWUP (a)]: evaluateRegimeAndLiquidity charges $0.12 drag once ($0.20 gross / small ATR passes; $0.15 gross fails; high ATR hurdle fails).'
+    );
+
+    // (b) Exact pass/fail & threshold consistency between regimeLiquidityFilter.ts and LeadLagAnomalyTriggers.ts
+    const parityMatrix: Array<{ grossEdge: number; atr14Usd: number; expectedPass: boolean }> = [
+      { grossEdge: 0.20, atr14Usd: 0.04, expectedPass: true },
+      { grossEdge: 0.18, atr14Usd: 0.05, expectedPass: true },
+      { grossEdge: 0.179, atr14Usd: 0.05, expectedPass: false },
+      { grossEdge: 0.15, atr14Usd: 0.02, expectedPass: false },
+      { grossEdge: 0.20, atr14Usd: 0.10, expectedPass: false },
+      { grossEdge: 0.23, atr14Usd: 0.10, expectedPass: true },
+      { grossEdge: 0.229, atr14Usd: 0.10, expectedPass: false },
+      { grossEdge: 0.26, atr14Usd: 0.12, expectedPass: true },
+    ];
+    for (const row of parityMatrix) {
+      const regVerdict = evalRegimeEdgeCase(row.grossEdge, row.atr14Usd);
+      const trigGate = evaluateSingleDragEdgeGate(
+        Number((0.60 + row.grossEdge).toFixed(6)),
+        0.60,
+        row.atr14Usd
+      );
+      assert.equal(
+        regVerdict.approved,
+        row.expectedPass,
+        `Unexpected regimeLiquidityFilter verdict for grossEdge=${row.grossEdge}, atr=${row.atr14Usd}`
+      );
+      assert.equal(
+        regVerdict.approved,
+        trigGate.passed,
+        `Parity mismatch between regimeLiquidityFilter (${regVerdict.approved}) and LeadLagAnomalyTriggers (${trigGate.passed}) for grossEdge=${row.grossEdge}, atr=${row.atr14Usd}`
+      );
+      assert.equal(
+        regVerdict.requiredGrossEdgeUsd,
+        Number(trigGate.requiredGrossEdgeDollars.toFixed(4)),
+        `Required gross edge mismatch for grossEdge=${row.grossEdge}, atr=${row.atr14Usd}`
+      );
+      assert.equal(
+        regVerdict.observedNetEdgeUsd,
+        Number(trigGate.netEdgeAfterDragDollars.toFixed(4)),
+        `Observed net edge mismatch for grossEdge=${row.grossEdge}, atr=${row.atr14Usd}`
+      );
+    }
+    console.log(
+      `PASS [SECTION-74-FOLLOWUP (b)]: Parity verified across all ${parityMatrix.length} (grossEdge, ATR) test cases between evaluateRegimeAndLiquidity and evaluateSingleDragEdgeGate.`
+    );
+
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER + TASK-14-RISK-GUARD + SECTION-74-FIX + SECTION-74-FOLLOWUP PASSED.');
   } finally {
     setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);
