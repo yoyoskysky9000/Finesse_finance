@@ -2374,7 +2374,180 @@ async function runSmokeSuite() {
       `PASS [SECTION-74-FOLLOWUP (b)]: Parity verified across all ${parityMatrix.length} (grossEdge, ATR) test cases between evaluateRegimeAndLiquidity and evaluateSingleDragEdgeGate.`
     );
 
-    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(F) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER + TASK-14-RISK-GUARD + SECTION-74-FIX + SECTION-74-FOLLOWUP PASSED.');
+    // -------------------------------------------------------------------------
+    // FIX G [VAULT-FIX]: Kalshi Candlestick Fetch Interval=1 & <=5,000-Candle Lifetime Clip
+    // -------------------------------------------------------------------------
+    const {
+      buildKalshiTickerCandlestickParams,
+      KALSHI_MAX_CANDLES_PER_REQUEST,
+      TOTAL_BARS_5M,
+      GRANULARITY_SECONDS,
+    } = await import('../scripts/fetch_walk_forward_history');
+
+    const fixGWindowEndSec = 1_795_200_000;
+    const fixGWindowStartSec = fixGWindowEndSec - TOTAL_BARS_5M * GRANULARITY_SECONDS; // full 37d+60m window
+    const knownCloseSec = fixGWindowEndSec - 86_400; // 1 day before window end
+    const capturedCandleUrls: URL[] = [];
+
+    const fixGFetchMock: typeof fetch = async (input) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/markets?')) {
+        return new Response(
+          JSON.stringify({
+            markets: [
+              {
+                ticker: 'KXBTC15M-FIXG-KNOWN',
+                close_time: new Date(knownCloseSec * 1000).toISOString(),
+              },
+              {
+                ticker: 'KXBTC15M-FIXG-NOCLOSE',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      capturedCandleUrls.push(new URL(urlStr));
+      return new Response(
+        JSON.stringify({
+          candlesticks: [
+            {
+              end_period_ts: knownCloseSec - 60,
+              yes_bid: { close_dollars: '0.56' },
+              yes_ask: { close_dollars: '0.58' },
+              price: { close_dollars: '0.57' },
+              volume: 42,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const fixGRes = await fetchPaginatedKalshiKxbtc15mCandles(
+      fixGWindowStartSec,
+      fixGWindowEndSec,
+      { fetchFn: fixGFetchMock, rateLimitDelayMs: 0 }
+    );
+    assert.equal(fixGRes.tickersQueried.length, 2);
+    assert.equal(capturedCandleUrls.length, 2);
+
+    const knownUrl = capturedCandleUrls.find((u) => u.pathname.includes('KXBTC15M-FIXG-KNOWN'));
+    const noCloseUrl = capturedCandleUrls.find((u) => u.pathname.includes('KXBTC15M-FIXG-NOCLOSE'));
+    assert(knownUrl, 'Expected candlestick request for KXBTC15M-FIXG-KNOWN');
+    assert(noCloseUrl, 'Expected candlestick request for KXBTC15M-FIXG-NOCLOSE');
+
+    // (a) Candlestick request for known-close ticker uses valid period_interval='1' (never invalid '5')
+    assert.equal(knownUrl.searchParams.get('period_interval'), '1');
+
+    // (c) Known-close ticker gets clipped lifetime window: [max(windowStart, closeSec - 7200), min(windowEnd, closeSec + 300)]
+    const knownStartTs = Number(knownUrl.searchParams.get('start_ts'));
+    const knownEndTs = Number(knownUrl.searchParams.get('end_ts'));
+    assert.equal(knownStartTs, Math.max(fixGWindowStartSec, knownCloseSec - 7200));
+    assert.equal(knownEndTs, Math.min(fixGWindowEndSec, knownCloseSec + 300));
+    assert(knownEndTs - knownStartTs === 7500, `Expected clipped 7500s span, got ${knownEndTs - knownStartTs}`);
+
+    // (b) Every per-ticker request stays strictly <= 5,000 candles at its requested interval
+    for (const u of capturedCandleUrls) {
+      const intervalMin = Number(u.searchParams.get('period_interval'));
+      assert(
+        intervalMin === 1 || intervalMin === 60 || intervalMin === 1440,
+        `Invalid Kalshi period_interval=${intervalMin} (must be 1, 60, or 1440)`
+      );
+      const sTs = Number(u.searchParams.get('start_ts'));
+      const eTs = Number(u.searchParams.get('end_ts'));
+      const candlesRequested = Math.ceil((eTs - sTs) / (intervalMin * 60));
+      assert(
+        candlesRequested <= KALSHI_MAX_CANDLES_PER_REQUEST,
+        `Per-ticker request ${u.pathname} requested ${candlesRequested} candles > cap ${KALSHI_MAX_CANDLES_PER_REQUEST}`
+      );
+    }
+
+    // Fallback check: ticker with no parseable close_time uses period_interval='60' over full 37d window (<= 5,000 candles)
+    assert.equal(noCloseUrl.searchParams.get('period_interval'), '60');
+    assert.equal(Number(noCloseUrl.searchParams.get('start_ts')), fixGWindowStartSec);
+    assert.equal(Number(noCloseUrl.searchParams.get('end_ts')), fixGWindowEndSec);
+
+    // Pathological 1-year window with null closeSec also stays <= 5,000 candles
+    const longFallback = buildKalshiTickerCandlestickParams(
+      fixGWindowEndSec - 365 * 86_400,
+      fixGWindowEndSec,
+      null
+    );
+    assert(longFallback !== null);
+    assert.equal(longFallback.periodInterval, '60');
+    assert(longFallback.estimatedCandles <= KALSHI_MAX_CANDLES_PER_REQUEST);
+
+    // Batch mode check: adjacent tickers group under period_interval='1', span <= 5,000, and tickers * span <= 10,000
+    const capturedBatchUrls: URL[] = [];
+    const batchMock: typeof fetch = async (input) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/markets?')) {
+        return new Response(
+          JSON.stringify({
+            markets: [
+              { ticker: 'KXBTC15M-BATCH-1', close_time: new Date((knownCloseSec - 900) * 1000).toISOString() },
+              { ticker: 'KXBTC15M-BATCH-2', close_time: new Date(knownCloseSec * 1000).toISOString() },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      capturedBatchUrls.push(new URL(urlStr));
+      return new Response(
+        JSON.stringify({
+          markets: [
+            {
+              market_ticker: 'KXBTC15M-BATCH-1',
+              candlesticks: [
+                {
+                  end_period_ts: knownCloseSec - 960,
+                  yes_bid: { close_dollars: '0.54' },
+                  yes_ask: { close_dollars: '0.56' },
+                  price: { close_dollars: '0.55' },
+                  volume: 10,
+                },
+              ],
+            },
+            {
+              market_ticker: 'KXBTC15M-BATCH-2',
+              candlesticks: [
+                {
+                  end_period_ts: knownCloseSec - 60,
+                  yes_bid: { close_dollars: '0.57' },
+                  yes_ask: { close_dollars: '0.59' },
+                  price: { close_dollars: '0.58' },
+                  volume: 12,
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+    const batchRes = await fetchPaginatedKalshiKxbtc15mCandles(
+      fixGWindowStartSec,
+      fixGWindowEndSec,
+      { fetchFn: batchMock, rateLimitDelayMs: 0, batchSize: 20 }
+    );
+    assert.equal(batchRes.tickersQueried.length, 2);
+    assert.equal(batchRes.candles.size, 2);
+    assert.equal(capturedBatchUrls.length, 1);
+    assert.equal(capturedBatchUrls[0].searchParams.get('period_interval'), '1');
+    const bSpanMin = Math.ceil(
+      (Number(capturedBatchUrls[0].searchParams.get('end_ts')) -
+        Number(capturedBatchUrls[0].searchParams.get('start_ts'))) /
+        60
+    );
+    assert(bSpanMin <= KALSHI_MAX_CANDLES_PER_REQUEST, `Batch span ${bSpanMin} exceeds 5,000 cap`);
+    assert(2 * bSpanMin <= 10_000, `Batch total candles ${2 * bSpanMin} exceeds 10,000 Kalshi cap`);
+
+    console.log(
+      'PASS [FIX G (a)-(c)]: Kalshi candlestick requests use period_interval=1 with clipped [close-7200, close+300] lifetime window (<=125 candles), period_interval=60 fallback when close time is missing, batch cap <=10,000 total candles, and never exceed 5,000 candles/ticker.'
+    );
+
+    console.log('\nALL SMOKE TESTS (a)-(j) + FIXES (A)-(G) + 2.6.0-PORTFOLIO-GUARD + 2.7.0-LEAD-LAG-LIVE-CHAMPION + LOW_BALANCE_COMPOUNDER + TASK-14-RISK-GUARD + SECTION-74-FIX + SECTION-74-FOLLOWUP PASSED.');
   } finally {
     setTestVenueExitHooks(null);
     setCustomTokenVerifier(null);

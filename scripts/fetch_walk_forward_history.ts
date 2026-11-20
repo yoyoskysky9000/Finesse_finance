@@ -81,6 +81,59 @@ export class InsufficientRealHistoryError extends Error {
 export interface FetchHistoryOptions {
   fetchFn?: typeof fetch;
   rateLimitDelayMs?: number;
+  concurrency?: number;
+  /** Max adjacent tickers per Kalshi v2 batch candlestick request (defaults to 20 live, 1 when custom fetchFn is injected). */
+  batchSize?: number;
+}
+
+export const KALSHI_MAX_CANDLES_PER_REQUEST = 5000;
+export const KALSHI_BATCH_MAX_TOTAL_CANDLES = 9000;
+export const KALSHI_MARKET_LOOKBACK_SEC = 7200;
+export const KALSHI_MARKET_LOOKAHEAD_SEC = 300;
+
+export interface KalshiTickerCandlestickRequestParams {
+  periodInterval: '1' | '60';
+  startTs: number;
+  endTs: number;
+  estimatedCandles: number;
+}
+
+/**
+ * Computes valid Kalshi v2 candlestick query parameters for a single market ticker:
+ * - Known closeSec: period_interval='1', clipped to [max(windowStart, closeSec - 7200), min(windowEnd, closeSec + 300)]
+ *   (<= 125 candles, well below Kalshi's 5,000-candle cap). Returns null if the clipped range does not overlap.
+ * - Unparseable closeSec: period_interval='60' over the full window (37 days = 888 candles <= 5,000; clamped at 5,000h).
+ */
+export function buildKalshiTickerCandlestickParams(
+  windowStartSec: number,
+  windowEndSec: number,
+  closeSec: number | null
+): KalshiTickerCandlestickRequestParams | null {
+  if (closeSec !== null && Number.isFinite(closeSec)) {
+    const startTs = Math.max(windowStartSec, closeSec - KALSHI_MARKET_LOOKBACK_SEC);
+    const endTs = Math.min(windowEndSec, closeSec + KALSHI_MARKET_LOOKAHEAD_SEC);
+    if (endTs < startTs) {
+      return null;
+    }
+    const estimatedCandles = Math.ceil((endTs - startTs) / 60);
+    return {
+      periodInterval: '1',
+      startTs,
+      endTs,
+      estimatedCandles,
+    };
+  }
+
+  const maxSpanSec = KALSHI_MAX_CANDLES_PER_REQUEST * 3600;
+  const startTs = Math.max(windowStartSec, windowEndSec - maxSpanSec);
+  const endTs = windowEndSec;
+  const estimatedCandles = Math.ceil(Math.max(0, endTs - startTs) / 3600);
+  return {
+    periodInterval: '60',
+    startTs,
+    endTs,
+    estimatedCandles,
+  };
 }
 
 export interface KalshiCandlestickBar {
@@ -360,6 +413,7 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
 ): Promise<KalshiUniverseFetchResult> {
   const fetchImpl = options.fetchFn ?? fetch;
   const paceMs = options.rateLimitDelayMs ?? RATE_LIMIT_DELAY_MS;
+  const concurrency = Math.max(1, Math.min(8, Math.floor(options.concurrency ?? 1)));
   const candleMap = new Map<number, KalshiCandlestickBar>();
   const gaps: InsufficientHistoryGap[] = [];
   const queriedTickers: string[] = [];
@@ -368,11 +422,49 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
   const windowStartIso = new Date(startSec * 1000).toISOString();
   const windowEndIso = new Date(endSec * 1000).toISOString();
 
+  const effectiveBatchSize = Math.max(
+    1,
+    Math.min(20, Math.floor(options.batchSize ?? (options.fetchFn ? 1 : 20)))
+  );
+
+  const fetchKalshiWithRetry = async (url: string): Promise<Response> => {
+    let res = await fetchImpl(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
+      },
+    });
+    for (let retry = 0; retry < 15 && res.status === 429; retry += 1) {
+      const retryAfterHdr = Number(res.headers?.get?.('retry-after') ?? NaN);
+      const resetHdr = Number(res.headers?.get?.('x-ratelimit-reset') ?? NaN);
+      const remHdr = Number(res.headers?.get?.('x-ratelimit-remaining') ?? NaN);
+      const costHdr = Number(res.headers?.get?.('x-ratelimit-cost') ?? 50);
+      let backoffMs: number;
+      if (Number.isFinite(retryAfterHdr) && retryAfterHdr > 0) {
+        backoffMs = Math.min(5000, Math.ceil(retryAfterHdr * 1000));
+      } else if (Number.isFinite(remHdr) && Number.isFinite(costHdr) && costHdr > remHdr) {
+        backoffMs = Math.max(350, Math.min(3500, Math.ceil((costHdr - remHdr) * 20) + retry * 150));
+      } else if (Number.isFinite(resetHdr) && resetHdr > 0) {
+        backoffMs = Math.max(350, Math.min(3500, Math.ceil((resetHdr * 1000) / 2)));
+      } else {
+        backoffMs = Math.max(400, Math.min(4000, paceMs * (retry + 2)));
+      }
+      await sleep(backoffMs);
+      res = await fetchImpl(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
+        },
+      });
+    }
+    return res;
+  };
+
   for (const baseUrl of KALSHI_BASE_URLS) {
     try {
       let cursor: string | undefined;
       const seenCursors = new Set<string>();
-      const tickerSet = new Set<string>();
+      const tickerCloseMap = new Map<string, number | null>();
       let marketPages = 0;
 
       // Paginate the entire requested market universe without artificial truncation
@@ -386,15 +478,12 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
         const qs = new URLSearchParams({
           series_ticker: KALSHI_SERIES_TICKER,
           limit: '200',
+          min_close_ts: String(startSec - 3600),
+          max_close_ts: String(endSec + 3600),
         });
         if (cursor) qs.set('cursor', cursor);
 
-        const mktRes = await fetchImpl(`${baseUrl}/markets?${qs.toString()}`, {
-          headers: {
-            Accept: 'application/json',
-            'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
-          },
-        });
+        const mktRes = await fetchKalshiWithRetry(`${baseUrl}/markets?${qs.toString()}`);
         if (!mktRes.ok) {
           gaps.push({
             code: INSUFFICIENT_REAL_HISTORY_CODE,
@@ -431,10 +520,12 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
           if (Number.isFinite(closeMs)) {
             const closeSec = Math.floor(closeMs / 1000);
             if (closeSec >= startSec - 3600 && closeSec <= endSec + 3600) {
-              tickerSet.add(m.ticker);
+              if (!tickerCloseMap.has(m.ticker)) {
+                tickerCloseMap.set(m.ticker, closeSec);
+              }
             }
-          } else {
-            tickerSet.add(m.ticker);
+          } else if (!tickerCloseMap.has(m.ticker)) {
+            tickerCloseMap.set(m.ticker, null);
           }
         }
 
@@ -446,46 +537,12 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
         cursor = nextCursor;
       }
 
-      const uniqueTickers = Array.from(tickerSet);
-      for (let i = 0; i < uniqueTickers.length; i += 1) {
-        const ticker = uniqueTickers[i];
-        queriedTickers.push(ticker);
-        await sleep(paceMs);
+      const uniqueEntries = Array.from(tickerCloseMap.entries());
 
-        const candleQs = new URLSearchParams({
-          period_interval: '5',
-          start_ts: String(startSec),
-          end_ts: String(endSec),
-        });
-        const candleUrl = `${baseUrl}/series/${KALSHI_SERIES_TICKER}/markets/${encodeURIComponent(
-          ticker
-        )}/candlesticks?${candleQs.toString()}`;
-
-        const cRes = await fetchImpl(candleUrl, {
-          headers: {
-            Accept: 'application/json',
-            'User-Agent': 'FinesseFinance-WalkForwardValidator/2.7.0',
-          },
-        });
-        if (!cRes.ok) {
-          gaps.push({
-            code: INSUFFICIENT_REAL_HISTORY_CODE,
-            source: 'KALSHI',
-            ticker,
-            windowStartIso,
-            windowEndIso,
-            expectedBars: 1,
-            observedBars: 0,
-            missingBars: 1,
-            detail: `Kalshi candlesticks endpoint returned HTTP ${cRes.status} for ticker ${ticker}`,
-          });
-          continue;
-        }
-
-        const cBody = (await cRes.json()) as {
-          candlesticks?: Array<Record<string, unknown>>;
-        };
-        const sticks = Array.isArray(cBody.candlesticks) ? cBody.candlesticks : [];
+      const ingestTickerCandlesticks = (
+        ticker: string,
+        sticks: Array<Record<string, unknown>>
+      ): void => {
         let validForTicker = 0;
         let incompleteForTicker = 0;
 
@@ -544,6 +601,201 @@ export async function fetchPaginatedKalshiKxbtc15mCandles(
                 : `Skipped ${incompleteForTicker} candlesticks with missing real bid/ask/close quotes for ${ticker}`,
           });
         }
+      };
+
+      const fetchSingleTicker = async (ticker: string, closeSec: number | null): Promise<void> => {
+        const reqParams = buildKalshiTickerCandlestickParams(startSec, endSec, closeSec);
+        if (!reqParams) {
+          return;
+        }
+        queriedTickers.push(ticker);
+        await sleep(paceMs);
+
+        const candleQs = new URLSearchParams({
+          period_interval: reqParams.periodInterval,
+          start_ts: String(reqParams.startTs),
+          end_ts: String(reqParams.endTs),
+        });
+        const candleUrl = `${baseUrl}/series/${KALSHI_SERIES_TICKER}/markets/${encodeURIComponent(
+          ticker
+        )}/candlesticks?${candleQs.toString()}`;
+
+        const cRes = await fetchKalshiWithRetry(candleUrl);
+        if (!cRes.ok) {
+          gaps.push({
+            code: INSUFFICIENT_REAL_HISTORY_CODE,
+            source: 'KALSHI',
+            ticker,
+            windowStartIso,
+            windowEndIso,
+            expectedBars: 1,
+            observedBars: 0,
+            missingBars: 1,
+            detail: `Kalshi candlesticks endpoint returned HTTP ${cRes.status} for ticker ${ticker}`,
+          });
+          return;
+        }
+
+        const cBody = (await cRes.json()) as {
+          candlesticks?: Array<Record<string, unknown>>;
+        };
+        const sticks = Array.isArray(cBody.candlesticks) ? cBody.candlesticks : [];
+        ingestTickerCandlesticks(ticker, sticks);
+      };
+
+      if (effectiveBatchSize > 1) {
+        const singleFallbackEntries: Array<[string, number | null]> = [];
+        const batchable: Array<{
+          ticker: string;
+          closeSec: number;
+          startTs: number;
+          endTs: number;
+        }> = [];
+
+        for (const [ticker, closeSec] of uniqueEntries) {
+          if (closeSec === null) {
+            singleFallbackEntries.push([ticker, null]);
+            continue;
+          }
+          const reqParams = buildKalshiTickerCandlestickParams(startSec, endSec, closeSec);
+          if (!reqParams) continue;
+          if (reqParams.periodInterval !== '1') {
+            singleFallbackEntries.push([ticker, closeSec]);
+            continue;
+          }
+          batchable.push({
+            ticker,
+            closeSec,
+            startTs: reqParams.startTs,
+            endTs: reqParams.endTs,
+          });
+        }
+
+        batchable.sort((a, b) => a.closeSec - b.closeSec);
+
+        interface TickerBatch {
+          items: typeof batchable;
+          startTs: number;
+          endTs: number;
+        }
+        const batches: TickerBatch[] = [];
+        let currentBatch: typeof batchable = [];
+        let batchMinStart = 0;
+        let batchMaxEnd = 0;
+
+        for (const item of batchable) {
+          if (currentBatch.length === 0) {
+            currentBatch = [item];
+            batchMinStart = item.startTs;
+            batchMaxEnd = item.endTs;
+            continue;
+          }
+          const nextMinStart = Math.min(batchMinStart, item.startTs);
+          const nextMaxEnd = Math.max(batchMaxEnd, item.endTs);
+          const nextSpanCandles = Math.ceil((nextMaxEnd - nextMinStart) / 60);
+          const nextCount = currentBatch.length + 1;
+          if (
+            nextCount <= effectiveBatchSize &&
+            nextSpanCandles <= KALSHI_MAX_CANDLES_PER_REQUEST &&
+            nextCount * nextSpanCandles <= KALSHI_BATCH_MAX_TOTAL_CANDLES
+          ) {
+            currentBatch.push(item);
+            batchMinStart = nextMinStart;
+            batchMaxEnd = nextMaxEnd;
+          } else {
+            batches.push({ items: currentBatch, startTs: batchMinStart, endTs: batchMaxEnd });
+            currentBatch = [item];
+            batchMinStart = item.startTs;
+            batchMaxEnd = item.endTs;
+          }
+        }
+        if (currentBatch.length > 0) {
+          batches.push({ items: currentBatch, startTs: batchMinStart, endTs: batchMaxEnd });
+        }
+
+        let nextBatchIdx = 0;
+        const batchWorkerCount = Math.min(concurrency, Math.max(1, batches.length));
+        await Promise.all(
+          Array.from({ length: batchWorkerCount }, async (_, workerIdx) => {
+            if (workerIdx > 0 && paceMs > 0) {
+              await sleep(Math.floor((paceMs * workerIdx) / batchWorkerCount));
+            }
+            while (nextBatchIdx < batches.length) {
+              const idx = nextBatchIdx;
+              nextBatchIdx += 1;
+              const batch = batches[idx];
+              await sleep(paceMs);
+              const batchQs = new URLSearchParams({
+                market_tickers: batch.items.map((it) => it.ticker).join(','),
+                period_interval: '1',
+                start_ts: String(batch.startTs),
+                end_ts: String(batch.endTs),
+              });
+              const batchUrl = `${baseUrl}/markets/candlesticks?${batchQs.toString()}`;
+              const bRes = await fetchKalshiWithRetry(batchUrl);
+              if (!bRes.ok) {
+                for (const it of batch.items) {
+                  singleFallbackEntries.push([it.ticker, it.closeSec]);
+                }
+                continue;
+              }
+              const bBody = (await bRes.json()) as {
+                markets?: Array<{
+                  market_ticker?: string;
+                  candlesticks?: Array<Record<string, unknown>>;
+                }>;
+              };
+              const returnedByTicker = new Map<string, Array<Record<string, unknown>>>();
+              if (Array.isArray(bBody.markets)) {
+                for (const mkt of bBody.markets) {
+                  if (mkt.market_ticker) {
+                    returnedByTicker.set(
+                      mkt.market_ticker,
+                      Array.isArray(mkt.candlesticks) ? mkt.candlesticks : []
+                    );
+                  }
+                }
+              }
+              for (const it of batch.items) {
+                queriedTickers.push(it.ticker);
+                const sticks = returnedByTicker.get(it.ticker) ?? [];
+                ingestTickerCandlesticks(it.ticker, sticks);
+              }
+            }
+          })
+        );
+
+        let nextFallbackIdx = 0;
+        const fbWorkerCount = Math.min(concurrency, Math.max(1, singleFallbackEntries.length));
+        await Promise.all(
+          Array.from({ length: fbWorkerCount }, async (_, workerIdx) => {
+            if (workerIdx > 0 && paceMs > 0) {
+              await sleep(Math.floor((paceMs * workerIdx) / fbWorkerCount));
+            }
+            while (nextFallbackIdx < singleFallbackEntries.length) {
+              const idx = nextFallbackIdx;
+              nextFallbackIdx += 1;
+              const [ticker, closeSec] = singleFallbackEntries[idx];
+              await fetchSingleTicker(ticker, closeSec);
+            }
+          })
+        );
+      } else {
+        let nextIndex = 0;
+        const workerCount = Math.min(concurrency, Math.max(1, uniqueEntries.length));
+        await Promise.all(
+          Array.from({ length: workerCount }, async (_, workerIdx) => {
+            if (workerIdx > 0 && paceMs > 0) {
+              await sleep(Math.floor((paceMs * workerIdx) / workerCount));
+            }
+            while (nextIndex < uniqueEntries.length) {
+              const idx = nextIndex;
+              nextIndex += 1;
+              const [ticker, closeSec] = uniqueEntries[idx];
+              await fetchSingleTicker(ticker, closeSec);
+            }
+          })
+        );
       }
 
       if (candleMap.size > 0) {
