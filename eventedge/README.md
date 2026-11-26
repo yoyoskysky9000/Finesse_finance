@@ -14,9 +14,9 @@ eventedge/
 ├── README.md             # Package overview & usage
 ├── index.ts              # Public barrel exports
 ├── config/
-│   └── index.ts          # Mode guard (OBSERVE | PAPER | DEMO; LIVE hard-disabled), risk, discovery & forecasting defaults
+│   └── index.ts          # Mode guard (OBSERVE | PAPER | DEMO; LIVE hard-disabled), risk, discovery, forecasting & shadow defaults + config_hash
 ├── db/
-│   ├── schema.ts         # Immutable 18-table EventEdge SQLite ledger schema + forward-only migrations (v1..v5)
+│   ├── schema.ts         # Immutable 21-table EventEdge SQLite ledger schema + forward-only migrations (v1..v6)
 │   └── migrations.ts     # node:sqlite (DatabaseSync) WAL opener & transactional migration runner
 ├── discovery/
 │   ├── kalshiPublicClient.ts  # Public-only Kalshi v2 REST client (no auth/trading calls)
@@ -46,6 +46,12 @@ eventedge/
 │   ├── calibration.ts    # Temporally isolated Beta, Platt & Temperature calibration + p_calibrated builder
 │   ├── killGate.ts       # evaluateExperiment kill-gate report & p_calibrated persistence
 │   └── index.ts          # Evaluation barrel exports
+├── shadow/
+│   ├── types.ts          # Paper-only shadow decision, order, fill & reason-code types
+│   ├── fees.ts           # Versioned Kalshi taker fee wrapper (kalshi-taker-v1 via src/strategies/kalshiFeeCalculator.ts)
+│   ├── bookReader.ts     # Captured book snapshot reader (orderbook_states / market_snapshots)
+│   ├── engine.ts         # Deterministic edge-gate, arrival-book latency, partial-fill & ledger persistence engine
+│   └── index.ts          # Shadow execution barrel exports
 ├── runner/
 │   ├── observeRunner.ts  # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
 │   └── index.ts          # Runner barrel exports
@@ -56,7 +62,8 @@ eventedge/
     ├── ee01.test.ts      # EE-01 verification suite (discovery, resolution auditor, rule versions, OBSERVE runner)
     ├── ee02.test.ts      # EE-02 verification suite (price-blindness, stages, provenance, invariants, determinism)
     ├── ee03.test.ts      # EE-03 verification suite (experiment registry, persistence layer, lifecycle & hooks)
-    └── ee04.test.ts      # EE-04 verification suite (scoring, denominator, temporal calibration, cluster bootstrap, kill-gate)
+    ├── ee04.test.ts      # EE-04 verification suite (scoring, denominator, temporal calibration, cluster bootstrap, kill-gate)
+    └── ee05.test.ts      # EE-05 verification suite (shadow edge gate, arrival book, latency, partial fill, fees, determinism, append-only, config_hash)
 ```
 
 ### 1. Execution Mode Guard (`eventedge/config/index.ts`)
@@ -85,10 +92,16 @@ All risk, discovery, and forecasting settings are configurable via constructor o
   - Event family derivation version: **`'ee-family-prefix-v1'`** (`eventFamilyDerivationVersion`)
   - Minimum base-rate sample count: **`1`** (`minBaseRateSampleCount`)
 
+- **Shadow execution defaults (`EVENTEDGE_DEFAULT_SHADOW_CONFIG`, hashed into `computeEventEdgeConfigHash`)**:
+  - Latency model version: **`'ee-latency-fixed-v1'`** (`latencyModelVersion`)
+  - Arrival latency: **`250` ms** (`latencyMs`)
+  - Max arrival book age: **`5000` ms** (`maxBookAgeMs`)
+  - Fee schedule version: **`'kalshi-taker-v1'`** (`feeScheduleVersion`)
+
 ### 3. Immutable Ledger (`eventedge/db/schema.ts`, `eventedge/db/migrations.ts`)
 Uses Node's built-in `node:sqlite` (`DatabaseSync`) in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`), matching `src/server/ExecutionVault.ts`, `src/server/riskGuard.ts`, and `server.ts`.
 
-Forward-only migrations (`schema_migrations`, currently v1..v5) provision 18 append-only tables protected by SQLite immutability triggers (`RAISE(ABORT, ...)`):
+Forward-only migrations (`schema_migrations`, currently v1..v6) provision 21 append-only tables protected by SQLite immutability triggers (`RAISE(ABORT, ...)`):
 1. `market_snapshots`
 2. `settlement_rule_versions`
 3. `research_evidence`
@@ -107,18 +120,22 @@ Forward-only migrations (`schema_migrations`, currently v1..v5) provision 18 app
 16. `experiments` (append-only except controlled `status` transitions logged in `experiment_status_history`)
 17. `experiment_status_history`
 18. `contract_lifecycle_history` (plus automatic `RULES_REVISED` trigger on new `settlement_rule_versions` for `APPROVED`/`ACTIVE` contracts)
+19. `shadow_decisions` (v6: immutable paper shadow-fill decisions)
+20. `shadow_orders` (v6: immutable paper shadow orders with latency & arrival timestamps)
+21. `shadow_fills` (v6: immutable paper shadow fills with decision + arrival book IDs, depth, age, fee & schedule version)
 
 ---
 
 ## Running Tests & Type Checks
 
 ```bash
-# Run EventEdge EE-00 through EE-04 automated tests (zero live network)
+# Run EventEdge EE-00 through EE-05 automated tests (zero live network)
 npx tsx eventedge/tests/ee00.test.ts
 npx tsx eventedge/tests/ee01.test.ts
 npx tsx eventedge/tests/ee02.test.ts
 npx tsx eventedge/tests/ee03.test.ts
 npx tsx eventedge/tests/ee04.test.ts
+npx tsx eventedge/tests/ee05.test.ts
 
 # Type-check entire workspace including eventedge/
 npm run lint

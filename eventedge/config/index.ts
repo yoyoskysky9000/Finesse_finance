@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -90,6 +91,17 @@ export interface EventEdgeForecastingConfig {
   readonly minBaseRateSampleCount: number;
 }
 
+export interface EventEdgeShadowConfig {
+  /** Version identifier for the shadow execution latency model (default 'ee-latency-fixed-v1'). */
+  readonly latencyModelVersion: string;
+  /** Simulated decision-to-venue arrival latency in milliseconds (default 250). */
+  readonly latencyMs: number;
+  /** Maximum permissible arrival book age relative to fill evaluation time in milliseconds (default 5000). */
+  readonly maxBookAgeMs: number;
+  /** Version identifier for the fee schedule applied per fill (default 'kalshi-taker-v1'). */
+  readonly feeScheduleVersion: string;
+}
+
 export interface EventEdgeConfig {
   readonly mode: EventEdgeAllowedMode;
   /** Hard-locked to false; LIVE execution cannot be toggled at runtime. */
@@ -98,6 +110,7 @@ export interface EventEdgeConfig {
   readonly risk: EventEdgeRiskConfig;
   readonly discovery: EventEdgeDiscoveryConfig;
   readonly forecasting: EventEdgeForecastingConfig;
+  readonly shadow: EventEdgeShadowConfig;
 }
 
 export interface EventEdgeConfigInput {
@@ -110,6 +123,7 @@ export interface EventEdgeConfigInput {
       ensembleWeights?: Partial<EventEdgeEnsembleWeights>;
     }
   >;
+  shadow?: Partial<EventEdgeShadowConfig>;
 }
 
 export const EVENTEDGE_DEFAULT_RISK_CONFIG: Readonly<EventEdgeRiskConfig> = Object.freeze({
@@ -145,8 +159,48 @@ export const EVENTEDGE_DEFAULT_FORECASTING_CONFIG: Readonly<EventEdgeForecasting
     minBaseRateSampleCount: 1,
   });
 
+export const EVENTEDGE_DEFAULT_SHADOW_CONFIG: Readonly<EventEdgeShadowConfig> = Object.freeze({
+  latencyModelVersion: 'ee-latency-fixed-v1',
+  latencyMs: 250,
+  maxBookAgeMs: 5000,
+  feeScheduleVersion: 'kalshi-taker-v1',
+});
+
 export function getDefaultEventEdgeLedgerDbPath(): string {
   return path.resolve(process.cwd(), '.eventedge_ledger.sqlite');
+}
+
+function canonicalConfigStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalConfigStringify(item)).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${canonicalConfigStringify(obj[k])}`)
+    .join(',')}}`;
+}
+
+/**
+ * Computes a deterministic SHA-256 hash of the EventEdge runtime configuration,
+ * including `risk`, `discovery`, `forecasting`, and `shadow` settings (excluding local file path).
+ */
+export function computeEventEdgeConfigHash(config: EventEdgeConfig): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      canonicalConfigStringify({
+        mode: config.mode,
+        risk: config.risk,
+        discovery: config.discovery,
+        forecasting: config.forecasting,
+        shadow: config.shadow,
+      })
+    )
+    .digest('hex');
 }
 
 /**
@@ -439,6 +493,45 @@ export function createEventEdgeConfig(
     minBaseRateSampleCount,
   });
 
+  const latencyModelVersion = validateNonEmptyString(
+    input.shadow?.latencyModelVersion ??
+      env.EVENTEDGE_SHADOW_LATENCY_MODEL_VERSION ??
+      EVENTEDGE_DEFAULT_SHADOW_CONFIG.latencyModelVersion,
+    'shadow.latencyModelVersion'
+  );
+
+  const latencyMs = validateShadowNumber(
+    input.shadow?.latencyMs ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_SHADOW_LATENCY_MS') ??
+      EVENTEDGE_DEFAULT_SHADOW_CONFIG.latencyMs,
+    'latencyMs',
+    0,
+    3_600_000
+  );
+
+  const maxBookAgeMs = validateShadowNumber(
+    input.shadow?.maxBookAgeMs ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_SHADOW_MAX_BOOK_AGE_MS') ??
+      EVENTEDGE_DEFAULT_SHADOW_CONFIG.maxBookAgeMs,
+    'maxBookAgeMs',
+    0,
+    86_400_000
+  );
+
+  const feeScheduleVersion = validateNonEmptyString(
+    input.shadow?.feeScheduleVersion ??
+      env.EVENTEDGE_SHADOW_FEE_SCHEDULE_VERSION ??
+      EVENTEDGE_DEFAULT_SHADOW_CONFIG.feeScheduleVersion,
+    'shadow.feeScheduleVersion'
+  );
+
+  const mergedShadow: EventEdgeShadowConfig = Object.freeze({
+    latencyModelVersion,
+    latencyMs,
+    maxBookAgeMs,
+    feeScheduleVersion,
+  });
+
   const rawDbPath =
     input.ledgerDbPath ?? env.EVENTEDGE_LEDGER_DB ?? getDefaultEventEdgeLedgerDbPath();
   const ledgerDbPath =
@@ -451,7 +544,27 @@ export function createEventEdgeConfig(
     risk: mergedRisk,
     discovery: mergedDiscovery,
     forecasting: mergedForecasting,
+    shadow: mergedShadow,
   });
+}
+
+function validateShadowNumber(
+  value: number,
+  name: 'latencyMs' | 'maxBookAgeMs',
+  minValue: number,
+  maxValue: number
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge shadow.${name} must be a finite number (received ${String(value)}).`
+    );
+  }
+  if (value < minValue || value > maxValue) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge shadow.${name} must be in [${minValue}, ${maxValue}] (received ${value}).`
+    );
+  }
+  return value;
 }
 
 function validateNonEmptyString(value: unknown, fieldPath: string): string {
@@ -626,6 +739,10 @@ export function loadEventEdgeConfigFromFile(
       forecasting:
         obj.forecasting && typeof obj.forecasting === 'object' && !Array.isArray(obj.forecasting)
           ? (obj.forecasting as EventEdgeConfigInput['forecasting'])
+          : undefined,
+      shadow:
+        obj.shadow && typeof obj.shadow === 'object' && !Array.isArray(obj.shadow)
+          ? (obj.shadow as Partial<EventEdgeShadowConfig>)
           : undefined,
     },
     options.env ?? process.env

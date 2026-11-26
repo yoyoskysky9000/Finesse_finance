@@ -35,6 +35,9 @@ export const EVENTEDGE_LEDGER_TABLES = [
   'experiments',
   'experiment_status_history',
   'contract_lifecycle_history',
+  'shadow_decisions',
+  'shadow_orders',
+  'shadow_fills',
 ] as const;
 
 export type EventEdgeLedgerTable = (typeof EVENTEDGE_LEDGER_TABLES)[number];
@@ -670,6 +673,109 @@ const V5_EE04_STATEMENTS: readonly string[] = [
   ...buildImmutabilityTriggers('probability_forecasts'),
 ];
 
+const V6_EE05_STATEMENTS: readonly string[] = [
+  // 19. Immutable Shadow Execution Decisions (paper-only; never touches live venues)
+  `CREATE TABLE IF NOT EXISTS shadow_decisions (
+    decision_id TEXT PRIMARY KEY,
+    forecast_id TEXT NOT NULL REFERENCES probability_forecasts(forecast_id),
+    forecast_stage TEXT NOT NULL CHECK (forecast_stage IN ('p_ensemble', 'p_calibrated')),
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    market_id TEXT NOT NULL,
+    model_probability REAL NOT NULL CHECK (model_probability >= 0.0 AND model_probability <= 1.0),
+    decision_timestamp TEXT NOT NULL,
+    decision_book_snapshot_id TEXT NOT NULL,
+    decision_book_captured_at TEXT NOT NULL,
+    decision_yes_bid_usd REAL NOT NULL CHECK (decision_yes_bid_usd >= 0.0 AND decision_yes_bid_usd <= 1.0),
+    decision_yes_ask_usd REAL NOT NULL CHECK (decision_yes_ask_usd >= 0.0 AND decision_yes_ask_usd <= 1.0),
+    edge_yes REAL NOT NULL,
+    edge_no REAL NOT NULL,
+    selected_edge REAL NOT NULL,
+    min_conservative_edge REAL NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('ORDER_CREATED', 'NO_EDGE')),
+    side TEXT CHECK (side IS NULL OR side IN ('BUY_YES', 'BUY_NO')),
+    requested_quantity INTEGER NOT NULL CHECK (requested_quantity > 0),
+    config_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (
+      (outcome = 'NO_EDGE' AND side IS NULL)
+      OR (outcome = 'ORDER_CREATED' AND side IS NOT NULL)
+    )
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_shadow_decisions_exp_market_time
+    ON shadow_decisions (experiment_id, market_id, decision_timestamp);`,
+  ...buildImmutabilityTriggers('shadow_decisions'),
+
+  // 20. Immutable Shadow Execution Orders (only created when edge >= minConservativeEdge)
+  `CREATE TABLE IF NOT EXISTS shadow_orders (
+    order_id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL REFERENCES shadow_decisions(decision_id),
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    forecast_id TEXT NOT NULL REFERENCES probability_forecasts(forecast_id),
+    market_id TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('BUY_YES', 'BUY_NO')),
+    requested_quantity INTEGER NOT NULL CHECK (requested_quantity > 0),
+    decision_price_usd REAL NOT NULL CHECK (decision_price_usd >= 0.0 AND decision_price_usd <= 1.0),
+    decision_book_snapshot_id TEXT NOT NULL,
+    decision_timestamp TEXT NOT NULL,
+    latency_model_version TEXT NOT NULL,
+    latency_ms REAL NOT NULL CHECK (latency_ms >= 0.0),
+    arrival_timestamp TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_shadow_orders_decision
+    ON shadow_orders (decision_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_shadow_orders_exp_market
+    ON shadow_orders (experiment_id, market_id, arrival_timestamp);`,
+  ...buildImmutabilityTriggers('shadow_orders'),
+
+  // 21. Immutable Shadow Execution Fills (simulated against arrival book displayed depth)
+  `CREATE TABLE IF NOT EXISTS shadow_fills (
+    fill_id TEXT PRIMARY KEY,
+    order_id TEXT REFERENCES shadow_orders(order_id),
+    decision_id TEXT NOT NULL REFERENCES shadow_decisions(decision_id),
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    market_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('FILLED', 'PARTIAL', 'NO_FILL')),
+    side TEXT CHECK (side IS NULL OR side IN ('BUY_YES', 'BUY_NO')),
+    requested_quantity INTEGER NOT NULL CHECK (requested_quantity > 0),
+    filled_quantity INTEGER NOT NULL CHECK (filled_quantity >= 0),
+    unfilled_quantity INTEGER NOT NULL CHECK (unfilled_quantity >= 0),
+    fill_price_usd REAL CHECK (fill_price_usd IS NULL OR (fill_price_usd >= 0.0 AND fill_price_usd <= 1.0)),
+    fee_usd REAL NOT NULL CHECK (fee_usd >= 0.0),
+    fee_schedule_version TEXT NOT NULL,
+    decision_book_snapshot_id TEXT NOT NULL,
+    arrival_book_snapshot_id TEXT,
+    arrival_book_captured_at TEXT,
+    displayed_depth_at_price REAL,
+    book_age_ms REAL,
+    evaluated_at TEXT NOT NULL,
+    reason_code TEXT CHECK (
+      reason_code IS NULL
+      OR reason_code IN ('NO_EDGE', 'BOOK_NOT_CAPTURED', 'STALE_BOOK', 'INSUFFICIENT_DEPTH')
+    ),
+    config_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (filled_quantity + unfilled_quantity = requested_quantity),
+    CHECK (
+      (status = 'NO_FILL' AND filled_quantity = 0 AND reason_code IS NOT NULL)
+      OR (status = 'PARTIAL' AND filled_quantity > 0 AND unfilled_quantity > 0 AND reason_code IS NULL)
+      OR (status = 'FILLED' AND filled_quantity = requested_quantity AND unfilled_quantity = 0 AND reason_code IS NULL)
+    ),
+    CHECK (
+      (reason_code = 'NO_EDGE' AND order_id IS NULL)
+      OR (order_id IS NOT NULL)
+    )
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_shadow_fills_decision
+    ON shadow_fills (decision_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_shadow_fills_order
+    ON shadow_fills (order_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_shadow_fills_exp_market
+    ON shadow_fills (experiment_id, market_id, evaluated_at);`,
+  ...buildImmutabilityTriggers('shadow_fills'),
+];
+
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
@@ -695,5 +801,10 @@ export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze
     version: 5,
     name: '005_ee04_allow_p_calibrated_forecast_stage',
     statements: Object.freeze([...V5_EE04_STATEMENTS]),
+  }),
+  Object.freeze({
+    version: 6,
+    name: '006_ee05_shadow_execution_tables',
+    statements: Object.freeze([...V6_EE05_STATEMENTS]),
   }),
 ]);
