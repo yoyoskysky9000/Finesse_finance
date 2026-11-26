@@ -1,4 +1,5 @@
 export {
+  PERSISTED_FORECAST_STAGES,
   UnregisteredExperimentError,
   ContractNotEligibleForForecastError,
   ForecastInvariantViolationError,
@@ -8,5 +9,7 @@ export {
   getForecastsForExperiment,
   getEnsembleForMarket,
   createForecastRepository,
+  type PersistedForecastStage,
+  type PersistedForecastRecord,
   type ForecastRepository,
 } from './forecastRepository';

@@ -8,7 +8,6 @@ import {
   type EnsembleCombinationMetadata,
   type ForecastAbstentionReason,
   type ForecastRecord,
-  type ForecastStage,
   type ReferenceClass,
   type UncertaintyInterval,
 } from '../forecasting/index';
@@ -17,6 +16,13 @@ import {
   getContractLifecycleState,
   type ContractLifecycleState,
 } from '../lifecycle/contractLifecycle';
+
+export const PERSISTED_FORECAST_STAGES = [...FORECAST_STAGES, 'p_calibrated'] as const;
+export type PersistedForecastStage = (typeof PERSISTED_FORECAST_STAGES)[number];
+
+export interface PersistedForecastRecord extends Omit<ForecastRecord, 'forecastStage'> {
+  readonly forecastStage: PersistedForecastStage;
+}
 
 /**
  * Thrown by `saveForecast` when `record.experimentId` does not exist in `experiments`.
@@ -77,7 +83,9 @@ function isNonEmptyString(value: unknown): value is string {
  * Re-validates all EE-02 output & provenance invariants at the persistence boundary.
  * Throws `ForecastInvariantViolationError` if any invariant fails.
  */
-export function assertForecastRecordInvariants(record: ForecastRecord): void {
+export function assertForecastRecordInvariants(
+  record: ForecastRecord | PersistedForecastRecord
+): void {
   const violations: string[] = [];
 
   if (!record || typeof record !== 'object') {
@@ -85,7 +93,7 @@ export function assertForecastRecordInvariants(record: ForecastRecord): void {
   }
 
   // Provenance completeness
-  const requiredStringFields: ReadonlyArray<keyof ForecastRecord> = [
+  const requiredStringFields: ReadonlyArray<keyof PersistedForecastRecord> = [
     'forecastId',
     'experimentId',
     'marketId',
@@ -106,8 +114,58 @@ export function assertForecastRecordInvariants(record: ForecastRecord): void {
     }
   }
 
-  if (!FORECAST_STAGES.includes(record.forecastStage)) {
+  if (!PERSISTED_FORECAST_STAGES.includes(record.forecastStage)) {
     violations.push(`Invalid forecastStage "${String(record.forecastStage)}".`);
+  }
+
+  if (record.forecastStage === 'p_calibrated') {
+    const calMeta =
+      record.featureMetadata &&
+      typeof record.featureMetadata === 'object' &&
+      'calibration' in record.featureMetadata &&
+      record.featureMetadata.calibration &&
+      typeof record.featureMetadata.calibration === 'object'
+        ? (record.featureMetadata.calibration as Record<string, unknown>)
+        : null;
+
+    const sourceForecastId =
+      Array.isArray(record.componentForecastIds) && record.componentForecastIds.length > 0
+        ? record.componentForecastIds[0]
+        : null;
+
+    if (!isNonEmptyString(sourceForecastId)) {
+      violations.push('p_calibrated record must list its source forecast_id in componentForecastIds.');
+    }
+    if (!calMeta) {
+      violations.push('p_calibrated record must include featureMetadata.calibration provenance.');
+    } else {
+      if (!isNonEmptyString(calMeta.method)) {
+        violations.push('p_calibrated provenance must name calibration method.');
+      }
+      if (!isNonEmptyString(calMeta.sourceForecastId) || calMeta.sourceForecastId !== sourceForecastId) {
+        violations.push(
+          'p_calibrated provenance sourceForecastId must be non-empty and match componentForecastIds[0].'
+        );
+      }
+      const trainWindow = calMeta.trainWindow as Record<string, unknown> | null | undefined;
+      const valWindow = calMeta.validationWindow as Record<string, unknown> | null | undefined;
+      if (
+        !trainWindow ||
+        typeof trainWindow !== 'object' ||
+        !isNonEmptyString(trainWindow.start) ||
+        !isNonEmptyString(trainWindow.end)
+      ) {
+        violations.push('p_calibrated provenance must include trainWindow { start, end }.');
+      }
+      if (
+        !valWindow ||
+        typeof valWindow !== 'object' ||
+        !isNonEmptyString(valWindow.start) ||
+        !isNonEmptyString(valWindow.end)
+      ) {
+        violations.push('p_calibrated provenance must include validationWindow { start, end }.');
+      }
+    }
   }
 
   if (!FORECAST_STATUSES.includes(record.status)) {
@@ -191,7 +249,7 @@ interface RawProbabilityForecastRow {
   event_id: string;
   event_family_id: string;
   event_family_derivation_version: string;
-  forecast_stage: ForecastStage;
+  forecast_stage: PersistedForecastStage;
   status: 'FORECAST' | 'ABSTAINED';
   probability: number | null;
   uncertainty_lower: number | null;
@@ -214,7 +272,7 @@ interface RawProbabilityForecastRow {
   forecast_timestamp: string;
 }
 
-function mapRawForecastRow(row: RawProbabilityForecastRow): ForecastRecord {
+function mapRawForecastRow(row: RawProbabilityForecastRow): PersistedForecastRecord {
   const uncertaintyInterval: UncertaintyInterval | null =
     row.uncertainty_lower !== null &&
     row.uncertainty_upper !== null &&
@@ -276,7 +334,10 @@ function mapRawForecastRow(row: RawProbabilityForecastRow): ForecastRecord {
  *
  * No update or delete operations exist on this repository.
  */
-export function saveForecast(db: DatabaseSync, record: ForecastRecord): ForecastRecord {
+export function saveForecast<T extends ForecastRecord | PersistedForecastRecord>(
+  db: DatabaseSync,
+  record: T
+): T {
   // 1. Re-check EE-02 invariants at the persistence boundary
   assertForecastRecordInvariants(record);
 
@@ -293,15 +354,18 @@ export function saveForecast(db: DatabaseSync, record: ForecastRecord): Forecast
   }
 
   // 4. Append-only parameterized insert into probability_forecasts
-  persistForecastRecord(db, record);
+  persistForecastRecord(db, record as ForecastRecord);
   return record;
 }
 
 /**
  * Returns all immutable forecast stage records persisted for a market in chronological order.
  */
-export function getForecastsForMarket(db: DatabaseSync, marketId: string): ForecastRecord[] {
-  return listForecastsForMarket(db, marketId);
+export function getForecastsForMarket(
+  db: DatabaseSync,
+  marketId: string
+): PersistedForecastRecord[] {
+  return listForecastsForMarket(db, marketId) as unknown as PersistedForecastRecord[];
 }
 
 /**
@@ -310,7 +374,7 @@ export function getForecastsForMarket(db: DatabaseSync, marketId: string): Forec
 export function getForecastsForExperiment(
   db: DatabaseSync,
   experimentId: string
-): ForecastRecord[] {
+): PersistedForecastRecord[] {
   const rows = db
     .prepare(
       `SELECT
@@ -362,13 +426,13 @@ export function getEnsembleForMarket(
     )
     .get(marketId.trim()) as unknown as RawProbabilityForecastRow | undefined;
 
-  return row ? mapRawForecastRow(row) : null;
+  return row ? (mapRawForecastRow(row) as ForecastRecord) : null;
 }
 
 export interface ForecastRepository {
-  readonly saveForecast: (record: ForecastRecord) => ForecastRecord;
-  readonly getForecastsForMarket: (marketId: string) => ForecastRecord[];
-  readonly getForecastsForExperiment: (experimentId: string) => ForecastRecord[];
+  readonly saveForecast: <T extends ForecastRecord | PersistedForecastRecord>(record: T) => T;
+  readonly getForecastsForMarket: (marketId: string) => PersistedForecastRecord[];
+  readonly getForecastsForExperiment: (experimentId: string) => PersistedForecastRecord[];
   readonly getEnsembleForMarket: (marketId: string) => ForecastRecord | null;
 }
 
@@ -378,7 +442,8 @@ export interface ForecastRepository {
  */
 export function createForecastRepository(db: DatabaseSync): ForecastRepository {
   return Object.freeze({
-    saveForecast: (record: ForecastRecord) => saveForecast(db, record),
+    saveForecast: <T extends ForecastRecord | PersistedForecastRecord>(record: T) =>
+      saveForecast(db, record),
     getForecastsForMarket: (marketId: string) => getForecastsForMarket(db, marketId),
     getForecastsForExperiment: (experimentId: string) =>
       getForecastsForExperiment(db, experimentId),

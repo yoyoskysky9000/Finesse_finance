@@ -586,6 +586,90 @@ const V4_EE03_STATEMENTS: readonly string[] = [
    END;`,
 ];
 
+const V5_EE04_STATEMENTS: readonly string[] = [
+  // Forward-only migration extending probability_forecasts.forecast_stage CHECK to include
+  // 'p_calibrated' while preserving all existing rows untouched and restoring all indexes
+  // and append-only immutability triggers.
+  `CREATE TABLE probability_forecasts_v5 (
+    forecast_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    event_family_id TEXT NOT NULL,
+    event_family_derivation_version TEXT NOT NULL,
+    forecast_stage TEXT NOT NULL CHECK (forecast_stage IN ('p_base', 'p_quant', 'p_ensemble', 'p_calibrated')),
+    status TEXT NOT NULL CHECK (status IN ('FORECAST', 'ABSTAINED')),
+    probability REAL CHECK (
+      (status = 'ABSTAINED' AND probability IS NULL)
+      OR (status = 'FORECAST' AND probability IS NOT NULL AND probability >= 0.0 AND probability <= 1.0)
+    ),
+    uncertainty_lower REAL CHECK (uncertainty_lower IS NULL OR (uncertainty_lower >= 0.0 AND uncertainty_lower <= 1.0)),
+    uncertainty_upper REAL CHECK (uncertainty_upper IS NULL OR (uncertainty_upper >= 0.0 AND uncertainty_upper <= 1.0)),
+    uncertainty_method TEXT,
+    extreme_probability_justified INTEGER NOT NULL DEFAULT 0 CHECK (extreme_probability_justified IN (0, 1)),
+    extreme_probability_justification TEXT,
+    abstention_reasons_json TEXT NOT NULL DEFAULT '[]',
+    model_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    code_commit_hash TEXT NOT NULL,
+    data_snapshot_id TEXT NOT NULL,
+    base_rate_version TEXT NOT NULL,
+    ensemble_version TEXT NOT NULL,
+    rule_version_id TEXT REFERENCES settlement_rule_versions(rule_version_id),
+    component_forecast_ids_json TEXT NOT NULL DEFAULT '[]',
+    ensemble_metadata_json TEXT,
+    reference_class_json TEXT,
+    feature_metadata_json TEXT,
+    forecast_timestamp TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (uncertainty_lower IS NULL OR uncertainty_upper IS NULL OR uncertainty_lower <= uncertainty_upper),
+    CHECK (
+      status = 'ABSTAINED'
+      OR (probability > 0.0 AND probability < 1.0)
+      OR (
+        extreme_probability_justified = 1
+        AND extreme_probability_justification IS NOT NULL
+        AND length(trim(extreme_probability_justification)) > 0
+      )
+    )
+  );`,
+  `INSERT INTO probability_forecasts_v5 (
+    forecast_id, experiment_id, market_id, event_id,
+    event_family_id, event_family_derivation_version,
+    forecast_stage, status, probability,
+    uncertainty_lower, uncertainty_upper, uncertainty_method,
+    extreme_probability_justified, extreme_probability_justification,
+    abstention_reasons_json,
+    model_version, config_hash, code_commit_hash,
+    data_snapshot_id, base_rate_version, ensemble_version,
+    rule_version_id, component_forecast_ids_json,
+    ensemble_metadata_json, reference_class_json, feature_metadata_json,
+    forecast_timestamp, created_at
+  )
+  SELECT
+    forecast_id, experiment_id, market_id, event_id,
+    event_family_id, event_family_derivation_version,
+    forecast_stage, status, probability,
+    uncertainty_lower, uncertainty_upper, uncertainty_method,
+    extreme_probability_justified, extreme_probability_justification,
+    abstention_reasons_json,
+    model_version, config_hash, code_commit_hash,
+    data_snapshot_id, base_rate_version, ensemble_version,
+    rule_version_id, component_forecast_ids_json,
+    ensemble_metadata_json, reference_class_json, feature_metadata_json,
+    forecast_timestamp, created_at
+  FROM probability_forecasts;`,
+  `DROP TABLE probability_forecasts;`,
+  `ALTER TABLE probability_forecasts_v5 RENAME TO probability_forecasts;`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_prob_forecasts_market_stage_time
+    ON probability_forecasts (market_id, forecast_stage, forecast_timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_prob_forecasts_experiment
+    ON probability_forecasts (experiment_id, forecast_timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_prob_forecasts_event_family
+    ON probability_forecasts (event_family_id, forecast_timestamp);`,
+  ...buildImmutabilityTriggers('probability_forecasts'),
+];
+
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
@@ -606,5 +690,10 @@ export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze
     version: 4,
     name: '004_ee03_experiments_and_contract_lifecycle',
     statements: Object.freeze([...V4_EE03_STATEMENTS]),
+  }),
+  Object.freeze({
+    version: 5,
+    name: '005_ee04_allow_p_calibrated_forecast_stage',
+    statements: Object.freeze([...V5_EE04_STATEMENTS]),
   }),
 ]);

@@ -16,7 +16,7 @@ eventedge/
 ├── config/
 │   └── index.ts          # Mode guard (OBSERVE | PAPER | DEMO; LIVE hard-disabled), risk, discovery & forecasting defaults
 ├── db/
-│   ├── schema.ts         # Immutable 18-table EventEdge SQLite ledger schema + forward-only migrations (v1..v4)
+│   ├── schema.ts         # Immutable 18-table EventEdge SQLite ledger schema + forward-only migrations (v1..v5)
 │   └── migrations.ts     # node:sqlite (DatabaseSync) WAL opener & transactional migration runner
 ├── discovery/
 │   ├── kalshiPublicClient.ts  # Public-only Kalshi v2 REST client (no auth/trading calls)
@@ -37,8 +37,15 @@ eventedge/
 │   ├── contractLifecycle.ts # Contract resolution state machine, EE-01 auditor binding & rules-revision hook
 │   └── index.ts          # Lifecycle barrel exports
 ├── persistence/
-│   ├── forecastRepository.ts # Append-only ForecastRepository (registry, lifecycle & invariant guards)
+│   ├── forecastRepository.ts # Append-only ForecastRepository (registry, lifecycle & invariant guards; supports p_calibrated)
 │   └── index.ts          # Persistence barrel exports
+├── evaluation/
+│   ├── types.ts          # Evaluation, calibration, cluster bootstrap & kill-gate report types
+│   ├── scoring.ts        # Deterministic Brier, clipped log-loss & family-clustered bootstrap CI
+│   ├── outcomeJoin.ts    # Outcome join, timestamp-matched market reference & denominator accounting
+│   ├── calibration.ts    # Temporally isolated Beta, Platt & Temperature calibration + p_calibrated builder
+│   ├── killGate.ts       # evaluateExperiment kill-gate report & p_calibrated persistence
+│   └── index.ts          # Evaluation barrel exports
 ├── runner/
 │   ├── observeRunner.ts  # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
 │   └── index.ts          # Runner barrel exports
@@ -48,7 +55,8 @@ eventedge/
     ├── ee00.test.ts      # EE-00 verification suite (LIVE lock, defaults, ledger migrations)
     ├── ee01.test.ts      # EE-01 verification suite (discovery, resolution auditor, rule versions, OBSERVE runner)
     ├── ee02.test.ts      # EE-02 verification suite (price-blindness, stages, provenance, invariants, determinism)
-    └── ee03.test.ts      # EE-03 verification suite (experiment registry, persistence layer, lifecycle & hooks)
+    ├── ee03.test.ts      # EE-03 verification suite (experiment registry, persistence layer, lifecycle & hooks)
+    └── ee04.test.ts      # EE-04 verification suite (scoring, denominator, temporal calibration, cluster bootstrap, kill-gate)
 ```
 
 ### 1. Execution Mode Guard (`eventedge/config/index.ts`)
@@ -80,7 +88,7 @@ All risk, discovery, and forecasting settings are configurable via constructor o
 ### 3. Immutable Ledger (`eventedge/db/schema.ts`, `eventedge/db/migrations.ts`)
 Uses Node's built-in `node:sqlite` (`DatabaseSync`) in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`), matching `src/server/ExecutionVault.ts`, `src/server/riskGuard.ts`, and `server.ts`.
 
-Forward-only migrations (`schema_migrations`, currently v1..v4) provision 18 append-only tables protected by SQLite immutability triggers (`RAISE(ABORT, ...)`):
+Forward-only migrations (`schema_migrations`, currently v1..v5) provision 18 append-only tables protected by SQLite immutability triggers (`RAISE(ABORT, ...)`):
 1. `market_snapshots`
 2. `settlement_rule_versions`
 3. `research_evidence`
@@ -95,7 +103,7 @@ Forward-only migrations (`schema_migrations`, currently v1..v4) provision 18 app
 12. `realized_pnl`
 13. `unrealized_pnl`
 14. `observe_run_summaries`
-15. `probability_forecasts`
+15. `probability_forecasts` (stages `p_base`, `p_quant`, `p_ensemble`, `p_calibrated` via v5)
 16. `experiments` (append-only except controlled `status` transitions logged in `experiment_status_history`)
 17. `experiment_status_history`
 18. `contract_lifecycle_history` (plus automatic `RULES_REVISED` trigger on new `settlement_rule_versions` for `APPROVED`/`ACTIVE` contracts)
@@ -105,11 +113,12 @@ Forward-only migrations (`schema_migrations`, currently v1..v4) provision 18 app
 ## Running Tests & Type Checks
 
 ```bash
-# Run EventEdge EE-00, EE-01, EE-02, and EE-03 automated tests (zero live network)
+# Run EventEdge EE-00 through EE-04 automated tests (zero live network)
 npx tsx eventedge/tests/ee00.test.ts
 npx tsx eventedge/tests/ee01.test.ts
 npx tsx eventedge/tests/ee02.test.ts
 npx tsx eventedge/tests/ee03.test.ts
+npx tsx eventedge/tests/ee04.test.ts
 
 # Type-check entire workspace including eventedge/
 npm run lint

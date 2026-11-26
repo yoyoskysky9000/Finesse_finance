@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ContractNotEligibleForForecastError,
+  EVENTEDGE_MIGRATIONS,
   EventEdgeLiveModeDisabledError,
   ExperimentAlreadyExistsError,
   ForecastInvariantViolationError,
@@ -110,7 +111,11 @@ function runEe03Tests(): void {
 
     const { db, migrationResult } = initializeEventEdgeLedger(cfg.ledgerDbPath);
     try {
-      assert.equal(migrationResult.currentVersion, 4);
+      assert.equal(migrationResult.appliedVersions.includes(4), true);
+      assert.equal(
+        migrationResult.currentVersion,
+        EVENTEDGE_MIGRATIONS[EVENTEDGE_MIGRATIONS.length - 1].version
+      );
 
       // -----------------------------------------------------------------------
       // (a) EXPERIMENT REGISTRY: create, reject duplicate, legal transitions,
