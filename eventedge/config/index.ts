@@ -72,6 +72,24 @@ export interface EventEdgeDiscoveryConfig {
   readonly rateLimitDelayMs: number;
 }
 
+export interface EventEdgeEnsembleWeights {
+  /** Weight applied to `p_base` in deterministic weighted linear combination. */
+  readonly p_base: number;
+  /** Weight applied to `p_quant` in deterministic weighted linear combination. */
+  readonly p_quant: number;
+}
+
+export interface EventEdgeForecastingConfig {
+  /** Version identifier for the deterministic ensemble combiner. */
+  readonly ensembleVersion: string;
+  /** Non-negative stage weights normalized deterministically when multiple stages are available. */
+  readonly ensembleWeights: EventEdgeEnsembleWeights;
+  /** Version identifier for deterministic event_family_id derivation from event ticker. */
+  readonly eventFamilyDerivationVersion: string;
+  /** Minimum reference-class sample count required before p_base emits a forecast (default 1). */
+  readonly minBaseRateSampleCount: number;
+}
+
 export interface EventEdgeConfig {
   readonly mode: EventEdgeAllowedMode;
   /** Hard-locked to false; LIVE execution cannot be toggled at runtime. */
@@ -79,6 +97,7 @@ export interface EventEdgeConfig {
   readonly ledgerDbPath: string;
   readonly risk: EventEdgeRiskConfig;
   readonly discovery: EventEdgeDiscoveryConfig;
+  readonly forecasting: EventEdgeForecastingConfig;
 }
 
 export interface EventEdgeConfigInput {
@@ -86,6 +105,11 @@ export interface EventEdgeConfigInput {
   ledgerDbPath?: string;
   risk?: Partial<EventEdgeRiskConfig>;
   discovery?: Partial<EventEdgeDiscoveryConfig>;
+  forecasting?: Partial<
+    Omit<EventEdgeForecastingConfig, 'ensembleWeights'> & {
+      ensembleWeights?: Partial<EventEdgeEnsembleWeights>;
+    }
+  >;
 }
 
 export const EVENTEDGE_DEFAULT_RISK_CONFIG: Readonly<EventEdgeRiskConfig> = Object.freeze({
@@ -109,6 +133,17 @@ export const EVENTEDGE_DEFAULT_DISCOVERY_CONFIG: Readonly<EventEdgeDiscoveryConf
     rateLimitDelayMs: 250,
   }
 );
+
+export const EVENTEDGE_DEFAULT_FORECASTING_CONFIG: Readonly<EventEdgeForecastingConfig> =
+  Object.freeze({
+    ensembleVersion: 'ee-ensemble-v1.0.0',
+    ensembleWeights: Object.freeze({
+      p_base: 0.5,
+      p_quant: 0.5,
+    }),
+    eventFamilyDerivationVersion: 'ee-family-prefix-v1',
+    minBaseRateSampleCount: 1,
+  });
 
 export function getDefaultEventEdgeLedgerDbPath(): string {
   return path.resolve(process.cwd(), '.eventedge_ledger.sqlite');
@@ -353,6 +388,57 @@ export function createEventEdgeConfig(
     rateLimitDelayMs,
   });
 
+  const ensembleVersion = validateNonEmptyString(
+    input.forecasting?.ensembleVersion ??
+      env.EVENTEDGE_ENSEMBLE_VERSION ??
+      EVENTEDGE_DEFAULT_FORECASTING_CONFIG.ensembleVersion,
+    'forecasting.ensembleVersion'
+  );
+
+  const eventFamilyDerivationVersion = validateNonEmptyString(
+    input.forecasting?.eventFamilyDerivationVersion ??
+      env.EVENTEDGE_EVENT_FAMILY_DERIVATION_VERSION ??
+      EVENTEDGE_DEFAULT_FORECASTING_CONFIG.eventFamilyDerivationVersion,
+    'forecasting.eventFamilyDerivationVersion'
+  );
+
+  const rawWeightBase =
+    input.forecasting?.ensembleWeights?.p_base ??
+    parseOptionalEnvNumber(env, 'EVENTEDGE_ENSEMBLE_WEIGHT_BASE') ??
+    EVENTEDGE_DEFAULT_FORECASTING_CONFIG.ensembleWeights.p_base;
+
+  const rawWeightQuant =
+    input.forecasting?.ensembleWeights?.p_quant ??
+    parseOptionalEnvNumber(env, 'EVENTEDGE_ENSEMBLE_WEIGHT_QUANT') ??
+    EVENTEDGE_DEFAULT_FORECASTING_CONFIG.ensembleWeights.p_quant;
+
+  const weightBase = validateWeight(rawWeightBase, 'forecasting.ensembleWeights.p_base');
+  const weightQuant = validateWeight(rawWeightQuant, 'forecasting.ensembleWeights.p_quant');
+  if (weightBase + weightQuant <= 0) {
+    throw new EventEdgeConfigValidationError(
+      'EventEdge forecasting.ensembleWeights must sum to a positive value (> 0).'
+    );
+  }
+
+  const minBaseRateSampleCount = validateForecastingInteger(
+    input.forecasting?.minBaseRateSampleCount ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_MIN_BASE_RATE_SAMPLE_COUNT') ??
+      EVENTEDGE_DEFAULT_FORECASTING_CONFIG.minBaseRateSampleCount,
+    'forecasting.minBaseRateSampleCount',
+    1,
+    1_000_000
+  );
+
+  const mergedForecasting: EventEdgeForecastingConfig = Object.freeze({
+    ensembleVersion,
+    ensembleWeights: Object.freeze({
+      p_base: weightBase,
+      p_quant: weightQuant,
+    }),
+    eventFamilyDerivationVersion,
+    minBaseRateSampleCount,
+  });
+
   const rawDbPath =
     input.ledgerDbPath ?? env.EVENTEDGE_LEDGER_DB ?? getDefaultEventEdgeLedgerDbPath();
   const ledgerDbPath =
@@ -364,7 +450,40 @@ export function createEventEdgeConfig(
     ledgerDbPath,
     risk: mergedRisk,
     discovery: mergedDiscovery,
+    forecasting: mergedForecasting,
   });
+}
+
+function validateNonEmptyString(value: unknown, fieldPath: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge ${fieldPath} must be a non-empty string.`
+    );
+  }
+  return value.trim();
+}
+
+function validateWeight(value: number, fieldPath: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge ${fieldPath} must be a finite number in [0, 1] (received ${String(value)}).`
+    );
+  }
+  return value;
+}
+
+function validateForecastingInteger(
+  value: number,
+  fieldPath: string,
+  minValue: number,
+  maxValue: number
+): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < minValue || value > maxValue) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge ${fieldPath} must be an integer in [${minValue}, ${maxValue}] (received ${String(value)}).`
+    );
+  }
+  return value;
 }
 
 function validateDiscoveryNumber(
@@ -503,6 +622,10 @@ export function loadEventEdgeConfigFromFile(
       discovery:
         obj.discovery && typeof obj.discovery === 'object' && !Array.isArray(obj.discovery)
           ? (obj.discovery as Partial<EventEdgeDiscoveryConfig>)
+          : undefined,
+      forecasting:
+        obj.forecasting && typeof obj.forecasting === 'object' && !Array.isArray(obj.forecasting)
+          ? (obj.forecasting as EventEdgeConfigInput['forecasting'])
           : undefined,
     },
     options.env ?? process.env

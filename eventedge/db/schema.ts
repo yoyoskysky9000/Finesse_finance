@@ -31,6 +31,7 @@ export const EVENTEDGE_LEDGER_TABLES = [
   'realized_pnl',
   'unrealized_pnl',
   'observe_run_summaries',
+  'probability_forecasts',
 ] as const;
 
 export type EventEdgeLedgerTable = (typeof EVENTEDGE_LEDGER_TABLES)[number];
@@ -380,6 +381,60 @@ const V2_EE01_STATEMENTS: readonly string[] = [
   ...buildImmutabilityTriggers('observe_run_summaries'),
 ];
 
+const V3_EE02_STATEMENTS: readonly string[] = [
+  // 15. Immutable price-blind probability forecasts (p_base, p_quant, p_ensemble; first-class abstention)
+  `CREATE TABLE IF NOT EXISTS probability_forecasts (
+    forecast_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    event_family_id TEXT NOT NULL,
+    event_family_derivation_version TEXT NOT NULL,
+    forecast_stage TEXT NOT NULL CHECK (forecast_stage IN ('p_base', 'p_quant', 'p_ensemble')),
+    status TEXT NOT NULL CHECK (status IN ('FORECAST', 'ABSTAINED')),
+    probability REAL CHECK (
+      (status = 'ABSTAINED' AND probability IS NULL)
+      OR (status = 'FORECAST' AND probability IS NOT NULL AND probability >= 0.0 AND probability <= 1.0)
+    ),
+    uncertainty_lower REAL CHECK (uncertainty_lower IS NULL OR (uncertainty_lower >= 0.0 AND uncertainty_lower <= 1.0)),
+    uncertainty_upper REAL CHECK (uncertainty_upper IS NULL OR (uncertainty_upper >= 0.0 AND uncertainty_upper <= 1.0)),
+    uncertainty_method TEXT,
+    extreme_probability_justified INTEGER NOT NULL DEFAULT 0 CHECK (extreme_probability_justified IN (0, 1)),
+    extreme_probability_justification TEXT,
+    abstention_reasons_json TEXT NOT NULL DEFAULT '[]',
+    model_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    code_commit_hash TEXT NOT NULL,
+    data_snapshot_id TEXT NOT NULL,
+    base_rate_version TEXT NOT NULL,
+    ensemble_version TEXT NOT NULL,
+    rule_version_id TEXT REFERENCES settlement_rule_versions(rule_version_id),
+    component_forecast_ids_json TEXT NOT NULL DEFAULT '[]',
+    ensemble_metadata_json TEXT,
+    reference_class_json TEXT,
+    feature_metadata_json TEXT,
+    forecast_timestamp TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (uncertainty_lower IS NULL OR uncertainty_upper IS NULL OR uncertainty_lower <= uncertainty_upper),
+    CHECK (
+      status = 'ABSTAINED'
+      OR (probability > 0.0 AND probability < 1.0)
+      OR (
+        extreme_probability_justified = 1
+        AND extreme_probability_justification IS NOT NULL
+        AND length(trim(extreme_probability_justification)) > 0
+      )
+    )
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_prob_forecasts_market_stage_time
+    ON probability_forecasts (market_id, forecast_stage, forecast_timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_prob_forecasts_experiment
+    ON probability_forecasts (experiment_id, forecast_timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_prob_forecasts_event_family
+    ON probability_forecasts (event_family_id, forecast_timestamp);`,
+  ...buildImmutabilityTriggers('probability_forecasts'),
+];
+
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
@@ -390,5 +445,10 @@ export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze
     version: 2,
     name: '002_ee01_discovery_resolution_and_observe_runs',
     statements: Object.freeze([...V2_EE01_STATEMENTS]),
+  }),
+  Object.freeze({
+    version: 3,
+    name: '003_ee02_price_blind_probability_forecasts',
+    statements: Object.freeze([...V3_EE02_STATEMENTS]),
   }),
 ]);
