@@ -32,6 +32,9 @@ export const EVENTEDGE_LEDGER_TABLES = [
   'unrealized_pnl',
   'observe_run_summaries',
   'probability_forecasts',
+  'experiments',
+  'experiment_status_history',
+  'contract_lifecycle_history',
 ] as const;
 
 export type EventEdgeLedgerTable = (typeof EVENTEDGE_LEDGER_TABLES)[number];
@@ -435,6 +438,154 @@ const V3_EE02_STATEMENTS: readonly string[] = [
   ...buildImmutabilityTriggers('probability_forecasts'),
 ];
 
+const V4_EE03_STATEMENTS: readonly string[] = [
+  // 16. Experiment Registry (append-only except controlled status-column transition)
+  `CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    hypothesis TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('REGISTERED', 'RUNNING', 'COMPLETED', 'KILLED')),
+    kill_criteria TEXT NOT NULL,
+    sample_definition TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_experiments_status_time
+    ON experiments (status, registered_at);`,
+
+  // 17. Append-only Experiment Status History
+  `CREATE TABLE IF NOT EXISTS experiment_status_history (
+    history_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    from_status TEXT NOT NULL CHECK (from_status IN ('REGISTERED', 'RUNNING', 'COMPLETED', 'KILLED')),
+    to_status TEXT NOT NULL CHECK (to_status IN ('REGISTERED', 'RUNNING', 'COMPLETED', 'KILLED')),
+    reason TEXT NOT NULL,
+    changed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (
+      (from_status = 'REGISTERED' AND to_status = 'RUNNING')
+      OR (from_status = 'RUNNING' AND to_status = 'COMPLETED')
+      OR (from_status = 'RUNNING' AND to_status = 'KILLED')
+    )
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_exp_status_history_exp
+    ON experiment_status_history (experiment_id, changed_at);`,
+  ...buildImmutabilityTriggers('experiment_status_history'),
+
+  // Controlled immutability triggers on experiments:
+  // DELETE always aborts; UPDATE aborts unless ONLY status changes along a legal edge AND a
+  // corresponding experiment_status_history row exists for that transition.
+  `CREATE TRIGGER IF NOT EXISTS trg_experiments_no_delete
+   BEFORE DELETE ON experiments
+   BEGIN
+     SELECT RAISE(ABORT, 'EventEdge ledger table experiments is immutable: DELETE forbidden');
+   END;`,
+  `CREATE TRIGGER IF NOT EXISTS trg_experiments_controlled_status_update
+   BEFORE UPDATE ON experiments
+   BEGIN
+     SELECT CASE
+       WHEN NEW.experiment_id IS NOT OLD.experiment_id
+         OR NEW.title IS NOT OLD.title
+         OR NEW.hypothesis IS NOT OLD.hypothesis
+         OR NEW.registered_at IS NOT OLD.registered_at
+         OR NEW.kill_criteria IS NOT OLD.kill_criteria
+         OR NEW.sample_definition IS NOT OLD.sample_definition
+         OR NEW.model_version IS NOT OLD.model_version
+         OR NEW.config_hash IS NOT OLD.config_hash
+         OR NEW.notes IS NOT OLD.notes
+         OR NEW.created_at IS NOT OLD.created_at
+       THEN RAISE(ABORT, 'EventEdge ledger table experiments is immutable: UPDATE forbidden on non-status columns')
+     END;
+     SELECT CASE
+       WHEN NOT (
+         (OLD.status = 'REGISTERED' AND NEW.status = 'RUNNING')
+         OR (OLD.status = 'RUNNING' AND NEW.status = 'COMPLETED')
+         OR (OLD.status = 'RUNNING' AND NEW.status = 'KILLED')
+       )
+       THEN RAISE(ABORT, 'EventEdge ledger table experiments: illegal status transition forbidden')
+     END;
+     SELECT CASE
+       WHEN NOT EXISTS (
+         SELECT 1 FROM experiment_status_history h
+         WHERE h.experiment_id = NEW.experiment_id
+           AND h.from_status = OLD.status
+           AND h.to_status = NEW.status
+       )
+       THEN RAISE(ABORT, 'EventEdge ledger table experiments: direct status UPDATE without experiment_status_history forbidden')
+     END;
+   END;`,
+
+  // 18. Append-only Contract Lifecycle History
+  `CREATE TABLE IF NOT EXISTS contract_lifecycle_history (
+    transition_id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    from_state TEXT CHECK (
+      from_state IS NULL
+      OR from_state IN (
+        'DISCOVERED', 'AUDIT_PENDING', 'APPROVED', 'REJECTED',
+        'ACTIVE', 'SETTLEMENT_PENDING', 'RESOLVED', 'DISPUTED', 'VOIDED'
+      )
+    ),
+    to_state TEXT NOT NULL CHECK (
+      to_state IN (
+        'DISCOVERED', 'AUDIT_PENDING', 'APPROVED', 'REJECTED',
+        'ACTIVE', 'SETTLEMENT_PENDING', 'RESOLVED', 'DISPUTED', 'VOIDED'
+      )
+    ),
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    rule_version_id TEXT REFERENCES settlement_rule_versions(rule_version_id),
+    transitioned_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_contract_lifecycle_market_time
+    ON contract_lifecycle_history (market_id, transitioned_at);`,
+  ...buildImmutabilityTriggers('contract_lifecycle_history'),
+
+  // Rules-revision hook trigger: whenever a new settlement_rule_versions row is inserted for a
+  // contract currently in APPROVED or ACTIVE state, automatically append an AUDIT_PENDING
+  // transition with reason = 'RULES_REVISED' and the new rule_version_id.
+  `CREATE TRIGGER IF NOT EXISTS trg_settlement_rule_versions_lifecycle_revision
+   AFTER INSERT ON settlement_rule_versions
+   WHEN (
+     SELECT to_state
+     FROM contract_lifecycle_history
+     WHERE market_id = NEW.market_ticker
+     ORDER BY rowid DESC
+     LIMIT 1
+   ) IN ('APPROVED', 'ACTIVE')
+   BEGIN
+     INSERT INTO contract_lifecycle_history (
+       transition_id,
+       market_id,
+       from_state,
+       to_state,
+       reason,
+       actor,
+       rule_version_id,
+       transitioned_at
+     ) VALUES (
+       'lch_rev_' || NEW.rule_version_id,
+       NEW.market_ticker,
+       (
+         SELECT to_state
+         FROM contract_lifecycle_history
+         WHERE market_id = NEW.market_ticker
+         ORDER BY rowid DESC
+         LIMIT 1
+       ),
+       'AUDIT_PENDING',
+       'RULES_REVISED',
+       'rules_revision_hook',
+       NEW.rule_version_id,
+       COALESCE(NEW.audited_at, NEW.effective_at)
+     );
+   END;`,
+];
+
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
@@ -450,5 +601,10 @@ export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze
     version: 3,
     name: '003_ee02_price_blind_probability_forecasts',
     statements: Object.freeze([...V3_EE02_STATEMENTS]),
+  }),
+  Object.freeze({
+    version: 4,
+    name: '004_ee03_experiments_and_contract_lifecycle',
+    statements: Object.freeze([...V4_EE03_STATEMENTS]),
   }),
 ]);
