@@ -6,6 +6,7 @@ import {
   EVENTEDGE_DEFAULT_MODE,
   EVENTEDGE_DEFAULT_RISK_CONFIG,
   EVENTEDGE_LEDGER_TABLES,
+  EVENTEDGE_MIGRATIONS,
   EVENTEDGE_MODES,
   EventEdgeConfigValidationError,
   EventEdgeLiveModeDisabledError,
@@ -166,18 +167,20 @@ function runEe00Tests(): void {
     const sqlitePath = path.join(tempDir, 'eventedge_test.sqlite');
     const { db, migrationResult } = initializeEventEdgeLedger(sqlitePath);
     try {
-      assert.equal(migrationResult.currentVersion, 1);
-      assert.deepEqual(migrationResult.appliedVersions, [1]);
+      const expectedVersions = EVENTEDGE_MIGRATIONS.map((m) => m.version);
+      const latestVersion = expectedVersions[expectedVersions.length - 1];
+      assert.equal(migrationResult.currentVersion, latestVersion);
+      assert.deepEqual(migrationResult.appliedVersions, expectedVersions);
       assert.deepEqual(migrationResult.alreadyAppliedVersions, []);
 
       // Re-running migration must be idempotent
       const secondRun = applyEventEdgeMigrations(db);
-      assert.equal(secondRun.currentVersion, 1);
+      assert.equal(secondRun.currentVersion, latestVersion);
       assert.deepEqual(secondRun.appliedVersions, []);
-      assert.deepEqual(secondRun.alreadyAppliedVersions, [1]);
+      assert.deepEqual(secondRun.alreadyAppliedVersions, expectedVersions);
 
       const applied = getAppliedMigrations(db);
-      assert.equal(applied.length, 1);
+      assert.equal(applied.length, expectedVersions.length);
       assert.equal(applied[0].version, 1);
       assert.equal(applied[0].name, '001_initial_immutable_eventedge_ledger');
 
@@ -548,7 +551,8 @@ function runEe00Tests(): void {
     // Also verify :memory: initialization works cleanly
     const mem = initializeEventEdgeLedger(':memory:');
     try {
-      assert.equal(mem.migrationResult.currentVersion, 1);
+      const latestVersion = EVENTEDGE_MIGRATIONS[EVENTEDGE_MIGRATIONS.length - 1].version;
+      assert.equal(mem.migrationResult.currentVersion, latestVersion);
       assert.equal(listEventEdgeTables(mem.db).length, EVENTEDGE_LEDGER_TABLES.length + 1);
     } finally {
       mem.db.close();

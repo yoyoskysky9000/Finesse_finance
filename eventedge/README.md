@@ -14,12 +14,24 @@ eventedge/
 ├── README.md             # Package overview & usage
 ├── index.ts              # Public barrel exports
 ├── config/
-│   └── index.ts          # Mode guard (OBSERVE | PAPER | DEMO; LIVE hard-disabled) & risk defaults
+│   └── index.ts          # Mode guard (OBSERVE | PAPER | DEMO; LIVE hard-disabled), risk & discovery defaults
 ├── db/
-│   ├── schema.ts         # Immutable 13-table EventEdge SQLite ledger schema + immutability triggers
+│   ├── schema.ts         # Immutable 14-table EventEdge SQLite ledger schema + forward-only migrations
 │   └── migrations.ts     # node:sqlite (DatabaseSync) WAL opener & transactional migration runner
+├── discovery/
+│   ├── kalshiPublicClient.ts  # Public-only Kalshi v2 REST client (no auth/trading calls)
+│   └── index.ts          # Market normalization, market_snapshots persistence, config-driven scan filter
+├── resolution/
+│   ├── auditor.ts        # Contract Resolution Auditor (CLEAR vs AMBIGUOUS) & append-only rule versioning
+│   └── index.ts          # Resolution barrel exports
+├── runner/
+│   ├── observeRunner.ts  # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
+│   └── index.ts          # Runner barrel exports
 └── tests/
-    └── ee00.test.ts      # EE-00 automated verification suite (LIVE lock, defaults, ledger migrations)
+    ├── fixtures/
+    │   └── kalshiPayloads.ts  # Deterministic recorded-shape Kalshi public payloads (zero live network)
+    ├── ee00.test.ts      # EE-00 verification suite (LIVE lock, defaults, ledger migrations)
+    └── ee01.test.ts      # EE-01 verification suite (discovery, resolution auditor, rule versions, OBSERVE runner)
 ```
 
 ### 1. Execution Mode Guard (`eventedge/config/index.ts`)
@@ -27,20 +39,26 @@ eventedge/
 - **Default mode**: `OBSERVE`.
 - **`LIVE` is hard-disabled**: attempting to construct or load a configuration with `mode = "LIVE"` via constructor input, `EVENTEDGE_MODE`, `EVENTEDGE_ENABLE_LIVE`, or a JSON config file raises `EventEdgeLiveModeDisabledError`. Returned configs are deeply frozen (`Object.freeze`) with `liveEnabled: false`, and the database schema also enforces `CHECK (mode IN ('OBSERVE', 'PAPER', 'DEMO'))`.
 
-### 2. Configurable Risk Defaults (`EVENTEDGE_DEFAULT_RISK_CONFIG`)
-All risk parameters are configurable via constructor overrides, environment variables, or config file (except the hard `LIVE` lock):
-- Minimum conservative edge: **`0.04`** (`minConservativeEdge`)
-- Per-position cap: **`min(3% of settled cash, 0.5% of bankroll risk per underlying event)`** (`perPositionSettledCashCapPct = 0.03`, `perEventBankrollRiskCapPct = 0.005`, helper `computePerPositionCapUsd`)
-- Correlated event exposure cap: **`1.5%`** (`correlatedEventExposureCapPct = 0.015`)
-- Maximum deployed bankroll: **`10%`** (`maxDeployedBankrollPct = 0.10`)
-- Daily loss stop: **`2%`** (`dailyLossStopPct = 0.02`)
-- Peak-to-trough drawdown stop: **`8%`** (`peakToTroughDrawdownStopPct = 0.08`)
-- Fractional Kelly: **`0.10`** (`fractionalKelly = 0.10`)
+### 2. Configurable Risk & Discovery Defaults (`eventedge/config/index.ts`)
+All risk and discovery filter settings are configurable via constructor overrides, environment variables, or config file (except the hard `LIVE` lock):
+- **Risk defaults (`EVENTEDGE_DEFAULT_RISK_CONFIG`)**:
+  - Minimum conservative edge: **`0.04`** (`minConservativeEdge`)
+  - Per-position cap: **`min(3% of settled cash, 0.5% of bankroll risk per underlying event)`** (`perPositionSettledCashCapPct = 0.03`, `perEventBankrollRiskCapPct = 0.005`, helper `computePerPositionCapUsd`)
+  - Correlated event exposure cap: **`1.5%`** (`correlatedEventExposureCapPct = 0.015`)
+  - Maximum deployed bankroll: **`10%`** (`maxDeployedBankrollPct = 0.10`)
+  - Daily loss stop: **`2%`** (`dailyLossStopPct = 0.02`)
+  - Peak-to-trough drawdown stop: **`8%`** (`peakToTroughDrawdownStopPct = 0.08`)
+  - Fractional Kelly: **`0.10`** (`fractionalKelly = 0.10`)
+- **Discovery filter defaults (`EVENTEDGE_DEFAULT_DISCOVERY_CONFIG`)**:
+  - Max close horizon: **`14` days** (`maxCloseHorizonDays`)
+  - Min close horizon: **`0` minutes** (`minCloseHorizonMinutes`)
+  - Excluded categories blocklist: **`['sports', 'entertainment awards']`** (`excludedCategories`)
+  - Pagination & pacing: **`maxPagesPerEndpoint = 20`**, **`pageLimit = 200`**, **`rateLimitDelayMs = 250`**
 
 ### 3. Immutable Ledger (`eventedge/db/schema.ts`, `eventedge/db/migrations.ts`)
 Uses Node's built-in `node:sqlite` (`DatabaseSync`) in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`), matching `src/server/ExecutionVault.ts`, `src/server/riskGuard.ts`, and `server.ts`.
 
-Forward-only migrations (`schema_migrations`) provision 13 append-only tables protected by `BEFORE UPDATE` and `BEFORE DELETE` SQLite triggers (`RAISE(ABORT, ...)`):
+Forward-only migrations (`schema_migrations`, currently v1 + v2) provision 14 append-only tables protected by `BEFORE UPDATE` and `BEFORE DELETE` SQLite triggers (`RAISE(ABORT, ...)`):
 1. `market_snapshots`
 2. `settlement_rule_versions`
 3. `research_evidence`
@@ -54,14 +72,16 @@ Forward-only migrations (`schema_migrations`) provision 13 append-only tables pr
 11. `settlements`
 12. `realized_pnl`
 13. `unrealized_pnl`
+14. `observe_run_summaries`
 
 ---
 
 ## Running Tests & Type Checks
 
 ```bash
-# Run EventEdge EE-00 automated tests
+# Run EventEdge EE-00 and EE-01 automated tests (zero live network)
 npx tsx eventedge/tests/ee00.test.ts
+npx tsx eventedge/tests/ee01.test.ts
 
 # Type-check entire workspace including eventedge/
 npm run lint

@@ -30,9 +30,26 @@ export const EVENTEDGE_LEDGER_TABLES = [
   'settlements',
   'realized_pnl',
   'unrealized_pnl',
+  'observe_run_summaries',
 ] as const;
 
 export type EventEdgeLedgerTable = (typeof EVENTEDGE_LEDGER_TABLES)[number];
+
+const V1_IMMUTABLE_TABLES: readonly EventEdgeLedgerTable[] = [
+  'market_snapshots',
+  'settlement_rule_versions',
+  'research_evidence',
+  'agent_forecasts',
+  'final_probability_estimates',
+  'trade_decisions',
+  'orderbook_states',
+  'submitted_orders',
+  'actual_fills',
+  'fees',
+  'settlements',
+  'realized_pnl',
+  'unrealized_pnl',
+];
 
 function buildImmutabilityTriggers(tableName: EventEdgeLedgerTable): readonly string[] {
   return [
@@ -317,14 +334,61 @@ const V1_TABLE_STATEMENTS: readonly string[] = [
     ON unrealized_pnl (market_ticker, marked_at);`,
 ];
 
-const V1_IMMUTABILITY_TRIGGERS: readonly string[] = EVENTEDGE_LEDGER_TABLES.flatMap((table) =>
+const V1_IMMUTABILITY_TRIGGERS: readonly string[] = V1_IMMUTABLE_TABLES.flatMap((table) =>
   buildImmutabilityTriggers(table)
 );
+
+const V2_EE01_STATEMENTS: readonly string[] = [
+  // Extend market_snapshots for EE-01 discovery fields (category, terms/subtitle, NO bid/ask, settlement source name)
+  `ALTER TABLE market_snapshots ADD COLUMN category TEXT;`,
+  `ALTER TABLE market_snapshots ADD COLUMN market_terms TEXT;`,
+  `ALTER TABLE market_snapshots ADD COLUMN no_bid_usd REAL;`,
+  `ALTER TABLE market_snapshots ADD COLUMN no_ask_usd REAL;`,
+  `ALTER TABLE market_snapshots ADD COLUMN settlement_source_name TEXT;`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_market_snapshots_category_close
+    ON market_snapshots (category, close_time_utc);`,
+
+  // Extend settlement_rule_versions for EE-01 resolution audit classification, reasons, and version sequence
+  `ALTER TABLE settlement_rule_versions ADD COLUMN version_number INTEGER NOT NULL DEFAULT 1;`,
+  `ALTER TABLE settlement_rule_versions ADD COLUMN audit_status TEXT NOT NULL DEFAULT 'AMBIGUOUS' CHECK (audit_status IN ('CLEAR', 'AMBIGUOUS'));`,
+  `ALTER TABLE settlement_rule_versions ADD COLUMN ambiguity_reasons_json TEXT NOT NULL DEFAULT '[]';`,
+  `ALTER TABLE settlement_rule_versions ADD COLUMN settlement_source_url TEXT;`,
+  `ALTER TABLE settlement_rule_versions ADD COLUMN audited_at TEXT;`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_settlement_rules_status
+    ON settlement_rule_versions (audit_status, market_ticker);`,
+
+  // 14. Immutable OBSERVE-mode run summaries (discovery + resolution audit cycle telemetry)
+  `CREATE TABLE IF NOT EXISTS observe_run_summaries (
+    run_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL CHECK (mode = 'OBSERVE'),
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    events_fetched INTEGER NOT NULL,
+    markets_fetched INTEGER NOT NULL,
+    markets_filtered_out INTEGER NOT NULL,
+    markets_scanned INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL,
+    ambiguous_count INTEGER NOT NULL,
+    new_rule_versions_count INTEGER NOT NULL,
+    top_ambiguity_reasons_json TEXT NOT NULL,
+    filter_config_json TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_observe_runs_started
+    ON observe_run_summaries (started_at);`,
+  ...buildImmutabilityTriggers('observe_run_summaries'),
+];
 
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
     name: '001_initial_immutable_eventedge_ledger',
     statements: Object.freeze([...V1_TABLE_STATEMENTS, ...V1_IMMUTABILITY_TRIGGERS]),
+  }),
+  Object.freeze({
+    version: 2,
+    name: '002_ee01_discovery_resolution_and_observe_runs',
+    statements: Object.freeze([...V2_EE01_STATEMENTS]),
   }),
 ]);

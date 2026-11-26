@@ -57,18 +57,35 @@ export interface EventEdgeRiskConfig {
   readonly fractionalKelly: number;
 }
 
+export interface EventEdgeDiscoveryConfig {
+  /** Maximum days until market close/expiry to include in scans (default 14). */
+  readonly maxCloseHorizonDays: number;
+  /** Minimum minutes until close to exclude already-closed or imminent-expiry markets (default 0). */
+  readonly minCloseHorizonMinutes: number;
+  /** Case-insensitive category blocklist excluded from discovery scans (default: ['sports', 'entertainment awards']). */
+  readonly excludedCategories: readonly string[];
+  /** Maximum pages fetched per public Kalshi endpoint in a single scan (default 20). */
+  readonly maxPagesPerEndpoint: number;
+  /** Page size for Kalshi public /events and /markets requests (default 200). */
+  readonly pageLimit: number;
+  /** Delay in ms between paginated public Kalshi requests (default 250). */
+  readonly rateLimitDelayMs: number;
+}
+
 export interface EventEdgeConfig {
   readonly mode: EventEdgeAllowedMode;
   /** Hard-locked to false; LIVE execution cannot be toggled at runtime. */
   readonly liveEnabled: false;
   readonly ledgerDbPath: string;
   readonly risk: EventEdgeRiskConfig;
+  readonly discovery: EventEdgeDiscoveryConfig;
 }
 
 export interface EventEdgeConfigInput {
   mode?: EventEdgeMode | string;
   ledgerDbPath?: string;
   risk?: Partial<EventEdgeRiskConfig>;
+  discovery?: Partial<EventEdgeDiscoveryConfig>;
 }
 
 export const EVENTEDGE_DEFAULT_RISK_CONFIG: Readonly<EventEdgeRiskConfig> = Object.freeze({
@@ -81,6 +98,17 @@ export const EVENTEDGE_DEFAULT_RISK_CONFIG: Readonly<EventEdgeRiskConfig> = Obje
   peakToTroughDrawdownStopPct: 0.08,
   fractionalKelly: 0.10,
 });
+
+export const EVENTEDGE_DEFAULT_DISCOVERY_CONFIG: Readonly<EventEdgeDiscoveryConfig> = Object.freeze(
+  {
+    maxCloseHorizonDays: 14,
+    minCloseHorizonMinutes: 0,
+    excludedCategories: Object.freeze(['sports', 'entertainment awards']),
+    maxPagesPerEndpoint: 20,
+    pageLimit: 200,
+    rateLimitDelayMs: 250,
+  }
+);
 
 export function getDefaultEventEdgeLedgerDbPath(): string {
   return path.resolve(process.cwd(), '.eventedge_ledger.sqlite');
@@ -262,6 +290,69 @@ export function createEventEdgeConfig(
     ),
   });
 
+  const maxCloseHorizonDays = validateDiscoveryNumber(
+    input.discovery?.maxCloseHorizonDays ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_DISCOVERY_MAX_CLOSE_HORIZON_DAYS') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.maxCloseHorizonDays,
+    'maxCloseHorizonDays',
+    0,
+    3650,
+    true
+  );
+
+  const minCloseHorizonMinutes = validateDiscoveryNumber(
+    input.discovery?.minCloseHorizonMinutes ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_DISCOVERY_MIN_CLOSE_HORIZON_MINUTES') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.minCloseHorizonMinutes,
+    'minCloseHorizonMinutes',
+    0,
+    maxCloseHorizonDays * 24 * 60,
+    false
+  );
+
+  const maxPagesPerEndpoint = validateDiscoveryInteger(
+    input.discovery?.maxPagesPerEndpoint ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_DISCOVERY_MAX_PAGES') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.maxPagesPerEndpoint,
+    'maxPagesPerEndpoint',
+    1,
+    500
+  );
+
+  const pageLimit = validateDiscoveryInteger(
+    input.discovery?.pageLimit ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_DISCOVERY_PAGE_LIMIT') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.pageLimit,
+    'pageLimit',
+    1,
+    200
+  );
+
+  const rateLimitDelayMs = validateDiscoveryNumber(
+    input.discovery?.rateLimitDelayMs ??
+      parseOptionalEnvNumber(env, 'EVENTEDGE_DISCOVERY_RATE_LIMIT_DELAY_MS') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.rateLimitDelayMs,
+    'rateLimitDelayMs',
+    0,
+    60_000,
+    false
+  );
+
+  const excludedCategories = normalizeExcludedCategories(
+    input.discovery?.excludedCategories ??
+      parseOptionalEnvCategoryList(env, 'EVENTEDGE_DISCOVERY_EXCLUDED_CATEGORIES') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.excludedCategories
+  );
+
+  const mergedDiscovery: EventEdgeDiscoveryConfig = Object.freeze({
+    maxCloseHorizonDays,
+    minCloseHorizonMinutes,
+    excludedCategories,
+    maxPagesPerEndpoint,
+    pageLimit,
+    rateLimitDelayMs,
+  });
+
   const rawDbPath =
     input.ledgerDbPath ?? env.EVENTEDGE_LEDGER_DB ?? getDefaultEventEdgeLedgerDbPath();
   const ledgerDbPath =
@@ -272,7 +363,84 @@ export function createEventEdgeConfig(
     liveEnabled: false as const,
     ledgerDbPath,
     risk: mergedRisk,
+    discovery: mergedDiscovery,
   });
+}
+
+function validateDiscoveryNumber(
+  value: number,
+  name: keyof EventEdgeDiscoveryConfig,
+  minValue: number,
+  maxValue: number,
+  strictMin: boolean
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge discovery.${name} must be a finite number (received ${String(value)}).`
+    );
+  }
+  const failsMin = strictMin ? value <= minValue : value < minValue;
+  if (failsMin || value > maxValue) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge discovery.${name} must be in ${strictMin ? '(' : '['}${minValue}, ${maxValue}] (received ${value}).`
+    );
+  }
+  return value;
+}
+
+function validateDiscoveryInteger(
+  value: number,
+  name: keyof EventEdgeDiscoveryConfig,
+  minValue: number,
+  maxValue: number
+): number {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge discovery.${name} must be an integer (received ${String(value)}).`
+    );
+  }
+  if (value < minValue || value > maxValue) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge discovery.${name} must be in [${minValue}, ${maxValue}] (received ${value}).`
+    );
+  }
+  return value;
+}
+
+function parseOptionalEnvCategoryList(
+  env: Record<string, string | undefined>,
+  key: string
+): string[] | undefined {
+  const raw = env[key];
+  if (raw === undefined) return undefined;
+  if (raw.trim() === '') return [];
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function normalizeExcludedCategories(rawCategories: unknown): readonly string[] {
+  if (!Array.isArray(rawCategories)) {
+    throw new EventEdgeConfigValidationError(
+      'EventEdge discovery.excludedCategories must be an array of category strings.'
+    );
+  }
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const item of rawCategories) {
+    if (typeof item !== 'string') {
+      throw new EventEdgeConfigValidationError(
+        `EventEdge discovery.excludedCategories entries must be strings (received ${typeof item}).`
+      );
+    }
+    const cleaned = item.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+    if (cleaned.length > 0 && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      normalized.push(cleaned);
+    }
+  }
+  return Object.freeze(normalized);
 }
 
 /**
@@ -331,6 +499,10 @@ export function loadEventEdgeConfigFromFile(
       risk:
         obj.risk && typeof obj.risk === 'object' && !Array.isArray(obj.risk)
           ? (obj.risk as Partial<EventEdgeRiskConfig>)
+          : undefined,
+      discovery:
+        obj.discovery && typeof obj.discovery === 'object' && !Array.isArray(obj.discovery)
+          ? (obj.discovery as Partial<EventEdgeDiscoveryConfig>)
           : undefined,
     },
     options.env ?? process.env
