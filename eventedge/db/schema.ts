@@ -1,0 +1,330 @@
+/**
+ * Immutable EventEdge SQLite ledger schema & forward-only migrations.
+ *
+ * Matches the existing Finesse_finance backend storage pattern (`node:sqlite`
+ * `DatabaseSync` in WAL mode) used by `src/server/ExecutionVault.ts`,
+ * `src/server/riskGuard.ts`, and `server.ts`.
+ *
+ * Every ledger table is protected by SQLite `BEFORE UPDATE` and `BEFORE DELETE`
+ * triggers calling `RAISE(ABORT, ...)` so persisted records are strictly
+ * append-only / immutable at the database engine layer.
+ */
+
+export interface EventEdgeMigration {
+  readonly version: number;
+  readonly name: string;
+  readonly statements: readonly string[];
+}
+
+export const EVENTEDGE_LEDGER_TABLES = [
+  'market_snapshots',
+  'settlement_rule_versions',
+  'research_evidence',
+  'agent_forecasts',
+  'final_probability_estimates',
+  'trade_decisions',
+  'orderbook_states',
+  'submitted_orders',
+  'actual_fills',
+  'fees',
+  'settlements',
+  'realized_pnl',
+  'unrealized_pnl',
+] as const;
+
+export type EventEdgeLedgerTable = (typeof EVENTEDGE_LEDGER_TABLES)[number];
+
+function buildImmutabilityTriggers(tableName: EventEdgeLedgerTable): readonly string[] {
+  return [
+    `CREATE TRIGGER IF NOT EXISTS trg_${tableName}_no_update
+     BEFORE UPDATE ON ${tableName}
+     BEGIN
+       SELECT RAISE(ABORT, 'EventEdge ledger table ${tableName} is immutable: UPDATE forbidden');
+     END;`,
+    `CREATE TRIGGER IF NOT EXISTS trg_${tableName}_no_delete
+     BEFORE DELETE ON ${tableName}
+     BEGIN
+       SELECT RAISE(ABORT, 'EventEdge ledger table ${tableName} is immutable: DELETE forbidden');
+     END;`,
+  ];
+}
+
+const V1_TABLE_STATEMENTS: readonly string[] = [
+  // 1. Market snapshots
+  `CREATE TABLE IF NOT EXISTS market_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    series_ticker TEXT,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    status TEXT NOT NULL,
+    yes_bid_usd REAL,
+    yes_ask_usd REAL,
+    last_price_usd REAL,
+    volume INTEGER,
+    open_interest INTEGER,
+    close_time_utc TEXT,
+    expiration_time_utc TEXT,
+    raw_payload_json TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_market_snapshots_ticker_time
+    ON market_snapshots (market_ticker, captured_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_market_snapshots_event
+    ON market_snapshots (event_ticker, captured_at);`,
+
+  // 2. Settlement rule versions
+  `CREATE TABLE IF NOT EXISTS settlement_rule_versions (
+    rule_version_id TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    rule_hash TEXT NOT NULL,
+    rules_primary TEXT NOT NULL,
+    rules_secondary TEXT,
+    settlement_source TEXT NOT NULL,
+    effective_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (market_ticker, rule_hash)
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_settlement_rules_market
+    ON settlement_rule_versions (market_ticker, effective_at);`,
+
+  // 3. Research evidence
+  `CREATE TABLE IF NOT EXISTS research_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT,
+    source_type TEXT NOT NULL,
+    source_uri TEXT,
+    content_hash TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    credibility_score REAL CHECK (credibility_score IS NULL OR (credibility_score >= 0.0 AND credibility_score <= 1.0)),
+    metadata_json TEXT,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_research_evidence_event_time
+    ON research_evidence (event_ticker, observed_at);`,
+
+  // 4. Agent forecasts
+  `CREATE TABLE IF NOT EXISTS agent_forecasts (
+    forecast_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    snapshot_id TEXT REFERENCES market_snapshots(snapshot_id),
+    rule_version_id TEXT REFERENCES settlement_rule_versions(rule_version_id),
+    prob_yes REAL NOT NULL CHECK (prob_yes >= 0.0 AND prob_yes <= 1.0),
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    reasoning_summary TEXT NOT NULL,
+    evidence_ids_json TEXT NOT NULL,
+    model_version TEXT,
+    forecasted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_agent_forecasts_market_run
+    ON agent_forecasts (market_ticker, run_id, forecasted_at);`,
+
+  // 5. Final probability estimates
+  `CREATE TABLE IF NOT EXISTS final_probability_estimates (
+    estimate_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    snapshot_id TEXT REFERENCES market_snapshots(snapshot_id),
+    rule_version_id TEXT REFERENCES settlement_rule_versions(rule_version_id),
+    raw_prob_yes REAL NOT NULL CHECK (raw_prob_yes >= 0.0 AND raw_prob_yes <= 1.0),
+    conservative_prob_yes REAL NOT NULL CHECK (conservative_prob_yes >= 0.0 AND conservative_prob_yes <= 1.0),
+    market_implied_prob REAL NOT NULL CHECK (market_implied_prob >= 0.0 AND market_implied_prob <= 1.0),
+    conservative_edge REAL NOT NULL,
+    forecast_ids_json TEXT NOT NULL,
+    aggregation_method TEXT NOT NULL,
+    estimated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_final_estimates_market_time
+    ON final_probability_estimates (market_ticker, estimated_at);`,
+
+  // 6. Orderbook states (created before trade_decisions / submitted_orders so FK can reference it)
+  `CREATE TABLE IF NOT EXISTS orderbook_states (
+    orderbook_state_id TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    best_bid_usd REAL,
+    best_ask_usd REAL,
+    spread_usd REAL,
+    yes_bid_size_fp REAL,
+    yes_ask_size_fp REAL,
+    lhs REAL CHECK (lhs IS NULL OR (lhs >= 0.0 AND lhs <= 1.0)),
+    bids_json TEXT NOT NULL,
+    asks_json TEXT NOT NULL,
+    book_seq INTEGER,
+    captured_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_orderbook_states_market_time
+    ON orderbook_states (market_ticker, captured_at);`,
+
+  // 7. Trade decisions (mode CHECK strictly forbids LIVE at database layer as well)
+  `CREATE TABLE IF NOT EXISTS trade_decisions (
+    decision_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    estimate_id TEXT NOT NULL REFERENCES final_probability_estimates(estimate_id),
+    orderbook_state_id TEXT REFERENCES orderbook_states(orderbook_state_id),
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('OBSERVE', 'PAPER', 'DEMO')),
+    action TEXT NOT NULL CHECK (action IN ('BUY_YES', 'BUY_NO', 'SELL_YES', 'SELL_NO', 'HOLD', 'REJECT')),
+    approved INTEGER NOT NULL CHECK (approved IN (0, 1)),
+    rejection_reason TEXT,
+    conservative_edge REAL NOT NULL,
+    kelly_fraction REAL NOT NULL,
+    settled_cash_usd REAL NOT NULL,
+    bankroll_usd REAL NOT NULL,
+    requested_notional_usd REAL NOT NULL,
+    approved_notional_usd REAL NOT NULL,
+    target_contracts INTEGER NOT NULL,
+    idempotency_hash TEXT,
+    risk_checks_json TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_trade_decisions_market_time
+    ON trade_decisions (market_ticker, decided_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_trade_decisions_idempotency
+    ON trade_decisions (idempotency_hash);`,
+
+  // 8. Submitted orders (mode CHECK strictly forbids LIVE)
+  `CREATE TABLE IF NOT EXISTS submitted_orders (
+    submission_id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL REFERENCES trade_decisions(decision_id),
+    idempotency_hash TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    venue_order_id TEXT,
+    venue TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('OBSERVE', 'PAPER', 'DEMO')),
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    order_type TEXT NOT NULL,
+    post_only INTEGER NOT NULL CHECK (post_only IN (0, 1)),
+    reduce_only INTEGER NOT NULL DEFAULT 0 CHECK (reduce_only IN (0, 1)),
+    price_usd REAL NOT NULL,
+    contracts INTEGER NOT NULL CHECK (contracts > 0),
+    status TEXT NOT NULL,
+    raw_request_json TEXT NOT NULL,
+    raw_response_json TEXT,
+    submitted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_submitted_orders_idempotency
+    ON submitted_orders (idempotency_hash);`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_submitted_orders_venue_id
+    ON submitted_orders (venue_order_id);`,
+
+  // 9. Actual fills
+  `CREATE TABLE IF NOT EXISTS actual_fills (
+    fill_id TEXT PRIMARY KEY,
+    submission_id TEXT NOT NULL REFERENCES submitted_orders(submission_id),
+    venue_fill_id TEXT,
+    venue_order_id TEXT,
+    market_ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price_usd REAL NOT NULL,
+    contracts INTEGER NOT NULL CHECK (contracts > 0),
+    liquidity_role TEXT NOT NULL CHECK (liquidity_role IN ('MAKER', 'TAKER')),
+    raw_fill_json TEXT NOT NULL,
+    filled_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_actual_fills_submission
+    ON actual_fills (submission_id, filled_at);`,
+
+  // 10. Fees
+  `CREATE TABLE IF NOT EXISTS fees (
+    fee_id TEXT PRIMARY KEY,
+    submission_id TEXT REFERENCES submitted_orders(submission_id),
+    fill_id TEXT REFERENCES actual_fills(fill_id),
+    market_ticker TEXT NOT NULL,
+    fee_type TEXT NOT NULL CHECK (fee_type IN ('ENTRY_MAKER', 'ENTRY_TAKER', 'EXIT_MAKER', 'EXIT_TAKER', 'SETTLEMENT', 'OTHER')),
+    amount_usd REAL NOT NULL CHECK (amount_usd >= 0.0),
+    formula_version TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_fees_market_time
+    ON fees (market_ticker, recorded_at);`,
+
+  // 11. Settlements
+  `CREATE TABLE IF NOT EXISTS settlements (
+    settlement_id TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    rule_version_id TEXT REFERENCES settlement_rule_versions(rule_version_id),
+    outcome TEXT NOT NULL CHECK (outcome IN ('YES', 'NO', 'VOID', 'CANCELLED')),
+    settlement_price_usd REAL NOT NULL,
+    settled_contracts INTEGER NOT NULL,
+    payout_usd REAL NOT NULL,
+    raw_settlement_json TEXT NOT NULL,
+    settled_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_settlements_market_time
+    ON settlements (market_ticker, settled_at);`,
+
+  // 12. Realized PnL
+  `CREATE TABLE IF NOT EXISTS realized_pnl (
+    realized_pnl_id TEXT PRIMARY KEY,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    submission_id TEXT REFERENCES submitted_orders(submission_id),
+    settlement_id TEXT REFERENCES settlements(settlement_id),
+    entry_cost_usd REAL NOT NULL,
+    exit_or_payout_usd REAL NOT NULL,
+    fees_usd REAL NOT NULL,
+    gross_pnl_usd REAL NOT NULL,
+    net_pnl_usd REAL NOT NULL,
+    bankroll_after_usd REAL NOT NULL,
+    realized_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_realized_pnl_market_time
+    ON realized_pnl (market_ticker, realized_at);`,
+
+  // 13. Unrealized PnL
+  `CREATE TABLE IF NOT EXISTS unrealized_pnl (
+    unrealized_pnl_id TEXT PRIMARY KEY,
+    event_ticker TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    orderbook_state_id TEXT REFERENCES orderbook_states(orderbook_state_id),
+    position_contracts INTEGER NOT NULL,
+    avg_entry_price_usd REAL NOT NULL,
+    mark_price_usd REAL NOT NULL,
+    accrued_fees_usd REAL NOT NULL,
+    gross_unrealized_pnl_usd REAL NOT NULL,
+    net_unrealized_pnl_usd REAL NOT NULL,
+    bankroll_usd REAL NOT NULL,
+    peak_bankroll_usd REAL NOT NULL,
+    drawdown_pct REAL NOT NULL,
+    marked_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_unrealized_pnl_market_time
+    ON unrealized_pnl (market_ticker, marked_at);`,
+];
+
+const V1_IMMUTABILITY_TRIGGERS: readonly string[] = EVENTEDGE_LEDGER_TABLES.flatMap((table) =>
+  buildImmutabilityTriggers(table)
+);
+
+export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
+  Object.freeze({
+    version: 1,
+    name: '001_initial_immutable_eventedge_ledger',
+    statements: Object.freeze([...V1_TABLE_STATEMENTS, ...V1_IMMUTABILITY_TRIGGERS]),
+  }),
+]);
