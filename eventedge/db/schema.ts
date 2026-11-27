@@ -38,6 +38,7 @@ export const EVENTEDGE_LEDGER_TABLES = [
   'shadow_decisions',
   'shadow_orders',
   'shadow_fills',
+  'risk_state_history',
 ] as const;
 
 export type EventEdgeLedgerTable = (typeof EVENTEDGE_LEDGER_TABLES)[number];
@@ -776,6 +777,46 @@ const V6_EE05_STATEMENTS: readonly string[] = [
   ...buildImmutabilityTriggers('shadow_fills'),
 ];
 
+const V7_EE06_STATEMENTS: readonly string[] = [
+  // 22. Immutable Risk System State History (append-only state machine audit log)
+  `CREATE TABLE IF NOT EXISTS risk_state_history (
+    transition_id TEXT PRIMARY KEY,
+    from_state TEXT CHECK (
+      from_state IS NULL
+      OR from_state IN (
+        'HEALTHY', 'DEGRADED', 'HALTED',
+        'RECONCILIATION_REQUIRED', 'DATA_QUARANTINE', 'RECOVERY_PENDING'
+      )
+    ),
+    to_state TEXT NOT NULL CHECK (
+      to_state IN (
+        'HEALTHY', 'DEGRADED', 'HALTED',
+        'RECONCILIATION_REQUIRED', 'DATA_QUARANTINE', 'RECOVERY_PENDING'
+      )
+    ),
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_ee_risk_state_history_time
+    ON risk_state_history (recorded_at);`,
+  ...buildImmutabilityTriggers('risk_state_history'),
+
+  // Genesis HEALTHY state row (recorded exactly once if history is empty)
+  `INSERT INTO risk_state_history (
+    transition_id, from_state, to_state, reason, actor, recorded_at
+  )
+  SELECT
+    'rsh_genesis_healthy',
+    NULL,
+    'HEALTHY',
+    'GENESIS_INITIAL_STATE',
+    'system_migration_v7',
+    '1970-01-01T00:00:00.000Z'
+  WHERE NOT EXISTS (SELECT 1 FROM risk_state_history);`,
+];
+
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
@@ -806,5 +847,10 @@ export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze
     version: 6,
     name: '006_ee05_shadow_execution_tables',
     statements: Object.freeze([...V6_EE05_STATEMENTS]),
+  }),
+  Object.freeze({
+    version: 7,
+    name: '007_ee06_risk_state_history',
+    statements: Object.freeze([...V7_EE06_STATEMENTS]),
   }),
 ]);

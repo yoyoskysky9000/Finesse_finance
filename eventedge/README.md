@@ -16,7 +16,7 @@ eventedge/
 ├── config/
 │   └── index.ts          # Mode guard (OBSERVE | PAPER | DEMO; LIVE hard-disabled), risk, discovery, forecasting & shadow defaults + config_hash
 ├── db/
-│   ├── schema.ts         # Immutable 21-table EventEdge SQLite ledger schema + forward-only migrations (v1..v6)
+│   ├── schema.ts         # Immutable 22-table EventEdge SQLite ledger schema + forward-only migrations (v1..v7)
 │   └── migrations.ts     # node:sqlite (DatabaseSync) WAL opener & transactional migration runner
 ├── discovery/
 │   ├── kalshiPublicClient.ts  # Public-only Kalshi v2 REST client (no auth/trading calls)
@@ -52,6 +52,12 @@ eventedge/
 │   ├── bookReader.ts     # Captured book snapshot reader (orderbook_states / market_snapshots)
 │   ├── engine.ts         # Deterministic edge-gate, arrival-book latency, partial-fill & ledger persistence engine
 │   └── index.ts          # Shadow execution barrel exports
+├── risk/
+│   ├── types.ts          # PortfolioState, RiskProposal, system-state & sizing breakdown types
+│   ├── portfolioState.ts # Read-only deterministic buildPortfolioState (UTC day boundary, sampled equity curve)
+│   ├── limits.ts         # Pure evaluateRisk (all caps & stops) and fractional-Kelly computeMaxQuantity
+│   ├── systemState.ts    # Fail-closed 6-state machine & append-only risk_state_history transitions
+│   └── index.ts          # Risk manager barrel exports
 ├── runner/
 │   ├── observeRunner.ts  # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
 │   └── index.ts          # Runner barrel exports
@@ -63,7 +69,8 @@ eventedge/
     ├── ee02.test.ts      # EE-02 verification suite (price-blindness, stages, provenance, invariants, determinism)
     ├── ee03.test.ts      # EE-03 verification suite (experiment registry, persistence layer, lifecycle & hooks)
     ├── ee04.test.ts      # EE-04 verification suite (scoring, denominator, temporal calibration, cluster bootstrap, kill-gate)
-    └── ee05.test.ts      # EE-05 verification suite (shadow edge gate, arrival book, latency, partial fill, fees, determinism, append-only, config_hash)
+    ├── ee05.test.ts      # EE-05 verification suite (shadow edge gate, arrival book, latency, partial fill, fees, determinism, append-only, config_hash)
+    └── ee06.test.ts      # EE-06 verification suite (portfolio state builder, caps, Kelly sizing, stops, state machine, DEGRADED halving, append-only, determinism)
 ```
 
 ### 1. Execution Mode Guard (`eventedge/config/index.ts`)
@@ -101,7 +108,7 @@ All risk, discovery, and forecasting settings are configurable via constructor o
 ### 3. Immutable Ledger (`eventedge/db/schema.ts`, `eventedge/db/migrations.ts`)
 Uses Node's built-in `node:sqlite` (`DatabaseSync`) in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`), matching `src/server/ExecutionVault.ts`, `src/server/riskGuard.ts`, and `server.ts`.
 
-Forward-only migrations (`schema_migrations`, currently v1..v6) provision 21 append-only tables protected by SQLite immutability triggers (`RAISE(ABORT, ...)`):
+Forward-only migrations (`schema_migrations`, currently v1..v7) provision 22 append-only tables protected by SQLite immutability triggers (`RAISE(ABORT, ...)`):
 1. `market_snapshots`
 2. `settlement_rule_versions`
 3. `research_evidence`
@@ -123,19 +130,25 @@ Forward-only migrations (`schema_migrations`, currently v1..v6) provision 21 app
 19. `shadow_decisions` (v6: immutable paper shadow-fill decisions)
 20. `shadow_orders` (v6: immutable paper shadow orders with latency & arrival timestamps)
 21. `shadow_fills` (v6: immutable paper shadow fills with decision + arrival book IDs, depth, age, fee & schedule version)
+22. `risk_state_history` (v7: immutable fail-closed system-state transition log initialized with a genesis `HEALTHY` row)
+
+### 4. Risk & Exposure Accounting Conventions (`eventedge/risk/`)
+- **UTC Day Boundary**: `dailyPnl` is computed over the UTC calendar day `[YYYY-MM-DDT00:00:00.000Z, asOf]` as `(realizedPnl + unrealizedPnl at asOf) - (realizedPnl + unrealizedPnl strictly before dayStartUtc)`.
+- **Equity Sampling Policy**: `equity = settledCash + cumulative realized + current unrealized`, sampled deterministically at genesis (`settledCash`), each executed shadow fill, each contract resolution, each captured book mark while a position is open, and `asOf`. `peakEquity` and `drawdownPct` are computed peak-to-trough on this series.
 
 ---
 
 ## Running Tests & Type Checks
 
 ```bash
-# Run EventEdge EE-00 through EE-05 automated tests (zero live network)
+# Run EventEdge EE-00 through EE-06 automated tests (zero live network)
 npx tsx eventedge/tests/ee00.test.ts
 npx tsx eventedge/tests/ee01.test.ts
 npx tsx eventedge/tests/ee02.test.ts
 npx tsx eventedge/tests/ee03.test.ts
 npx tsx eventedge/tests/ee04.test.ts
 npx tsx eventedge/tests/ee05.test.ts
+npx tsx eventedge/tests/ee06.test.ts
 
 # Type-check entire workspace including eventedge/
 npm run lint
