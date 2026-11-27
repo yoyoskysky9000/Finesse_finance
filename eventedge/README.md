@@ -58,6 +58,12 @@ eventedge/
 │   ├── limits.ts         # Pure evaluateRisk (all caps & stops) and fractional-Kelly computeMaxQuantity
 │   ├── systemState.ts    # Fail-closed 6-state machine & append-only risk_state_history transitions
 │   └── index.ts          # Risk manager barrel exports
+├── dashboard/
+│   ├── types.ts          # Ordered dashboard section contracts & mandatory disclaimer constant
+│   ├── formatters.ts     # Pure score/probability/currency/percent formatters & HTML escaping
+│   ├── assembler.ts      # Strictly read-only buildDashboard(db, experimentId, asOf)
+│   ├── renderer.ts       # Pure self-contained renderDashboardHtml (inline CSS only, zero scripts/assets)
+│   └── index.ts          # Dashboard barrel exports
 ├── runner/
 │   ├── observeRunner.ts  # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
 │   └── index.ts          # Runner barrel exports
@@ -70,7 +76,8 @@ eventedge/
     ├── ee03.test.ts      # EE-03 verification suite (experiment registry, persistence layer, lifecycle & hooks)
     ├── ee04.test.ts      # EE-04 verification suite (scoring, denominator, temporal calibration, cluster bootstrap, kill-gate)
     ├── ee05.test.ts      # EE-05 verification suite (shadow edge gate, arrival book, latency, partial fill, fees, determinism, append-only, config_hash)
-    └── ee06.test.ts      # EE-06 verification suite (portfolio state builder, caps, Kelly sizing, stops, state machine, DEGRADED halving, append-only, determinism)
+    ├── ee06.test.ts      # EE-06 verification suite (portfolio state builder, caps, Kelly sizing, stops, state machine, DEGRADED halving, append-only, determinism)
+    └── ee07.test.ts      # EE-07 verification suite (section order, verdict-first, PnL containment, number fidelity, empty state, read-only, integrity)
 ```
 
 ### 1. Execution Mode Guard (`eventedge/config/index.ts`)
@@ -141,7 +148,7 @@ Forward-only migrations (`schema_migrations`, currently v1..v7) provision 22 app
 ## Running Tests & Type Checks
 
 ```bash
-# Run EventEdge EE-00 through EE-06 automated tests (zero live network)
+# Run EventEdge EE-00 through EE-07 automated tests (zero live network)
 npx tsx eventedge/tests/ee00.test.ts
 npx tsx eventedge/tests/ee01.test.ts
 npx tsx eventedge/tests/ee02.test.ts
@@ -149,6 +156,7 @@ npx tsx eventedge/tests/ee03.test.ts
 npx tsx eventedge/tests/ee04.test.ts
 npx tsx eventedge/tests/ee05.test.ts
 npx tsx eventedge/tests/ee06.test.ts
+npx tsx eventedge/tests/ee07.test.ts
 
 # Type-check entire workspace including eventedge/
 npm run lint
