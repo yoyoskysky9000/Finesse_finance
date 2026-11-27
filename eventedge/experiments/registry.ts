@@ -80,6 +80,8 @@ export interface RegisterExperimentInput {
   readonly modelVersion: string;
   readonly configHash: string;
   readonly notes?: string;
+  readonly supersedes?: string | null;
+  readonly voidReason?: string | null;
   readonly registeredAt?: string;
 }
 
@@ -94,6 +96,8 @@ export interface ExperimentRecord {
   readonly modelVersion: string;
   readonly configHash: string;
   readonly notes: string;
+  readonly supersedes: string | null;
+  readonly voidReason: string | null;
   readonly createdAt: string;
 }
 
@@ -130,6 +134,8 @@ interface RawExperimentRow {
   model_version: string;
   config_hash: string;
   notes: string;
+  supersedes: string | null;
+  void_reason: string | null;
   created_at: string;
 }
 
@@ -164,6 +170,8 @@ function mapRawExperimentRow(row: RawExperimentRow): ExperimentRecord {
     modelVersion: row.model_version,
     configHash: row.config_hash,
     notes: row.notes,
+    supersedes: row.supersedes ?? null,
+    voidReason: row.void_reason ?? null,
     createdAt: row.created_at,
   });
 }
@@ -196,6 +204,14 @@ export function registerExperiment(
   const modelVersion = requireNonEmptyText(input.modelVersion, 'modelVersion');
   const configHash = requireNonEmptyText(input.configHash, 'configHash');
   const notes = typeof input.notes === 'string' ? input.notes.trim() : '';
+  const supersedes =
+    typeof input.supersedes === 'string' && input.supersedes.trim().length > 0
+      ? input.supersedes.trim()
+      : null;
+  const voidReason =
+    typeof input.voidReason === 'string' && input.voidReason.trim().length > 0
+      ? input.voidReason.trim()
+      : null;
   const registeredAt = input.registeredAt?.trim() || new Date().toISOString();
 
   db.exec('BEGIN IMMEDIATE');
@@ -211,8 +227,9 @@ export function registerExperiment(
     db.prepare(
       `INSERT INTO experiments (
         experiment_id, title, hypothesis, registered_at, status,
-        kill_criteria, sample_definition, model_version, config_hash, notes
-      ) VALUES (?, ?, ?, ?, 'REGISTERED', ?, ?, ?, ?, ?)`
+        kill_criteria, sample_definition, model_version, config_hash, notes,
+        supersedes, void_reason
+      ) VALUES (?, ?, ?, ?, 'REGISTERED', ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       experimentId,
       title,
@@ -222,14 +239,17 @@ export function registerExperiment(
       sampleDefinition,
       modelVersion,
       configHash,
-      notes
+      notes,
+      supersedes,
+      voidReason
     );
 
     const inserted = db
       .prepare(
         `SELECT
           experiment_id, title, hypothesis, registered_at, status,
-          kill_criteria, sample_definition, model_version, config_hash, notes, created_at
+          kill_criteria, sample_definition, model_version, config_hash, notes,
+          supersedes, void_reason, created_at
         FROM experiments
         WHERE experiment_id = ?`
       )
@@ -252,7 +272,8 @@ export function getExperiment(db: DatabaseSync, experimentId: string): Experimen
     .prepare(
       `SELECT
         experiment_id, title, hypothesis, registered_at, status,
-        kill_criteria, sample_definition, model_version, config_hash, notes, created_at
+        kill_criteria, sample_definition, model_version, config_hash, notes,
+        supersedes, void_reason, created_at
       FROM experiments
       WHERE experiment_id = ?
       LIMIT 1`
@@ -267,7 +288,8 @@ export function listExperiments(db: DatabaseSync): ExperimentRecord[] {
     .prepare(
       `SELECT
         experiment_id, title, hypothesis, registered_at, status,
-        kill_criteria, sample_definition, model_version, config_hash, notes, created_at
+        kill_criteria, sample_definition, model_version, config_hash, notes,
+        supersedes, void_reason, created_at
       FROM experiments
       ORDER BY registered_at ASC, rowid ASC`
     )
@@ -302,7 +324,8 @@ export function transitionExperimentStatus(
       .prepare(
         `SELECT
           experiment_id, title, hypothesis, registered_at, status,
-          kill_criteria, sample_definition, model_version, config_hash, notes, created_at
+          kill_criteria, sample_definition, model_version, config_hash, notes,
+          supersedes, void_reason, created_at
         FROM experiments
         WHERE experiment_id = ?
         LIMIT 1`
@@ -338,7 +361,8 @@ export function transitionExperimentStatus(
       .prepare(
         `SELECT
           experiment_id, title, hypothesis, registered_at, status,
-          kill_criteria, sample_definition, model_version, config_hash, notes, created_at
+          kill_criteria, sample_definition, model_version, config_hash, notes,
+          supersedes, void_reason, created_at
         FROM experiments
         WHERE experiment_id = ?`
       )

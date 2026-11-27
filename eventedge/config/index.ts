@@ -71,6 +71,12 @@ export interface EventEdgeDiscoveryConfig {
   readonly pageLimit: number;
   /** Delay in ms between paginated public Kalshi requests (default 250). */
   readonly rateLimitDelayMs: number;
+  /** Optional series ticker prefixes resolved via public /series for targeted discovery (default []). */
+  readonly targetSeriesPrefixes: readonly string[];
+  /** Optional explicit series tickers fetched via public /events?series_ticker=... (default []). */
+  readonly targetSeriesTickers: readonly string[];
+  /** When true, skip the universe sweep and fetch exclusively from targeted series (default false). */
+  readonly targetedOnly: boolean;
 }
 
 export interface EventEdgeEnsembleWeights {
@@ -145,6 +151,9 @@ export const EVENTEDGE_DEFAULT_DISCOVERY_CONFIG: Readonly<EventEdgeDiscoveryConf
     maxPagesPerEndpoint: 20,
     pageLimit: 200,
     rateLimitDelayMs: 250,
+    targetSeriesPrefixes: Object.freeze([]),
+    targetSeriesTickers: Object.freeze([]),
+    targetedOnly: false,
   }
 );
 
@@ -433,6 +442,31 @@ export function createEventEdgeConfig(
       EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.excludedCategories
   );
 
+  const targetSeriesPrefixes = normalizeSeriesIdentifierList(
+    input.discovery?.targetSeriesPrefixes ??
+      parseOptionalEnvCategoryList(env, 'EVENTEDGE_DISCOVERY_TARGET_SERIES_PREFIXES') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.targetSeriesPrefixes,
+    'targetSeriesPrefixes'
+  );
+
+  const targetSeriesTickers = normalizeSeriesIdentifierList(
+    input.discovery?.targetSeriesTickers ??
+      parseOptionalEnvCategoryList(env, 'EVENTEDGE_DISCOVERY_TARGET_SERIES_TICKERS') ??
+      EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.targetSeriesTickers,
+    'targetSeriesTickers'
+  );
+
+  const rawTargetedOnly =
+    input.discovery?.targetedOnly ??
+    parseOptionalEnvBoolean(env, 'EVENTEDGE_DISCOVERY_TARGETED_ONLY') ??
+    EVENTEDGE_DEFAULT_DISCOVERY_CONFIG.targetedOnly;
+
+  if (typeof rawTargetedOnly !== 'boolean') {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge discovery.targetedOnly must be a boolean (received ${typeof rawTargetedOnly}).`
+    );
+  }
+
   const mergedDiscovery: EventEdgeDiscoveryConfig = Object.freeze({
     maxCloseHorizonDays,
     minCloseHorizonMinutes,
@@ -440,6 +474,9 @@ export function createEventEdgeConfig(
     maxPagesPerEndpoint,
     pageLimit,
     rateLimitDelayMs,
+    targetSeriesPrefixes,
+    targetSeriesTickers,
+    targetedOnly: rawTargetedOnly,
   });
 
   const ensembleVersion = validateNonEmptyString(
@@ -667,6 +704,46 @@ function normalizeExcludedCategories(rawCategories: unknown): readonly string[] 
       );
     }
     const cleaned = item.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+    if (cleaned.length > 0 && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      normalized.push(cleaned);
+    }
+  }
+  return Object.freeze(normalized);
+}
+
+function parseOptionalEnvBoolean(
+  env: Record<string, string | undefined>,
+  key: string
+): boolean | undefined {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const lowered = raw.trim().toLowerCase();
+  if (lowered === 'true' || lowered === '1' || lowered === 'yes') return true;
+  if (lowered === 'false' || lowered === '0' || lowered === 'no') return false;
+  throw new EventEdgeConfigValidationError(
+    `Environment variable ${key} must be a boolean string (received "${raw}").`
+  );
+}
+
+function normalizeSeriesIdentifierList(
+  rawList: unknown,
+  fieldName: 'targetSeriesPrefixes' | 'targetSeriesTickers'
+): readonly string[] {
+  if (!Array.isArray(rawList)) {
+    throw new EventEdgeConfigValidationError(
+      `EventEdge discovery.${fieldName} must be an array of non-empty strings.`
+    );
+  }
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const item of rawList) {
+    if (typeof item !== 'string') {
+      throw new EventEdgeConfigValidationError(
+        `EventEdge discovery.${fieldName} entries must be strings (received ${typeof item}).`
+      );
+    }
+    const cleaned = item.trim().toUpperCase();
     if (cleaned.length > 0 && !seen.has(cleaned)) {
       seen.add(cleaned);
       normalized.push(cleaned);

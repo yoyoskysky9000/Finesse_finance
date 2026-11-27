@@ -30,6 +30,7 @@ import {
   DASHBOARD_SECTION_HEADINGS,
   DASHBOARD_SECTION_KEYS,
   EVENTEDGE_LEDGER_TABLES,
+  EVENTEDGE_MIGRATIONS,
   EventEdgeLiveModeDisabledError,
   buildDashboard,
   buildPortfolioState,
@@ -757,7 +758,10 @@ test('(g) Integrity section: reports LIVE-disabled assertion passing and lists t
 
     assert.equal(dashboard.integrity.liveDisabledAssertion.passed, true);
     assert.equal(dashboard.integrity.allTriggersPresent, true);
-    assert.equal(dashboard.integrity.migrationVersion, 7);
+    assert.equal(
+      dashboard.integrity.migrationVersion,
+      EVENTEDGE_MIGRATIONS[EVENTEDGE_MIGRATIONS.length - 1].version
+    );
     assert.equal(dashboard.integrity.configHash.length, 64);
 
     // Every single ledger table in EVENTEDGE_LEDGER_TABLES must be checked and passing

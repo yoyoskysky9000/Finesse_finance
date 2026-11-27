@@ -817,6 +817,56 @@ const V7_EE06_STATEMENTS: readonly string[] = [
   WHERE NOT EXISTS (SELECT 1 FROM risk_state_history);`,
 ];
 
+const V8_EE09_STATEMENTS: readonly string[] = [
+  // Forward-only provenance columns on market_snapshots (existing rows retain defaults)
+  `ALTER TABLE market_snapshots ADD COLUMN discovery_source TEXT NOT NULL DEFAULT 'SWEEP' CHECK (discovery_source IN ('SWEEP', 'TARGETED', 'BOTH'));`,
+  `ALTER TABLE market_snapshots ADD COLUMN effective_event_date_utc TEXT;`,
+  `ALTER TABLE market_snapshots ADD COLUMN date_source TEXT NOT NULL DEFAULT 'CLOSE_TIME' CHECK (date_source IN ('OCCURRENCE', 'STRIKE_DATE', 'TICKER_DATE', 'CLOSE_TIME'));`,
+
+  // Forward-only supersession metadata columns on experiments
+  `ALTER TABLE experiments ADD COLUMN supersedes TEXT;`,
+  `ALTER TABLE experiments ADD COLUMN void_reason TEXT;`,
+
+  // Recreate controlled status update trigger on experiments so supersedes & void_reason are also immutable
+  `DROP TRIGGER IF EXISTS trg_experiments_controlled_status_update;`,
+  `CREATE TRIGGER IF NOT EXISTS trg_experiments_controlled_status_update
+   BEFORE UPDATE ON experiments
+   BEGIN
+     SELECT CASE
+       WHEN NEW.experiment_id IS NOT OLD.experiment_id
+         OR NEW.title IS NOT OLD.title
+         OR NEW.hypothesis IS NOT OLD.hypothesis
+         OR NEW.registered_at IS NOT OLD.registered_at
+         OR NEW.kill_criteria IS NOT OLD.kill_criteria
+         OR NEW.sample_definition IS NOT OLD.sample_definition
+         OR NEW.model_version IS NOT OLD.model_version
+         OR NEW.config_hash IS NOT OLD.config_hash
+         OR NEW.notes IS NOT OLD.notes
+         OR NEW.supersedes IS NOT OLD.supersedes
+         OR NEW.void_reason IS NOT OLD.void_reason
+         OR NEW.created_at IS NOT OLD.created_at
+       THEN RAISE(ABORT, 'EventEdge ledger table experiments is immutable: UPDATE forbidden on non-status columns')
+     END;
+     SELECT CASE
+       WHEN NOT (
+         (OLD.status = 'REGISTERED' AND NEW.status = 'RUNNING')
+         OR (OLD.status = 'RUNNING' AND NEW.status = 'COMPLETED')
+         OR (OLD.status = 'RUNNING' AND NEW.status = 'KILLED')
+       )
+       THEN RAISE(ABORT, 'EventEdge ledger table experiments: illegal status transition forbidden')
+     END;
+     SELECT CASE
+       WHEN NOT EXISTS (
+         SELECT 1 FROM experiment_status_history h
+         WHERE h.experiment_id = NEW.experiment_id
+           AND h.from_status = OLD.status
+           AND h.to_status = NEW.status
+       )
+       THEN RAISE(ABORT, 'EventEdge ledger table experiments: direct status UPDATE without experiment_status_history forbidden')
+     END;
+   END;`,
+];
+
 export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze([
   Object.freeze({
     version: 1,
@@ -852,5 +902,10 @@ export const EVENTEDGE_MIGRATIONS: readonly EventEdgeMigration[] = Object.freeze
     version: 7,
     name: '007_ee06_risk_state_history',
     statements: Object.freeze([...V7_EE06_STATEMENTS]),
+  }),
+  Object.freeze({
+    version: 8,
+    name: '008_ee09_discovery_provenance_and_experiment_supersession',
+    statements: Object.freeze([...V8_EE09_STATEMENTS]),
   }),
 ]);

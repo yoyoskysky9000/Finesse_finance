@@ -17,6 +17,7 @@ export {
   type RunPaperCycleInput,
   type PaperCycleMarketOutcomeStatus,
   type PaperCycleMarketOutcome,
+  type PaperCycleEnrichmentFailure,
   type PaperCycleStageCounts,
   type PaperCycleReport,
 } from './paperRunner';
@@ -29,3 +30,14 @@ export {
   type PreRegisteredExperimentSpec,
   type RegisterFirstExperimentOptions,
 } from './registerFirstExperiment';
+
+export {
+  SECOND_EXPERIMENT_ID,
+  SECOND_EXPERIMENT_DISCOVERY_OVERRIDES,
+  SECOND_EXPERIMENT,
+  createSecondExperimentConfig,
+  registerSecondExperiment,
+  type SecondPreRegisteredExperimentSpec,
+  type CreateSecondExperimentConfigOptions,
+  type RegisterSecondExperimentOptions,
+} from './registerSecondExperiment';

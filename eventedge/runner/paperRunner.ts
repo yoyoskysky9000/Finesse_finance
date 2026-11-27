@@ -11,11 +11,15 @@ import { buildDashboard, type EventEdgeDashboard } from '../dashboard/index';
 import { EVENTEDGE_LEDGER_TABLES } from '../db/schema';
 import {
   fetchPublicKalshiMarketByTicker,
+  mergeEnrichedKalshiMarketIntoSnapshot,
   normalizeKalshiMarketToSnapshot,
   persistMarketSnapshot,
+  type DiscoverySource,
+  type EventDateSource,
   type KalshiPublicClientOptions,
   type KalshiRawEvent,
   type KalshiRawMarket,
+  type KalshiRawSeries,
   type NormalizedMarketSnapshot,
 } from '../discovery/index';
 import { ExperimentNotFoundError, getExperiment } from '../experiments/registry';
@@ -137,6 +141,10 @@ export interface PaperCycleFixtures {
   readonly eventsPage2?: { events: KalshiRawEvent[]; cursor: string };
   /** Optional override for EE-01 standalone `/markets` payload (defaults to EE-01 fixture). */
   readonly standaloneMarkets?: { markets: KalshiRawMarket[]; cursor: string };
+  /** Optional fixture `/series` payload for targeted prefix resolution in fixture mode. */
+  readonly series?: readonly KalshiRawSeries[];
+  /** Optional fixture `/events?series_ticker=...` payloads keyed by series ticker. */
+  readonly eventsBySeries?: Readonly<Record<string, readonly KalshiRawEvent[]>>;
   /** Optional per-ticker payloads served on public `GET /markets/{ticker}` during settlement checks. */
   readonly marketByTicker?: Readonly<Record<string, KalshiRawMarket>>;
   /** Optional explicit price-blind `ReferenceClass` inputs keyed by `marketId`. */
@@ -170,9 +178,11 @@ export interface RunPaperCycleInput {
    * Dry-run offline fixture mode:
    * - `true`: reads default EE-01 Kalshi test fixtures instead of the network.
    * - `PaperCycleFixtures`: reads supplied/EE-01 fixture payloads and optional offline research/orderbook inputs.
-   * - omitted / `undefined`: uses the live EE-01 public Kalshi client (no auth headers; operator-only).
+   * - omitted / `undefined`: uses the EE-01 public Kalshi client (no auth headers; operator-only or custom `clientOptions`).
    */
   readonly fixtures?: boolean | PaperCycleFixtures;
+  /** Optional public Kalshi client options (used when `fixtures` is not set; public unauthenticated endpoints only). */
+  readonly clientOptions?: KalshiPublicClientOptions;
   /** Optional price-blind research data provider for EE-02 estimators. */
   readonly researchProvider?: PaperCycleResearchProvider;
   /** Optional EE-02 BaseRateEstimator override (defaults to EE-02 reference Laplace estimator). */
@@ -203,6 +213,12 @@ export type PaperCycleMarketOutcomeStatus =
   | 'SETTLED'
   | 'TERMINAL_STATE';
 
+export interface PaperCycleEnrichmentFailure {
+  readonly marketId: string;
+  readonly code: 'ENRICHMENT_FAILED';
+  readonly error: string;
+}
+
 export interface PaperCycleMarketOutcome {
   readonly marketId: string;
   readonly eventId: string;
@@ -219,6 +235,10 @@ export interface PaperCycleMarketOutcome {
   readonly fillId: string | null;
   readonly fillStatus: ShadowFillStatus | null;
   readonly settlementOutcome: SettlementOutcomeCode | null;
+  readonly discoverySource?: DiscoverySource;
+  readonly dateSource?: EventDateSource;
+  readonly enriched?: boolean;
+  readonly enrichmentError?: string | null;
 }
 
 export interface PaperCycleStageCounts {
@@ -250,6 +270,7 @@ export interface PaperCycleReport {
   readonly systemState: RiskSystemState;
   readonly counts: PaperCycleStageCounts;
   readonly marketOutcomes: readonly PaperCycleMarketOutcome[];
+  readonly enrichmentFailures: readonly PaperCycleEnrichmentFailure[];
   readonly observeSummary: ObserveRunSummary;
   readonly dashboard: EventEdgeDashboard;
 }
@@ -368,6 +389,11 @@ function resolveFixtureClientOptions(fixtures: boolean | PaperCycleFixtures): {
       tickerLookup.set(m.ticker, m);
     }
   }
+  if (fixtureConfig.eventsBySeries) {
+    for (const events of Object.values(fixtureConfig.eventsBySeries)) {
+      addFromEvents(events);
+    }
+  }
   if (fixtureConfig.marketByTicker) {
     for (const [ticker, m] of Object.entries(fixtureConfig.marketByTicker)) {
       tickerLookup.set(ticker, m);
@@ -378,6 +404,27 @@ function resolveFixtureClientOptions(fixtures: boolean | PaperCycleFixtures): {
     const urlStr =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const parsed = new URL(urlStr);
+
+    if (!fixtureConfig.fetchFn && parsed.pathname.endsWith('/series')) {
+      return new Response(
+        JSON.stringify({ series: fixtureConfig.series ?? [], cursor: '' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+
+    if (
+      !fixtureConfig.fetchFn &&
+      parsed.pathname.endsWith('/events') &&
+      parsed.searchParams.has('series_ticker')
+    ) {
+      const seriesTicker = parsed.searchParams.get('series_ticker') ?? '';
+      const matched = fixtureConfig.eventsBySeries?.[seriesTicker] ?? [];
+      return new Response(JSON.stringify({ events: matched, cursor: '' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
     const singleMarketMatch = parsed.pathname.match(/\/markets\/([^/]+)$/);
     if (singleMarketMatch && singleMarketMatch[1]) {
       const ticker = decodeURIComponent(singleMarketMatch[1]);
@@ -415,6 +462,39 @@ function resolveFixtureClientOptions(fixtures: boolean | PaperCycleFixtures): {
       rateLimitDelayMs: 0,
     },
   };
+}
+
+function snapshotHasSettlementSources(snapshot: NormalizedMarketSnapshot): boolean {
+  if (typeof snapshot.settlementSourceName === 'string' && snapshot.settlementSourceName.trim().length > 0) {
+    return true;
+  }
+  try {
+    const parsed = JSON.parse(snapshot.rawPayloadJson) as {
+      market?: KalshiRawMarket;
+      event?: KalshiRawEvent | null;
+    };
+    const checkList = (list: unknown): boolean =>
+      Array.isArray(list) &&
+      list.some(
+        (entry) =>
+          entry &&
+          typeof entry === 'object' &&
+          typeof (entry as { name?: unknown }).name === 'string' &&
+          ((entry as { name: string }).name).trim().length > 0
+      );
+    if (checkList(parsed?.market?.settlement_sources)) return true;
+    if (checkList(parsed?.event?.settlement_sources)) return true;
+  } catch {
+    // Ignore parse errors
+  }
+  return false;
+}
+
+function snapshotNeedsSettlementSourceEnrichment(snapshot: NormalizedMarketSnapshot): boolean {
+  const fromTargeted =
+    snapshot.discoverySource === 'TARGETED' || snapshot.discoverySource === 'BOTH';
+  if (!fromTargeted) return false;
+  return !snapshotHasSettlementSources(snapshot);
 }
 
 function buildHistoricalFamilyReferenceClass(
@@ -656,7 +736,7 @@ export async function runPaperCycle(
   // (c) Discovery via EE-01 public client and observeRunner
   // -------------------------------------------------------------------------
   const usedFixtures = input.fixtures !== undefined && input.fixtures !== false;
-  let clientOptions: KalshiPublicClientOptions | undefined;
+  let clientOptions: KalshiPublicClientOptions | undefined = input.clientOptions;
   let fixtureConfig: PaperCycleFixtures | null = null;
   if (usedFixtures) {
     const resolved = resolveFixtureClientOptions(input.fixtures!);
@@ -679,17 +759,112 @@ export async function runPaperCycle(
           {}
         );
 
+  const enrichmentFailures: PaperCycleEnrichmentFailure[] = [];
+  const enrichedMarkets = new Set<string>();
+  const enrichmentErrorByMarket = new Map<string, string>();
+
+  // EE-09 Piece 3: Pre-audit single-market settlement-source enrichment for targeted markets
+  // lacking settlement_sources. In fixture/dry-run mode (`usedFixtures === true`), ZERO
+  // enrichment network fetches occur; fixtures may carry the enriched shape directly.
+  const beforeAuditHook = usedFixtures
+    ? undefined
+    : async (
+        scannedSnapshots: readonly NormalizedMarketSnapshot[]
+      ): Promise<readonly NormalizedMarketSnapshot[]> => {
+        const result: NormalizedMarketSnapshot[] = [];
+        for (const snap of scannedSnapshots) {
+          const state = getContractLifecycleState(db, snap.marketTicker);
+          const needsAudit = state === null || state === 'DISCOVERED' || state === 'AUDIT_PENDING';
+          if (needsAudit && snapshotNeedsSettlementSourceEnrichment(snap)) {
+            try {
+              const fetched = await fetchPublicKalshiMarketByTicker(
+                snap.marketTicker,
+                clientOptions
+              );
+              if (fetched.market) {
+                const enrichedSnap = mergeEnrichedKalshiMarketIntoSnapshot(
+                  snap,
+                  fetched.market,
+                  asOf
+                );
+                persistMarketSnapshot(db, enrichedSnap);
+                enrichedMarkets.add(snap.marketTicker);
+                result.push(enrichedSnap);
+              } else {
+                const msg = `Single-market enrichment returned no payload for "${snap.marketTicker}" (HTTP 404).`;
+                enrichmentFailures.push(
+                  Object.freeze({
+                    marketId: snap.marketTicker,
+                    code: 'ENRICHMENT_FAILED' as const,
+                    error: msg,
+                  })
+                );
+                enrichmentErrorByMarket.set(snap.marketTicker, msg);
+                result.push(snap);
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              enrichmentFailures.push(
+                Object.freeze({
+                  marketId: snap.marketTicker,
+                  code: 'ENRICHMENT_FAILED' as const,
+                  error: msg,
+                })
+              );
+              enrichmentErrorByMarket.set(snap.marketTicker, msg);
+              result.push(snap);
+            }
+          } else {
+            result.push(snap);
+          }
+        }
+        return result;
+      };
+
   const observeResult = await runObserveCycle({
     db,
     config: observeConfig,
     clientOptions,
     now: asOfDate,
+    beforeAudit: beforeAuditHook,
   });
+
+  const snapshotMetaByMarket = new Map<
+    string,
+    { readonly discoverySource: DiscoverySource; readonly dateSource: EventDateSource }
+  >();
+  for (const s of observeResult.discovery.allSnapshots) {
+    snapshotMetaByMarket.set(s.marketTicker, {
+      discoverySource: s.discoverySource,
+      dateSource: s.dateSource,
+    });
+  }
+  for (const s of observeResult.discovery.scannedSnapshots) {
+    snapshotMetaByMarket.set(s.marketTicker, {
+      discoverySource: s.discoverySource,
+      dateSource: s.dateSource,
+    });
+  }
 
   // Track every market outcome by marketId so zero discovered markets are ever silently skipped
   const outcomesByMarket = new Map<string, PaperCycleMarketOutcome>();
   const setOutcome = (outcome: PaperCycleMarketOutcome): void => {
-    outcomesByMarket.set(outcome.marketId, Object.freeze(outcome));
+    const meta = snapshotMetaByMarket.get(outcome.marketId);
+    const enrichErr = enrichmentErrorByMarket.get(outcome.marketId) ?? null;
+    const reasonCodes = enrichErr
+      ? dedupeStrings(['ENRICHMENT_FAILED', ...outcome.reasonCodes])
+      : outcome.reasonCodes;
+    outcomesByMarket.set(
+      outcome.marketId,
+      Object.freeze({
+        ...outcome,
+        reasonCodes,
+        discoverySource: outcome.discoverySource ?? meta?.discoverySource,
+        dateSource: outcome.dateSource ?? meta?.dateSource,
+        enriched: enrichedMarkets.has(outcome.marketId),
+        enrichmentError: enrichErr,
+      })
+    );
   };
 
   let newlyRegisteredDiscovered = 0;
@@ -1535,6 +1710,7 @@ export async function runPaperCycle(
     systemState: currentSystemState,
     counts,
     marketOutcomes: Object.freeze(marketOutcomes),
+    enrichmentFailures: Object.freeze(enrichmentFailures),
     observeSummary: observeResult.summary,
     dashboard,
   });

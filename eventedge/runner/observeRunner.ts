@@ -15,6 +15,7 @@ import {
   discoverAndScanMarkets,
   type DiscoverAndScanResult,
   type KalshiPublicClientOptions,
+  type NormalizedMarketSnapshot,
 } from '../discovery/index';
 import {
   auditDiscoveredMarkets,
@@ -63,6 +64,10 @@ export interface RunObserveCycleOptions {
   readonly summaryOutputPath?: string;
   /** Optional base directory confining `summaryOutputPath` against path traversal. */
   readonly summaryBaseDir?: string;
+  /** Optional pre-audit hook allowing callers (e.g. paperRunner enrichment) to enrich scanned snapshots before auditing. */
+  readonly beforeAudit?: (
+    snapshots: readonly NormalizedMarketSnapshot[]
+  ) => Promise<readonly NormalizedMarketSnapshot[]>;
 }
 
 export interface RunObserveCycleResult {
@@ -147,12 +152,23 @@ export async function runObserveCycle(
   const db = options.db ?? initializeEventEdgeLedger(config.ledgerDbPath).db;
 
   try {
-    const discovery = await discoverAndScanMarkets({
+    const rawDiscovery = await discoverAndScanMarkets({
       db,
       config,
       clientOptions: options.clientOptions,
       now: startedDate,
     });
+
+    const scannedSnapshotsForAudit = options.beforeAudit
+      ? [...(await options.beforeAudit(rawDiscovery.scannedSnapshots))]
+      : rawDiscovery.scannedSnapshots;
+
+    const discovery: DiscoverAndScanResult = options.beforeAudit
+      ? {
+          ...rawDiscovery,
+          scannedSnapshots: scannedSnapshotsForAudit,
+        }
+      : rawDiscovery;
 
     const auditBatch = auditDiscoveredMarkets(db, discovery.scannedSnapshots, startedAt);
     const completedAt = options.now ? startedAt : new Date().toISOString();
