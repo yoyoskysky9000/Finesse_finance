@@ -79,6 +79,9 @@ export interface KalshiRawMarket {
   settlement_sources?: KalshiSettlementSource[] | null;
   settlement_source?: string | KalshiSettlementSource | null;
   settlement_source_name?: string | null;
+  result?: string | null;
+  settlement_ts?: string | null;
+  settlement_value?: number | null;
   strike_type?: string | null;
   custom_strike?: Record<string, unknown> | null;
   [key: string]: unknown;
@@ -430,6 +433,77 @@ export async function fetchPublicOpenKalshiCatalog(
 
   throw new Error(
     `Failed to fetch open Kalshi public catalog from all configured base URLs: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`
+  );
+}
+
+/**
+ * Fetches a single Kalshi market by ticker via the unauthenticated public
+ * `GET /markets/{ticker}` endpoint (no auth headers; allowlisted public hosts only).
+ * Returns `market: null` if the public endpoint responds with HTTP 404.
+ */
+export async function fetchPublicKalshiMarketByTicker(
+  ticker: string,
+  options: KalshiPublicClientOptions = {}
+): Promise<{ readonly baseUrlUsed: string; readonly market: KalshiRawMarket | null }> {
+  const trimmedTicker = ticker.trim();
+  if (!trimmedTicker) {
+    throw new EventEdgePublicClientViolationError('Market ticker must be a non-empty string.');
+  }
+
+  const candidateUrls =
+    options.baseUrls && options.baseUrls.length > 0
+      ? options.baseUrls
+      : KALSHI_PUBLIC_BASE_URLS;
+  const validatedUrls = candidateUrls.map((u) => assertAllowedKalshiPublicBaseUrl(u));
+  const safePath = assertPublicMarketDataRequest(
+    'GET',
+    `/markets/${encodeURIComponent(trimmedTicker)}`
+  );
+  const fetchImpl = options.fetchFn ?? fetch;
+  const paceMs = options.rateLimitDelayMs ?? RATE_LIMIT_DELAY_MS;
+  const maxRetries = options.maxRetries429 ?? 5;
+
+  let lastError: unknown = null;
+  for (const baseUrl of validatedUrls) {
+    try {
+      const response = await fetchPublicJsonWithRetry(
+        `${baseUrl}${safePath}`,
+        fetchImpl,
+        paceMs,
+        maxRetries
+      );
+      if (response.status === 404) {
+        return Object.freeze({ baseUrlUsed: baseUrl, market: null });
+      }
+      if (!response.ok) {
+        throw new Error(
+          `Kalshi public market-data GET ${safePath} failed with HTTP ${response.status}`
+        );
+      }
+      const payload = (await response.json()) as Record<string, unknown> | null;
+      let market: KalshiRawMarket | null = null;
+      if (payload && typeof payload === 'object') {
+        const candidate =
+          payload.market && typeof payload.market === 'object'
+            ? (payload.market as Record<string, unknown>)
+            : payload;
+        if (typeof candidate.ticker === 'string' && candidate.ticker.trim().length > 0) {
+          market = candidate as KalshiRawMarket;
+        }
+      }
+      return Object.freeze({ baseUrlUsed: baseUrl, market });
+    } catch (err) {
+      if (err instanceof EventEdgePublicClientViolationError) {
+        throw err;
+      }
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    `Failed to fetch public Kalshi market "${trimmedTicker}" from all configured base URLs: ${
       lastError instanceof Error ? lastError.message : String(lastError)
     }`
   );

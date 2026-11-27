@@ -13,6 +13,7 @@ import {
 import { initializeEventEdgeLedger } from '../db/migrations';
 import {
   discoverAndScanMarkets,
+  type DiscoverAndScanResult,
   type KalshiPublicClientOptions,
 } from '../discovery/index';
 import {
@@ -66,6 +67,7 @@ export interface RunObserveCycleOptions {
 
 export interface RunObserveCycleResult {
   readonly summary: ObserveRunSummary;
+  readonly discovery: DiscoverAndScanResult;
   readonly clearMarkets: readonly AuditedMarketEntry[];
   readonly ambiguousMarkets: readonly AuditedMarketEntry[];
   readonly summaryFilePath: string | null;
@@ -193,6 +195,7 @@ export async function runObserveCycle(
 
     return {
       summary,
+      discovery,
       clearMarkets: auditBatch.clearMarkets,
       ambiguousMarkets: auditBatch.ambiguousMarkets,
       summaryFilePath,

@@ -65,8 +65,10 @@ eventedge/
 │   ├── renderer.ts       # Pure self-contained renderDashboardHtml (inline CSS only, zero scripts/assets)
 │   └── index.ts          # Dashboard barrel exports
 ├── runner/
-│   ├── observeRunner.ts  # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
-│   └── index.ts          # Runner barrel exports
+│   ├── observeRunner.ts            # OBSERVE-mode single-cycle runner (discovery + audit + run summary, zero execution)
+│   ├── paperRunner.ts              # EE-08 paper validation harness (mode guard, frozen-config check, full offline/public pipeline)
+│   ├── registerFirstExperiment.ts  # Pre-registered FIRST_EXPERIMENT (EE-V1-BASERATE-01) & idempotent registerFirstExperiment(db)
+│   └── index.ts                    # Runner barrel exports
 └── tests/
     ├── fixtures/
     │   └── kalshiPayloads.ts  # Deterministic recorded-shape Kalshi public payloads (zero live network)
@@ -77,7 +79,8 @@ eventedge/
     ├── ee04.test.ts      # EE-04 verification suite (scoring, denominator, temporal calibration, cluster bootstrap, kill-gate)
     ├── ee05.test.ts      # EE-05 verification suite (shadow edge gate, arrival book, latency, partial fill, fees, determinism, append-only, config_hash)
     ├── ee06.test.ts      # EE-06 verification suite (portfolio state builder, caps, Kelly sizing, stops, state machine, DEGRADED halving, append-only, determinism)
-    └── ee07.test.ts      # EE-07 verification suite (section order, verdict-first, PnL containment, number fidelity, empty state, read-only, integrity)
+    ├── ee07.test.ts      # EE-07 verification suite (section order, verdict-first, PnL containment, number fidelity, empty state, read-only, integrity)
+    └── ee08.test.ts      # EE-08 verification suite (fixture cycle, fixture settlement, mode guard, frozen config, idempotent registration, no-silent-skip, FIRST_EXPERIMENT)
 ```
 
 ### 1. Execution Mode Guard (`eventedge/config/index.ts`)
@@ -148,7 +151,7 @@ Forward-only migrations (`schema_migrations`, currently v1..v7) provision 22 app
 ## Running Tests & Type Checks
 
 ```bash
-# Run EventEdge EE-00 through EE-07 automated tests (zero live network)
+# Run EventEdge EE-00 through EE-08 automated tests (zero live network)
 npx tsx eventedge/tests/ee00.test.ts
 npx tsx eventedge/tests/ee01.test.ts
 npx tsx eventedge/tests/ee02.test.ts
@@ -157,6 +160,7 @@ npx tsx eventedge/tests/ee04.test.ts
 npx tsx eventedge/tests/ee05.test.ts
 npx tsx eventedge/tests/ee06.test.ts
 npx tsx eventedge/tests/ee07.test.ts
+npx tsx eventedge/tests/ee08.test.ts
 
 # Type-check entire workspace including eventedge/
 npm run lint

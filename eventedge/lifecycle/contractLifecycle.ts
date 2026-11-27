@@ -472,3 +472,224 @@ export function recordRuleVersionWithLifecycleHook(
     revisionTransition,
   });
 }
+
+export interface ContractLifecycleSummaryEntry {
+  readonly marketId: string;
+  readonly state: ContractLifecycleState;
+  readonly ruleVersionId: string | null;
+  readonly transitionedAt: string;
+}
+
+/**
+ * Lists all contracts whose current (latest appended) lifecycle state is in `states`.
+ */
+export function listContractsInLifecycleStates(
+  db: DatabaseSync,
+  states: readonly ContractLifecycleState[]
+): readonly ContractLifecycleSummaryEntry[] {
+  if (states.length === 0) {
+    return Object.freeze([]);
+  }
+  const stateSet = new Set<ContractLifecycleState>(states);
+  const rows = db
+    .prepare(
+      `SELECT l.market_id, l.to_state, l.rule_version_id, l.transitioned_at
+       FROM contract_lifecycle_history l
+       INNER JOIN (
+         SELECT market_id, MAX(rowid) AS max_rowid
+         FROM contract_lifecycle_history
+         GROUP BY market_id
+       ) latest ON latest.market_id = l.market_id AND latest.max_rowid = l.rowid
+       ORDER BY l.market_id ASC`
+    )
+    .all() as unknown as Array<{
+    market_id: string;
+    to_state: ContractLifecycleState;
+    rule_version_id: string | null;
+    transitioned_at: string;
+  }>;
+
+  const matched: ContractLifecycleSummaryEntry[] = [];
+  for (const row of rows) {
+    if (stateSet.has(row.to_state)) {
+      matched.push(
+        Object.freeze({
+          marketId: row.market_id,
+          state: row.to_state,
+          ruleVersionId: row.rule_version_id,
+          transitionedAt: row.transitioned_at,
+        })
+      );
+    }
+  }
+  return Object.freeze(matched);
+}
+
+export type SettlementOutcomeCode = 'YES' | 'NO' | 'VOID' | 'CANCELLED';
+
+export interface RecordContractSettlementInput {
+  readonly marketId: string;
+  readonly eventTicker: string;
+  readonly outcome: SettlementOutcomeCode;
+  readonly settledAt: string;
+  readonly rawSettlementJson: string;
+  readonly actor?: string;
+  readonly reason?: string;
+  readonly venue?: string;
+  readonly ruleVersionId?: string | null;
+}
+
+export interface RecordContractSettlementResult {
+  readonly settlementId: string;
+  readonly marketId: string;
+  readonly outcome: SettlementOutcomeCode;
+  readonly settledAt: string;
+  readonly alreadySettled: boolean;
+  readonly transitions: readonly ContractLifecycleHistoryRecord[];
+  readonly lifecycleStateAfter: ContractLifecycleState;
+}
+
+/**
+ * Records a discovery-sourced contract settlement into the immutable `settlements` table
+ * and advances contract lifecycle to `RESOLVED` (for `YES`/`NO`) or `VOIDED` (for `VOID`/`CANCELLED`).
+ *
+ * Strictly append-only and idempotent: if a settlement row already exists for `marketId` and the
+ * contract is already in `RESOLVED` or `VOIDED`, returns the existing record without modifying state.
+ */
+export function recordContractSettlement(
+  db: DatabaseSync,
+  input: RecordContractSettlementInput
+): RecordContractSettlementResult {
+  const marketId = input.marketId.trim();
+  const eventTicker = input.eventTicker.trim();
+  const outcome = input.outcome;
+  const settledAt = input.settledAt.trim();
+  const actor = input.actor?.trim() || 'ee01_discovery_settlement';
+  const venue = input.venue?.trim() || 'KALSHI';
+  const ruleVersionId = input.ruleVersionId?.trim() || null;
+
+  if (!marketId || !eventTicker) {
+    throw new Error('recordContractSettlement requires non-empty marketId and eventTicker.');
+  }
+  if (!['YES', 'NO', 'VOID', 'CANCELLED'].includes(outcome)) {
+    throw new Error(`Invalid settlement outcome "${String(outcome)}".`);
+  }
+  if (!Number.isFinite(Date.parse(settledAt))) {
+    throw new Error(`Invalid settledAt timestamp "${settledAt}".`);
+  }
+
+  const currentState = getContractLifecycleState(db, marketId);
+  if (currentState === null) {
+    throw new ContractLifecycleNotFoundError(marketId);
+  }
+
+  const existingSettlement = db
+    .prepare(
+      `SELECT settlement_id, outcome, settled_at
+       FROM settlements
+       WHERE market_ticker = ?
+       ORDER BY rowid DESC
+       LIMIT 1`
+    )
+    .get(marketId) as
+    | { settlement_id: string; outcome: SettlementOutcomeCode; settled_at: string }
+    | undefined;
+
+  if (existingSettlement && (currentState === 'RESOLVED' || currentState === 'VOIDED')) {
+    return Object.freeze({
+      settlementId: existingSettlement.settlement_id,
+      marketId,
+      outcome: existingSettlement.outcome,
+      settledAt: existingSettlement.settled_at,
+      alreadySettled: true,
+      transitions: Object.freeze([]),
+      lifecycleStateAfter: currentState,
+    });
+  }
+
+  const transitions: ContractLifecycleHistoryRecord[] = [];
+  let state = currentState;
+
+  if (state === 'APPROVED') {
+    const t = transitionContractLifecycle(db, {
+      marketId,
+      toState: 'ACTIVE',
+      reason: 'ACTIVATED_BEFORE_SETTLEMENT',
+      actor,
+      ruleVersionId,
+      transitionedAt: settledAt,
+    });
+    transitions.push(t);
+    state = t.toState;
+  }
+
+  if (state === 'ACTIVE') {
+    const t = transitionContractLifecycle(db, {
+      marketId,
+      toState: 'SETTLEMENT_PENDING',
+      reason: 'CLOSE_TIME_PASSED_FOR_SETTLEMENT',
+      actor,
+      ruleVersionId,
+      transitionedAt: settledAt,
+    });
+    transitions.push(t);
+    state = t.toState;
+  }
+
+  const targetState: ContractLifecycleState =
+    outcome === 'YES' || outcome === 'NO' ? 'RESOLVED' : 'VOIDED';
+
+  let settlementId = existingSettlement?.settlement_id;
+  if (!settlementId) {
+    const digest = crypto
+      .createHash('sha256')
+      .update(`${venue}|${eventTicker}|${marketId}|${outcome}|${settledAt}`)
+      .digest('hex')
+      .slice(0, 24);
+    settlementId = `set_${digest}`;
+    const settlementPriceUsd = outcome === 'YES' ? 1 : 0;
+
+    db.prepare(
+      `INSERT INTO settlements (
+        settlement_id, venue, event_ticker, market_ticker, rule_version_id,
+        outcome, settlement_price_usd, settled_contracts, payout_usd,
+        raw_settlement_json, settled_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      settlementId,
+      venue,
+      eventTicker,
+      marketId,
+      ruleVersionId,
+      outcome,
+      settlementPriceUsd,
+      0,
+      0,
+      input.rawSettlementJson,
+      settledAt
+    );
+  }
+
+  if (state !== targetState) {
+    const t = transitionContractLifecycle(db, {
+      marketId,
+      toState: targetState,
+      reason: input.reason?.trim() || `DISCOVERY_SETTLEMENT_${outcome}`,
+      actor,
+      ruleVersionId,
+      transitionedAt: settledAt,
+    });
+    transitions.push(t);
+    state = t.toState;
+  }
+
+  return Object.freeze({
+    settlementId,
+    marketId,
+    outcome,
+    settledAt,
+    alreadySettled: false,
+    transitions: Object.freeze(transitions),
+    lifecycleStateAfter: state,
+  });
+}

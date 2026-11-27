@@ -19,6 +19,7 @@ export {
   fetchOpenKalshiEvents,
   fetchOpenKalshiMarkets,
   fetchPublicOpenKalshiCatalog,
+  fetchPublicKalshiMarketByTicker,
   type KalshiSettlementSource,
   type KalshiRawMarket,
   type KalshiRawEvent,
